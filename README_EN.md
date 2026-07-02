@@ -15,7 +15,9 @@
 
 ---
 
-> **📖 Read the [LocationSpoofer Detailed Tutorial](https://docs.google.com/document/d/1fFEz3k7ATdN2dwY1L3RJn1QuzgokIsslNa88-vUPxPk/edit?usp=sharing)**
+### 🌱 Origin and Evolution
+
+This project originally originated from the open-source repository [SuseOAA/LocationSpoofer](https://github.com/SuseOAA/LocationSpoofer). Following continuous feature evolution and codebase refactoring (including package renaming, map engine streamlining, and hardening of wireless environment simulation rules, along with the removal of unstable experimental features like traffic light waits and magnetic vector simulation), **it has now evolved into a fully independent development branch**.
 
 ---
 
@@ -31,14 +33,6 @@ In modern Android risk control environments, the standard developer options feat
 **LocationSpoofer** is a **system-level virtual positioning and radio environment cloning solution** designed specifically to counter these deep anti-cheating mechanisms. 
 By leveraging **KernelSU / Magisk / APatch** for root privileges and the **LSPosed (libxposed)** framework to inject hook routines into targeted processes, LocationSpoofer intercepts and fakes all positioning and wireless networking API responses with high physical fidelity. This ensures the target apps receive highly consistent location fingerprints without detecting any virtualization.
 
-> [!TIP]
-> **🌟 Major Update in Latest Version**
-> 
-> Rebuilt and hardened the security of **Wi-Fi environment simulation** and **cell tower simulation**:
-> * **Zero Synthetic Fake Data**: Removed all generated Wi-Fi AP identities (e.g. `WIFI_Nearby_*`) and fake LTE towers. If no trusted environmental data is present for the coordinates, the module securely returns empty sets ("Fail-Closed"), blocking the real environment without leaking fake patterns.
-> * **Decoupled Jitter Math**: Shifted Ornstein-Uhlenbeck random walks to the hook output edge, fixing the previous infinite random-walk accumulation drift.
-> * **Monotonic Timestamp Generator**: Implemented a monotonic timestamp sequence for spoofed locations, addressing issues where Android rejected mock locations due to non-monotonic clock intervals (often reported as "weak GPS signal").
-
 ---
 
 ## ✨ Core Features & Technical Deep Dive
@@ -48,12 +42,10 @@ By leveraging **KernelSU / Magisk / APatch** for root privileges and the **LSPos
 * **Per-App Coordinate System Adapter**: Different applications expect different coordinate systems. Sending GCJ-02 coordinates to Baidu Maps or WGS-84 to others creates static offsets of 300-500 meters. LocationSpoofer lets you specify `GCJ-02` (Mars Coordinates), `WGS-84` (Standard GPS Coordinates), or `BD-09` (Baidu Coordinates) on a per-app basis.
 * **Zero-Latency Calculations**: Coordinate translation is computed on-the-fly inside the Xposed hooks by fetching pre-calculated values from the host app, bypassing expensive trigonometric calls in high-frequency callback contexts.
 
-### 2. 🛰️ High-Fidelity GPS Physics Engine with Random Walks
+### 2. 🛰️ High-Fidelity GPS Physics Engine with Monotonic Timestamps
 Raw GPS receivers output coordinates that naturally contain Gaussian white noise due to ionospheric/tropospheric delays and clock offsets. Static or straight-line mock sequences are easily identified by anti-cheat spectral analyzers.
-* **Ornstein-Uhlenbeck Process**: We implement a mathematical model of physical random walks to generate natural location jitters:
-   $$\mathrm{d}X_t = -\alpha X_t \mathrm{d}t + \sigma \mathrm{d}W_t$$
-   where $\sigma$ is the jitter intensity (user-configurable from 1m to 80m, defaulting to 30m), and $\alpha$ is the mean-reversion coefficient. This creates realistic low-frequency slowly-varying drift characteristics while keeping the displacement bounded within 3-Sigma limits to prevent location jumps.
-* **Gait Lateral Jitter**: When walking or running, the engine automatically calculates step-frequency statistical intervals and applies a perpendicular lateral displacement of `0.15 * N(0,1)` meters, simulating the natural left-right swaying motion of a walking human.
+* **Decoupled Jitter Math**: The system supports custom location jitter (radius from 1m to 80m, defaulting to 30m, offering slow/medium/fast drift profiles). Jitter calculations are shifted to the hook output edge with a short caching window, resolving the previous infinite random-walk accumulation drift.
+* **Monotonic Timestamp Generator**: To prevent Android from rejecting mock locations due to non-monotonic clock intervals (often reported as "weak GPS signal"), the hook layer features a monotonic timestamp generator ensuring output locations increment naturally on the timeline.
 * **Altitude & Accuracy (GDOP) Drift**: Horizontal accuracy (Accuracy) and vertical elevation (Altitude) fluctuate slowly in a Brownian motion pattern to simulate tropospheric delay changes and changes in satellite geometries.
 
 ### 3. 🛡️ Stealth & Anti-Detection Suite
@@ -66,22 +58,23 @@ Raw GPS receivers output coordinates that naturally contain Gaussian white noise
   * Hooks secure settings queries (e.g. `mock_location`, `allow_mock_location`) in `Settings.Secure` to return `0` (disabled status).
   * Replaces test/mock providers in `LocationManager` and forces them to report as native `gps` signals.
 
-### 4. 📶 Radio Environment Cloning & Spatial Heatmap Interpolation
-Anti-cheat engines compare your GPS coordinates against the Wi-Fi scan results reported by your device. If you are virtually located in Taipei, but your device reports Wi-Fi BSSIDs from your home in Kaohsiung, you will be flagged immediately.
+### 4. 📶 Radio Environment Cloning & "Fail-Closed" Security
+Anti-cheat engines compare your GPS coordinates against the Wi-Fi scan results reported by your device.
+* **Zero Synthetic Fake Data**: Removed all generated Wi-Fi AP identities (e.g. `WIFI_Nearby_*`) and fake cell towers. If no trusted environmental data is present for the coordinates, the module securely returns empty sets, blocking the real environment without leaking fake patterns.
+* **Fail-Closed Security Mechanism**:
+  * **Wi-Fi Simulation**: Only accepts local scans, stored local DB records, or live queries from the **WiGLE API**. If no trusted data exists, the hook returns empty arrays, successfully hiding physical networks.
+  * **Cellular Simulation**: Uses local sweeps and **OpenCellID API** cell records. Returns null or empty cellular structures when empty, refusing to synthesize fake towers.
 * **On-Site Environment Scanner**: Background sweep utility collects and logs Wi-Fi networks (SSID/BSSID/RSSI/frequency/channel/WiFi standard), Cell Towers (GSM, WCDMA, CDMA, LTE, and 5G NR configurations containing MCC/MNC/LAC/CID/TAC/PCI/NCI and signal dbm), and BLE Bluetooth beacons.
 * **Spatial Inverse Distance Weighting (IDW) Interpolation**: During virtual movements, the Xposed module searches the local Room SQLite DB for physical records within a 50-meter radius of the target coordinates. It computes weights based on the inverse square distance to interpolate nearby Wi-Fi RSSI, Cell signal strength dbm, and BLE Bluetooth RSSI.
-* **Trusted Wi-Fi Source Guarantee**: Only accepts local scans, stored local DB records, or live queries from the **WiGLE API**. If no trusted data exists, the hook returns empty arrays, successfully hiding physical networks without inventing fake ones.
-* **Trusted Cellular Source Guarantee**: Uses local sweeps and **OpenCellID API** cell records. Returns null or empty cellular structures when empty, rather than generating synthetic LAC/CID.
 * **Brand OUI Prefix Matching**: When generating fake scans in non-recorded zones, the generator assigns real MAC prefixes (OUI) belonging to mainstream network manufacturers (e.g. TP-Link, Huawei, ZTE, Xiaomi, Cisco, Netgear) instead of random MAC addresses.
 
 ### 5. 🛰️ Satellite Sky Matrix & NMEA Protocol Generator
 * **GNSS Status Hijacking**: Hooks `GnssStatus` to simulate a fully populated constellation of 20+ active satellites (GPS, BeiDou, GLONASS) detailing unique PRN IDs, signal-to-noise ratios (CNR/SNR), elevations, azimuths, and Used-In-Fix status flags.
 * **Dynamic NMEA Naming & Calculations**: Intercepts `OnNmeaMessageListener` and constructs matching raw NMEA-0183 sentences (such as `\$GPGGA`, `\$GPRMC`, `\$GPGSA`, `\$GPGSV`) in memory based on current coordinates, velocities, and bearing inputs, calculating the proper Checksum to bypass deep hardware queries.
 
-### 6. 🔀 Smart Route Navigation & Traffic Light Waits
-* **Road Network Snapping**: Fits custom multi-point routes to physical roads using routing APIs, preventing straight-line navigation through buildings.
-* **Traffic Light Simulator**: Analyzes route segments and populates nodes with traffic light tags. The route simulator will **automatically pause for 15 seconds** at these coordinates to replicate real driving waits.
-* **Compose Floating Joystick**: A float window containing an interactive joystick overlay to fine-tune coords on-the-fly. Leverages smooth bearing transitions and steering damping adjustments.
+### 6. 🚗 Route & Joystick Simulation
+* **Route Path Snapping**: Fits custom multi-point routes to physical roads using routing APIs, preventing straight-line navigation. Select travel speed class (Walking, Running, Cycling, Driving, or custom speed value).
+* **Compose Floating Joystick**: A float window containing an interactive joystick overlay to fine-tune coords on-the-fly, leveraging smooth bearing transitions and steering damping adjustments.
 
 ---
 
