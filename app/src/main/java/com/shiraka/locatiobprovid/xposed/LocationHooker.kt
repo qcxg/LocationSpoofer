@@ -1,0 +1,4707 @@
+package com.shiraka.locatiobprovid.xposed
+
+import io.github.libxposed.api.XposedInterface
+import android.net.Uri
+import io.github.libxposed.api.XposedModule
+import io.github.libxposed.api.XposedModuleInterface
+import org.json.JSONObject
+import java.io.File
+import java.util.Collections
+import java.util.Random
+import java.util.WeakHashMap
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
+import java.lang.reflect.Member
+
+// --- Legacy Compatibility Layer ---
+abstract class XC_MethodHook {
+    open fun beforeHookedMethod(param: MethodHookParam) {}
+    open fun afterHookedMethod(param: MethodHookParam) {}
+
+    class MethodHookParam {
+        var method: Member? = null
+        var thisObject: Any? = null
+        var args: Array<Any?> = emptyArray()
+        var returnEarly = false
+        var result: Any? = null
+            set(value) {
+                field = value
+                returnEarly = true
+            }
+        var throwable: Throwable? = null
+            set(value) {
+                field = value
+                returnEarly = true
+            }
+    }
+}
+
+object XposedHelpers {
+    lateinit var module: XposedModule
+
+    fun findClass(className: String, classLoader: ClassLoader?): Class<*> {
+        return Class.forName(className, false, classLoader ?: ClassLoader.getSystemClassLoader())
+    }
+
+    fun findClassIfExists(className: String, classLoader: ClassLoader?): Class<*>? {
+        return try { findClass(className, classLoader) } catch (e: Throwable) { null }
+    }
+
+    fun getObjectField(obj: Any, fieldName: String): Any? {
+        var clazz: Class<*>? = obj.javaClass
+        while (clazz != null) {
+            try {
+                val f = clazz.getDeclaredField(fieldName)
+                f.isAccessible = true
+                return f.get(obj)
+            } catch (e: NoSuchFieldException) {
+                clazz = clazz.superclass
+            }
+        }
+        throw NoSuchFieldException(fieldName)
+    }
+
+    fun setObjectField(obj: Any, fieldName: String, value: Any?) {
+        var clazz: Class<*>? = obj.javaClass
+        while (clazz != null) {
+            try {
+                val f = clazz.getDeclaredField(fieldName)
+                f.isAccessible = true
+                f.set(obj, value)
+                return
+            } catch (e: NoSuchFieldException) {
+                clazz = clazz.superclass
+            }
+        }
+        throw NoSuchFieldException(fieldName)
+    }
+
+    fun setIntField(obj: Any, fieldName: String, value: Int) { setObjectField(obj, fieldName, value) }
+    fun setDoubleField(obj: Any, fieldName: String, value: Double) { setObjectField(obj, fieldName, value) }
+    fun setFloatField(obj: Any, fieldName: String, value: Float) { setObjectField(obj, fieldName, value) }
+    fun setBooleanField(obj: Any, fieldName: String, value: Boolean) { setObjectField(obj, fieldName, value) }
+    fun setLongField(obj: Any, fieldName: String, value: Long) { setObjectField(obj, fieldName, value) }
+
+    fun callMethod(obj: Any, methodName: String, vararg args: Any?): Any? {
+        var clazz: Class<*>? = obj.javaClass
+        while (clazz != null) {
+            for (m in clazz.declaredMethods) {
+                if (m.name == methodName && m.parameterCount == args.size) {
+                    m.isAccessible = true
+                    return m.invoke(obj, *args)
+                }
+            }
+            clazz = clazz.superclass
+        }
+        throw NoSuchMethodException(methodName)
+    }
+
+    fun tryCallMethodDeep(obj: Any, methodName: String, vararg args: Any?): Boolean {
+        val visited = HashSet<Class<*>>()
+        val stack = ArrayDeque<Class<*>>()
+        stack.add(obj.javaClass)
+        while (stack.isNotEmpty()) {
+            val clazz = stack.removeFirst()
+            if (!visited.add(clazz)) continue
+            for (m in clazz.declaredMethods) {
+                if (m.name != methodName || m.parameterCount != args.size) continue
+                val types = m.parameterTypes
+                var compatible = true
+                for (i in args.indices) {
+                    if (!isCompatibleParameter(types[i], args[i])) {
+                        compatible = false
+                        break
+                    }
+                }
+                if (!compatible) continue
+                try {
+                    m.isAccessible = true
+                    m.invoke(obj, *args)
+                    return true
+                } catch (_: Throwable) {
+                }
+            }
+            clazz.superclass?.let { stack.add(it) }
+            clazz.interfaces.forEach { stack.add(it) }
+        }
+        return false
+    }
+
+    private fun isCompatibleParameter(parameterType: Class<*>, arg: Any?): Boolean {
+        if (arg == null) return !parameterType.isPrimitive
+        val argType = arg.javaClass
+        if (parameterType.isAssignableFrom(argType)) return true
+        if (!parameterType.isPrimitive) return false
+        return when (parameterType) {
+            java.lang.Integer.TYPE -> arg is Int
+            java.lang.Long.TYPE -> arg is Long
+            java.lang.Boolean.TYPE -> arg is Boolean
+            java.lang.Float.TYPE -> arg is Float
+            java.lang.Double.TYPE -> arg is Double
+            java.lang.Short.TYPE -> arg is Short
+            java.lang.Byte.TYPE -> arg is Byte
+            java.lang.Character.TYPE -> arg is Char
+            else -> false
+        }
+    }
+
+    fun callStaticMethod(clazz: Class<*>, methodName: String, vararg args: Any?): Any? {
+        var c: Class<*>? = clazz
+        while (c != null) {
+            for (m in c.declaredMethods) {
+                if (m.name == methodName && m.parameterCount == args.size && java.lang.reflect.Modifier.isStatic(m.modifiers)) {
+                    m.isAccessible = true
+                    return m.invoke(null, *args)
+                }
+            }
+            c = c.superclass
+        }
+        throw NoSuchMethodException(methodName)
+    }
+
+    fun findMethodExact(clazz: Class<*>, methodName: String, vararg parameterTypes: Class<*>): java.lang.reflect.Method {
+        var c: Class<*>? = clazz
+        while (c != null) {
+            try {
+                val m = c.getDeclaredMethod(methodName, *parameterTypes)
+                m.isAccessible = true
+                return m
+            } catch (e: NoSuchMethodException) {
+                c = c.superclass
+            }
+        }
+        throw NoSuchMethodException(methodName)
+    }
+
+    fun newInstance(clazz: Class<*>, vararg args: Any?): Any {
+        for (c in clazz.declaredConstructors) {
+            if (c.parameterCount == args.size) {
+                c.isAccessible = true
+                return c.newInstance(*args)
+            }
+        }
+        throw NoSuchMethodException("Constructor for " + clazz.name + " not found")
+    }
+
+    fun findAndHookMethod(className: String, classLoader: ClassLoader?, methodName: String, vararg args: Any?) {
+        try {
+            val clazz = findClass(className, classLoader)
+            findAndHookMethod(clazz, methodName, *args)
+        } catch (e: Throwable) {
+            // log
+        }
+    }
+
+    fun findAndHookMethod(clazz: Class<*>, methodName: String, vararg args: Any?) {
+        val hookIndex = args.indexOfLast { it is XC_MethodHook }
+        if (hookIndex == -1) return
+        val callback = args[hookIndex] as XC_MethodHook
+        val paramTypes = args.slice(0 until hookIndex).map {
+            when (it) {
+                is Class<*> -> it
+                is String -> findClass(it, clazz.classLoader)
+                else -> throw IllegalArgumentException("Invalid argument type")
+            }
+        }.toTypedArray()
+
+        val method = findMethodExact(clazz, methodName, *paramTypes)
+        hookMethod(method, callback)
+    }
+
+    fun hookMethod(executable: java.lang.reflect.Executable, callback: XC_MethodHook) {
+        module.hook(executable).intercept(object : io.github.libxposed.api.XposedInterface.Hooker {
+            override fun intercept(chain: io.github.libxposed.api.XposedInterface.Chain): Any? {
+                val param = XC_MethodHook.MethodHookParam().apply {
+                    this.method = executable
+                    this.thisObject = chain.thisObject
+                    this.args = chain.args.toTypedArray()
+                }
+
+                try {
+                    callback.beforeHookedMethod(param)
+                } catch (e: Throwable) {
+                    param.throwable = e
+                }
+
+                if (!param.returnEarly) {
+                    try {
+                        param.result = chain.proceed(param.args)
+                    } catch (e: Throwable) {
+                        param.throwable = e
+                    }
+                }
+
+                try {
+                    callback.afterHookedMethod(param)
+                } catch (e: Throwable) {
+                    param.throwable = e
+                }
+
+                if (param.throwable != null) throw param.throwable!!
+                return param.result
+            }
+        })
+    }
+}
+
+object XposedBridge {
+    private val openCellLogLastTimes = ConcurrentHashMap<String, Long>()
+
+    fun log(msg: String) {
+        android.util.Log.i("LocationSpoofer_Xposed", msg)
+        try { XposedHelpers.module.log(android.util.Log.INFO, "LocationSpoofer", msg) } catch (e: Throwable) {}
+    }
+    fun logOpenCellId(msg: String) {
+        val text = "[XposedCell] $msg"
+        android.util.Log.d("OpenCellID", text)
+        try { XposedHelpers.module.log(android.util.Log.DEBUG, "OpenCellID", text) } catch (e: Throwable) {}
+    }
+    fun logOpenCellId(msg: String, t: Throwable) {
+        val text = "[XposedCell] $msg"
+        android.util.Log.e("OpenCellID", text, t)
+        try { XposedHelpers.module.log(android.util.Log.ERROR, "OpenCellID", text, t) } catch (e: Throwable) {}
+    }
+    fun logOpenCellIdEvery(key: String, msg: String, intervalMs: Long = 10_000L) {
+        val now = System.currentTimeMillis()
+        val last = openCellLogLastTimes[key]
+        if (last == null || now - last >= intervalMs) {
+            openCellLogLastTimes[key] = now
+            logOpenCellId(msg)
+        }
+    }
+    fun log(t: Throwable) {
+        android.util.Log.e("LocationSpoofer_Xposed", "Error", t)
+        try { XposedHelpers.module.log(android.util.Log.ERROR, "LocationSpoofer", "Error", t) } catch (e: Throwable) {}
+    }
+    fun hookAllMethods(clazz: Class<*>, methodName: String, callback: XC_MethodHook) {
+        for (m in clazz.declaredMethods) {
+            if (m.name == methodName) {
+                XposedHelpers.hookMethod(m, callback)
+            }
+        }
+    }
+}
+
+class LocationHooker : XposedModule() {
+    init {
+        XposedHelpers.module = this
+    }
+
+    @Volatile
+    private var xsharedPrefs: Any? = null
+
+    private val nmeaTimers = ConcurrentHashMap<Any, java.util.Timer>()
+    private val hookedCallbackClasses = ConcurrentHashMap<Class<*>, Boolean>()
+    @Volatile
+    private var currentPackageName: String = ""
+
+    override fun onPackageLoaded(param: XposedModuleInterface.PackageLoadedParam) {
+        // Nothing here for now
+    }
+
+    override fun onPackageReady(param: XposedModuleInterface.PackageReadyParam) {
+        val pkg = param.packageName
+        val classLoader = param.classLoader
+        handleLoadPackage(pkg, classLoader)
+    }
+    
+    // --- Original Logic ---
+
+
+    companion object {
+
+        // 系统进程同样需要覆盖（android进程持有LocationManagerService）
+        val SYSTEM_PACKAGES = setOf("android", "system", "com.android.phone")
+        private const val VERBOSE_CELL_BUILD_LOGS = false
+        private const val EARTH_RADIUS_METERS = 6378137.0
+        private const val DEFAULT_JITTER_RADIUS_METERS = 30.0
+        private const val MIN_JITTER_RADIUS_METERS = 1.0
+        private const val MAX_JITTER_RADIUS_METERS = 80.0
+    }
+
+    fun handleLoadPackage(pkg: String, classLoader: ClassLoader) {
+        currentPackageName = pkg
+        
+
+        // 宿主App自报平安
+        if (pkg == "com.shiraka.locatiobprovid") {
+            return // 宿主App不需要注入定位Hook
+        }
+
+        // 系统进程：允许执行所有的环境数据Hook，实现系统原生界面的完美覆盖
+        // if (SYSTEM_PACKAGES.contains(pkg)) {
+        //     hookLocationAPIs(classLoader, pkg)
+        //     return
+        // }
+
+
+        XposedBridge.log("[LocationSpoofer] Hooking package: $pkg")
+        XposedBridge.logOpenCellId("handleLoadPackage pkg=$pkg classLoader=$classLoader")
+
+        // ★ 反检测: 必须在其他Hook之前安装,隐藏Xposed环境
+        hookAntiDetection(classLoader)
+
+        hookLocationAPIs(classLoader, pkg)
+        hookWifiEnvironment(classLoader)
+        hookCellEnvironment(classLoader)
+        hookConnectivityLayer(classLoader)
+        hookBluetoothLE(classLoader)
+        hookGnssStatus(classLoader)
+        // Magnetic-field sensor rewriting is intentionally not part of the stable pipeline.
+        // It can lower compass confidence when the physical sensor calibration disagrees with
+        // the calculated geomagnetic model, so keep compass data untouched by default.
+    }
+
+    /**
+     * ★ 反检测: 隐藏Xposed环境,防止反作弊SDK检测到Hook
+     *
+     * 设计原则:
+     * 1. 只使用精确匹配,绝不使用宽泛的contains/startsWith,避免误杀正常类
+     * 2. 不Hook ClassLoader.loadClass的宽泛模式(会导致App卡死)
+     * 3. 不Hook BufferedReader.readLine(开销巨大)
+     * 4. 不Hook File.exists/Runtime.exec(干扰正常功能)
+     */
+    private fun hookAntiDetection(classLoader: ClassLoader) {
+
+        // ── 1. 堆栈帧过滤 ──
+        // 反作弊SDK通过getStackTrace()检查调用链,发现Xposed帧即判定为Hook环境
+        // 只过滤精确匹配的Xposed类名,不影响正常堆栈
+        val xposedClassNames = setOf(
+            "de.robv.android.xposed.XposedBridge",
+            "de.robv.android.xposed.XC_MethodHook",
+            "de.robv.android.xposed.XC_MethodReplacement",
+            "de.robv.android.xposed.XposedHelpers",
+            "de.robv.android.xposed.XC_MethodHook\$MethodHookParam",
+            "io.github.libxposed.api.XposedModule",
+            "io.github.libxposed.api.XposedInterface",
+            "io.github.libxposed.api.XposedModuleInterface",
+            "org.lsposed.manager.MainApplication",
+            "io.github.lsposed.manager.App"
+        )
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                "java.lang.Throwable", classLoader, "getStackTrace",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val rawStackTrace = param.result as? Array<*> ?: return
+                        val stackTrace = rawStackTrace.filterIsInstance<StackTraceElement>()
+                        val filtered = stackTrace.filter { elem ->
+                            elem.className !in xposedClassNames
+                        }.toTypedArray()
+                        if (filtered.size != rawStackTrace.size) {
+                            param.result = filtered
+                        }
+                    }
+                })
+        } catch (_: Throwable) {}
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                "java.lang.Thread", classLoader, "getStackTrace",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val rawStackTrace = param.result as? Array<*> ?: return
+                        val stackTrace = rawStackTrace.filterIsInstance<StackTraceElement>()
+                        val filtered = stackTrace.filter { elem ->
+                            elem.className !in xposedClassNames
+                        }.toTypedArray()
+                        if (filtered.size != rawStackTrace.size) {
+                            param.result = filtered
+                        }
+                    }
+                })
+        } catch (_: Throwable) {}
+
+        // ── 2. Class.forName 精确匹配 ──
+        // 反作弊SDK通过Class.forName()尝试加载Xposed类,成功则判定为Hook环境
+        // 使用精确匹配(不是contains),只拦截已知Xposed类名
+        try {
+            XposedHelpers.findAndHookMethod(
+                "java.lang.Class", classLoader, "forName",
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                ClassLoader::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val className = param.args[0] as? String ?: return
+                        if (className in xposedClassNames) {
+                            throw ClassNotFoundException()
+                        }
+                    }
+                })
+        } catch (_: Throwable) {
+            // 降级: 尝试2参数版本
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "java.lang.Class", classLoader, "forName",
+                    String::class.java,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val className = param.args[0] as? String ?: return
+                            if (className in xposedClassNames) {
+                                throw ClassNotFoundException()
+                            }
+                        }
+                    })
+            } catch (_: Throwable) {}
+        }
+
+        // ── 3. ClassLoader.loadClass 精确匹配 ──
+        // 同样使用精确匹配,只拦截已知Xposed类名
+        // loadClass被调用频率很高,精确匹配确保零误杀
+        try {
+            XposedHelpers.findAndHookMethod(
+                "java.lang.ClassLoader", classLoader, "loadClass",
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val className = param.args[0] as? String ?: return
+                        if (className in xposedClassNames) {
+                            throw ClassNotFoundException()
+                        }
+                    }
+                })
+        } catch (_: Throwable) {}
+
+// ── 4. 拦截 AppOpsManager 的 OP_MOCK_LOCATION (58) ──
+        // 很多深度定制系统（如 MIUI）和硬核反作弊会检查 AppOps 权限
+        try {
+            val appOpsHook = object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val config = readConfig() ?: return
+                    if (!config.optBoolean("active", false)) return
+                    
+                    val opArg = param.args[0]
+                    val isMockOp = if (opArg is Int) {
+                        opArg == 58 // OP_MOCK_LOCATION
+                    } else if (opArg is String) {
+                        opArg == "android:mock_location"
+                    } else false
+
+                    if (isMockOp) {
+                        // MODE_IGNORED = 1, MODE_ERRORED = 2
+                        param.result = 1 // MODE_IGNORED，让对方以为我们没有被授权模拟位置
+                    }
+                }
+            }
+            
+            val appOpsClass = XposedHelpers.findClass("android.app.AppOpsManager", classLoader)
+            try { XposedBridge.hookAllMethods(appOpsClass, "checkOp", appOpsHook) } catch (e: Throwable) {}
+            try { XposedBridge.hookAllMethods(appOpsClass, "checkOpNoThrow", appOpsHook) } catch (e: Throwable) {}
+            try { XposedBridge.hookAllMethods(appOpsClass, "noteOp", appOpsHook) } catch (e: Throwable) {}
+            try { XposedBridge.hookAllMethods(appOpsClass, "noteOpNoThrow", appOpsHook) } catch (e: Throwable) {}
+        } catch (e: Throwable) { XposedBridge.log(e) }
+
+        // ── 5. 拦截 Settings.Secure 的 mock_location 开关查询 ──
+        try {
+            val secureHook = object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val config = readConfig() ?: return
+                    if (!config.optBoolean("active", false)) return
+                    
+                    val name = param.args[1] as? String
+                    if (name == "mock_location") {
+                        if (param.method?.name == "getInt") {
+                            param.result = 0
+                        } else if (param.method?.name == "getString") {
+                            param.result = "0"
+                        }
+                    }
+                }
+            }
+            
+            val secureClass = XposedHelpers.findClass("android.provider.Settings\$Secure", classLoader)
+            try { XposedHelpers.findAndHookMethod(secureClass, "getInt", android.content.ContentResolver::class.java, String::class.java, secureHook) } catch (e: Throwable) {}
+            try { XposedHelpers.findAndHookMethod(secureClass, "getInt", android.content.ContentResolver::class.java, String::class.java, Int::class.javaPrimitiveType, secureHook) } catch (e: Throwable) {}
+            try { XposedHelpers.findAndHookMethod(secureClass, "getString", android.content.ContentResolver::class.java, String::class.java, secureHook) } catch (e: Throwable) {}
+        } catch (e: Throwable) { XposedBridge.log(e) }
+
+        XposedBridge.log("[LocationSpoofer] Anti-detection hooks installed")
+    }
+
+    private var startTimestamp = System.currentTimeMillis()
+
+    // ── GCJ-02 → WGS-84 转换（Xposed模块运行在目标App进程，必须自带转换代码）──
+    private val GCJ_A = 6378245.0
+    private val GCJ_EE = 0.00669342162296594
+
+    private fun gcj02ToWgs84(gcjLat: Double, gcjLng: Double): Pair<Double, Double> {
+        if (gcjLng < 72.004 || gcjLng > 137.8347 || gcjLat < 0.8293 || gcjLat > 55.8271)
+            return Pair(gcjLat, gcjLng)
+        val dLat = gcjTransformLat(gcjLng - 105.0, gcjLat - 35.0)
+        val dLng = gcjTransformLng(gcjLng - 105.0, gcjLat - 35.0)
+        val radLat = gcjLat / 180.0 * Math.PI
+        var magic = sin(radLat)
+        magic = 1 - GCJ_EE * magic * magic
+        val sqrtMagic = sqrt(magic)
+        val mLat = (dLat * 180.0) / ((GCJ_A * (1 - GCJ_EE)) / (magic * sqrtMagic) * Math.PI)
+        val mLng = (dLng * 180.0) / (GCJ_A / sqrtMagic * cos(radLat) * Math.PI)
+        return Pair(gcjLat - mLat, gcjLng - mLng)
+    }
+
+    private fun gcjTransformLat(x: Double, y: Double): Double {
+        var ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * sqrt(abs(x))
+        ret += (20.0 * sin(6.0 * x * Math.PI) + 20.0 * sin(2.0 * x * Math.PI)) * 2.0 / 3.0
+        ret += (20.0 * sin(y * Math.PI) + 40.0 * sin(y / 3.0 * Math.PI)) * 2.0 / 3.0
+        ret += (160.0 * sin(y / 12.0 * Math.PI) + 320.0 * sin(y * Math.PI / 30.0)) * 2.0 / 3.0
+        return ret
+    }
+
+    private fun gcjTransformLng(x: Double, y: Double): Double {
+        var ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * sqrt(abs(x))
+        ret += (20.0 * sin(6.0 * x * Math.PI) + 20.0 * sin(2.0 * x * Math.PI)) * 2.0 / 3.0
+        ret += (20.0 * sin(x * Math.PI) + 40.0 * sin(x / 3.0 * Math.PI)) * 2.0 / 3.0
+        ret += (150.0 * sin(x / 12.0 * Math.PI) + 300.0 * sin(x / 30.0 * Math.PI)) * 2.0 / 3.0
+        return ret
+    }
+
+    // ── GCJ-02 → BD-09 转换(百度坐标系) ──
+    //
+    // BD-09是百度在GCJ-02基础上施加的二次偏移坐标系。百度地图/百度定位SDK(BDLocation)
+    // 内部期望接收BD-09坐标,若直接传入GCJ-02会产生约100-500米的固定偏移。
+    //
+    // 算法原理:
+    // 1. 将GCJ-02坐标解释为以(0,0)为中心的直角坐标(x=lng, y=lat)
+    // 2. 施加百度公开的偏移常量(x偏移0.0065度, y偏移0.006度)
+    // 3. 将偏移后的直角坐标转为极坐标(r, theta),其中r=sqrt(x^2+y^2), theta=atan2(y,x)
+    // 4. 对极角theta叠加一个与r相关的微小旋转量: theta += BD_PI * sin(r * BD_PI) * 0.000003
+    //    BD_PI = pi * 3000/180 ≈ 52.3598..., 这是百度定义的旋转频率系数
+    // 5. 对极径r叠加微小伸缩: r += BD_PI * cos(r * BD_PI) * 0.00002
+    // 6. 将修正后的极坐标转回直角坐标,即为BD-09经纬度
+    //
+    // 为何不能省略此转换:
+    // BDLocation.getLatitude()被Hook后如果返回GCJ-02坐标,百度SDK内部不会再做转换,
+    // 直接将该值作为BD-09渲染到地图上,导致显示位置相对真实位置偏移数百米。
+
+    /** 百度坐标系旋转频率常量: pi * 3000 / 180 */
+    private val BD_PI = Math.PI * 3000.0 / 180.0
+
+    /**
+     * GCJ-02坐标转BD-09坐标
+     *
+     * @param gcjLat GCJ-02纬度(高德/腾讯坐标系)
+     * @param gcjLng GCJ-02经度
+     * @return Pair(BD-09纬度, BD-09经度)
+     */
+    private fun gcj02ToBd09(gcjLat: Double, gcjLng: Double): Pair<Double, Double> {
+        val x = gcjLng
+        val y = gcjLat
+        val z = sqrt(x * x + y * y) + 0.00002 * sin(y * BD_PI)
+        val theta = Math.atan2(y, x) + 0.000003 * cos(x * BD_PI)
+        val bdLng = z * cos(theta) + 0.0065
+        val bdLat = z * sin(theta) + 0.006
+        return Pair(bdLat, bdLng)
+    }
+
+    /**
+     * 高斯随机游走状态(Xposed进程内独立维护)
+     * 使用Ornstein-Uhlenbeck过程: X(t+dt) = X(t) + sigma*sqrt(dt)*N(0,1) - alpha*X(t)*dt
+     * 产生白噪声频谱,FFT检测无法发现单频峰
+     */
+    private val rng = Random()
+    private var hookDriftNorthMeters = 0.0
+    private var hookDriftEastMeters = 0.0
+    private var hookAccuracyDrift = 0.0
+    private var hookLastCallTime = 0L
+    private var cachedJitterAt = 0L
+    private var cachedJitterBaseLat = Double.NaN
+    private var cachedJitterBaseLng = Double.NaN
+    private var cachedJitterRadius = DEFAULT_JITTER_RADIUS_METERS
+    private var cachedJitterSpeed = "MEDIUM"
+    private var cachedJitteredLocation = Pair(0.0, 0.0)
+    private val locationUpdateHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
+    private val activeLocationUpdateRunnables = ConcurrentHashMap<Int, Runnable>()
+    private var lastSpoofedWallTimeMs = 0L
+    private var lastSpoofedElapsedRealtimeNanos = 0L
+    private val locationTimestampCache: MutableMap<Any, SpoofedTimestamps> =
+        Collections.synchronizedMap(WeakHashMap())
+
+    private data class SpoofedTimestamps(
+        val wallTimeMs: Long,
+        val elapsedRealtimeNanos: Long
+    )
+
+    private fun nextSpoofedTimestamps(): SpoofedTimestamps {
+        synchronized(this) {
+            val rawWall = System.currentTimeMillis()
+            val rawElapsed = android.os.SystemClock.elapsedRealtimeNanos()
+            val wall = if (rawWall > lastSpoofedWallTimeMs) rawWall else lastSpoofedWallTimeMs + 1L
+            val elapsed = if (rawElapsed > lastSpoofedElapsedRealtimeNanos) {
+                rawElapsed
+            } else {
+                lastSpoofedElapsedRealtimeNanos + 1_000_000L
+            }
+            lastSpoofedWallTimeMs = wall
+            lastSpoofedElapsedRealtimeNanos = elapsed
+            return SpoofedTimestamps(wall, elapsed)
+        }
+    }
+
+    private fun timestampsForLocation(loc: Any?): SpoofedTimestamps {
+        if (loc == null) return nextSpoofedTimestamps()
+        locationTimestampCache[loc]?.let { return it }
+
+        val raw = readRawLocationTimestamps(loc)
+        if (raw != null) {
+            locationTimestampCache[loc] = raw
+            return raw
+        }
+
+        val generated = nextSpoofedTimestamps()
+        locationTimestampCache[loc] = generated
+        return generated
+    }
+
+    private fun rememberLocationTimestamps(loc: Any, timestamps: SpoofedTimestamps) {
+        locationTimestampCache[loc] = timestamps
+    }
+
+    private fun readRawLocationTimestamps(loc: Any): SpoofedTimestamps? {
+        val elapsed = readLongFieldOrNull(loc, "mElapsedRealtimeNs")
+            ?: readLongFieldOrNull(loc, "mElapsedRealtimeNanos")
+            ?: readLongFieldOrNull(loc, "elapsedRealtimeNanos")
+        if (elapsed == null || elapsed <= 0L) return null
+
+        val wall = readLongFieldOrNull(loc, "mTimeMs")
+            ?: readLongFieldOrNull(loc, "mTime")
+            ?: readLongFieldOrNull(loc, "time")
+            ?: System.currentTimeMillis()
+        return SpoofedTimestamps(wall, elapsed)
+    }
+
+    private fun readLongFieldOrNull(obj: Any, fieldName: String): Long? {
+        return try {
+            (XposedHelpers.getObjectField(obj, fieldName) as? Number)?.toLong()
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun getJitteredLocation(baseLat: Double, baseLng: Double): Pair<Double, Double> {
+        val enableJitter = lastConfig?.optBoolean("enable_jitter", true) ?: true
+        if (!enableJitter) return Pair(baseLat, baseLng)
+        val jitterRadius = jitterRadiusMeters()
+        val profile = jitterProfile()
+
+        val now = System.currentTimeMillis()
+        if (
+            now - cachedJitterAt < profile.sampleIntervalMs &&
+            cachedJitterBaseLat == baseLat &&
+            cachedJitterBaseLng == baseLng &&
+            cachedJitterRadius == jitterRadius &&
+            cachedJitterSpeed == profile.speedName
+        ) {
+            return cachedJitteredLocation
+        }
+
+        val dt = if (hookLastCallTime > 0) {
+            ((now - hookLastCallTime) / 1000.0).coerceIn(0.01, 5.0)
+        } else 1.0
+        hookLastCallTime = now
+
+        val sigma = jitterRadius / profile.sigmaDivisor
+        val alpha = profile.pullback
+        
+        hookDriftNorthMeters += sigma * sqrt(dt) * rng.nextGaussian() - alpha * hookDriftNorthMeters * dt
+        hookDriftEastMeters += sigma * sqrt(dt) * rng.nextGaussian() - alpha * hookDriftEastMeters * dt
+
+        val driftDistance = sqrt(hookDriftNorthMeters * hookDriftNorthMeters + hookDriftEastMeters * hookDriftEastMeters)
+        if (driftDistance > jitterRadius && driftDistance > 0.0) {
+            val scale = jitterRadius / driftDistance
+            hookDriftNorthMeters *= scale
+            hookDriftEastMeters *= scale
+        }
+
+        val latRad = Math.toRadians(baseLat)
+        val lngCos = cos(latRad).let { if (abs(it) < 1e-6) 1e-6 else it }
+        val jittered = Pair(
+            baseLat + Math.toDegrees(hookDriftNorthMeters / EARTH_RADIUS_METERS),
+            baseLng + Math.toDegrees(hookDriftEastMeters / (EARTH_RADIUS_METERS * lngCos))
+        )
+        cachedJitterAt = now
+        cachedJitterBaseLat = baseLat
+        cachedJitterBaseLng = baseLng
+        cachedJitterRadius = jitterRadius
+        cachedJitterSpeed = profile.speedName
+        cachedJitteredLocation = jittered
+        return jittered
+    }
+
+    private fun getJitteredAccuracy(): Float {
+        val jitterRadius = jitterRadiusMeters()
+        hookAccuracyDrift += 0.5 * rng.nextGaussian() - 0.03 * hookAccuracyDrift
+        val baseAccuracy = (jitterRadius * 0.65).coerceIn(8.0, 50.0)
+        return (baseAccuracy + hookAccuracyDrift).coerceIn(3.0, 55.0).toFloat()
+    }
+
+    private fun jitterRadiusMeters(): Double {
+        return (lastConfig?.optDouble("jitter_radius_meters", DEFAULT_JITTER_RADIUS_METERS)
+            ?: DEFAULT_JITTER_RADIUS_METERS).coerceIn(MIN_JITTER_RADIUS_METERS, MAX_JITTER_RADIUS_METERS)
+    }
+
+    private data class JitterProfile(
+        val speedName: String,
+        val sampleIntervalMs: Long,
+        val sigmaDivisor: Double,
+        val pullback: Double
+    )
+
+    private fun jitterProfile(): JitterProfile {
+        val speed = lastConfig?.optString("jitter_speed", "MEDIUM")?.uppercase() ?: "MEDIUM"
+        return when (speed) {
+            "SLOW" -> JitterProfile("SLOW", 2_500L, 55.0, 0.08)
+            "FAST" -> JitterProfile("FAST", 800L, 30.0, 0.12)
+            else -> JitterProfile("MEDIUM", 1_500L, 42.0, 0.10)
+        }
+    }
+
+
+    private fun hookLocationAPIs(classLoader: ClassLoader, currentPkg: String) {
+        try {
+            // android.location.Location 标准接口: 返回GCJ-02坐标
+            //
+            // 关键决策 -- 为何不返回WGS-84:
+            // 在中国大陆,系统GPS HAL层已内置GCJ-02强制加偏(国家测绘法规要求)。
+            // 因此android.location.Location.getLatitude()在中国设备上实际返回的是GCJ-02坐标,
+            // 而非API文档声称的WGS-84。所有中国地图App(高德/腾讯/百度)都基于这一事实编写:
+            // 它们从Location拿到坐标后不会再做WGS-84到GCJ-02的转换,而是直接使用。
+            //
+            // 如果我们返回真正的WGS-84,App会把它当GCJ-02直接传给地图SDK渲染,
+            // 由于WGS-84与GCJ-02之间存在约300-500米的非线性偏移,地图上会出现固定偏移。
+            // 这正是之前微信和学习通出现定位偏移的根本原因。
+            val getLatHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        val appSystems = config.optJSONObject("app_coordinate_systems")
+                        val basePkg = currentPkg.substringBefore(":")
+                        // optString 在 key 不存在时返回 ""（空字符串），不是 null！
+                        // 必须用 has() 先检查，否则会错误匹配到空字符串分支
+                        val targetSys = if (appSystems?.has(basePkg) == true) {
+                            appSystems.optString(basePkg, "GCJ-02")
+                        } else {
+                            "GCJ-02"
+                        }
+                        val baseLat = when (targetSys) {
+                            "WGS-84" -> config.optDouble("wgs84_lat", param.result as Double)
+                            "BD-09" -> config.optDouble("bd09_lat", param.result as Double)
+                            else -> config.optDouble("lat", param.result as Double)
+                        }
+                        val baseLng = when (targetSys) {
+                            "WGS-84" -> config.optDouble("wgs84_lng", 0.0)
+                            "BD-09" -> config.optDouble("bd09_lng", 0.0)
+                            else -> config.optDouble("lng", 0.0)
+                        }
+                        param.result = getJitteredLocation(baseLat, baseLng).first
+                    }
+                }
+            }
+
+            val getLngHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        val appSystems = config.optJSONObject("app_coordinate_systems")
+                        val basePkg = currentPkg.substringBefore(":")
+                        // optString 在 key 不存在时返回 ""（空字符串），不是 null！
+                        val targetSys = if (appSystems?.has(basePkg) == true) {
+                            appSystems.optString(basePkg, "GCJ-02")
+                        } else {
+                            "GCJ-02"
+                        }
+                        val baseLat = when (targetSys) {
+                            "WGS-84" -> config.optDouble("wgs84_lat", 0.0)
+                            "BD-09" -> config.optDouble("bd09_lat", 0.0)
+                            else -> config.optDouble("lat", 0.0)
+                        }
+                        val baseLng = when (targetSys) {
+                            "WGS-84" -> config.optDouble("wgs84_lng", param.result as Double)
+                            "BD-09" -> config.optDouble("bd09_lng", param.result as Double)
+                            else -> config.optDouble("lng", param.result as Double)
+                        }
+                        param.result = getJitteredLocation(baseLat, baseLng).second
+                    }
+                }
+            }
+
+            val getAccHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        param.result = getJitteredAccuracy()
+                    }
+                }
+            }
+
+            val getAltHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        val baseAlt = config.optDouble("altitude", 0.0)
+                        val enableJitter = config.optBoolean("enable_jitter", true)
+                        param.result = if (enableJitter && baseAlt > 0.0) {
+                            // 稍微抖动海拔，真实气压计存在起伏，±0.5米
+                            baseAlt + (rng.nextDouble() - 0.5)
+                        } else {
+                            baseAlt
+                        }
+                    }
+                }
+            }
+
+            val freshWallTimeHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        param.result = timestampsForLocation(param.thisObject).wallTimeMs
+                    }
+                }
+            }
+
+            val freshElapsedRealtimeNanosHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        param.result = timestampsForLocation(param.thisObject).elapsedRealtimeNanos
+                    }
+                }
+            }
+
+            val freshElapsedRealtimeMillisHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        param.result = timestampsForLocation(param.thisObject).elapsedRealtimeNanos / 1_000_000L
+                    }
+                }
+            }
+
+            val freshElapsedRealtimeAgeHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        param.result = 0L
+                    }
+                }
+            }
+
+            val outboundParcelHook = object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val loc = param.thisObject ?: return
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        applySpoofedLocationToObject(loc, config)
+                    }
+                }
+            }
+
+            XposedHelpers.findAndHookMethod(
+                "android.location.Location",
+                classLoader,
+                "getLatitude",
+                getLatHook
+            )
+            XposedHelpers.findAndHookMethod(
+                "android.location.Location",
+                classLoader,
+                "getLongitude",
+                getLngHook
+            )
+            XposedHelpers.findAndHookMethod(
+                "android.location.Location",
+                classLoader,
+                "getAccuracy",
+                getAccHook
+            )
+            XposedHelpers.findAndHookMethod(
+                "android.location.Location",
+                classLoader,
+                "getAltitude",
+                getAltHook
+            )
+            XposedHelpers.findAndHookMethod(
+                "android.location.Location",
+                classLoader,
+                "getTime",
+                freshWallTimeHook
+            )
+            XposedHelpers.findAndHookMethod(
+                "android.location.Location",
+                classLoader,
+                "getElapsedRealtimeNanos",
+                freshElapsedRealtimeNanosHook
+            )
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "android.location.Location",
+                    classLoader,
+                    "getElapsedRealtimeMillis",
+                    freshElapsedRealtimeMillisHook
+                )
+            } catch (_: Throwable) {
+            }
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "android.location.Location",
+                    classLoader,
+                    "getElapsedRealtimeAgeMillis",
+                    freshElapsedRealtimeAgeHook
+                )
+            } catch (_: Throwable) {
+            }
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "android.location.Location",
+                    classLoader,
+                    "writeToParcel",
+                    android.os.Parcel::class.java,
+                    Int::class.javaPrimitiveType!!,
+                    outboundParcelHook
+                )
+                XposedBridge.log("[LocationSpoofer] Location.writeToParcel outbound hook installed")
+            } catch (e: Throwable) {
+                XposedBridge.log("[LocationSpoofer] Location.writeToParcel hook failed: $e")
+            }
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "android.location.Location",
+                    classLoader,
+                    "getElapsedRealtimeAgeMillis",
+                    Long::class.javaPrimitiveType,
+                    freshElapsedRealtimeAgeHook
+                )
+            } catch (_: Throwable) {
+            }
+
+            // ★ 核心反检测：抹除 isFromMockProvider 标志位（strategy:100 的根本来源）
+            val antiMockHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        param.result = false
+                    }
+                }
+            }
+            // Android 6~11: isFromMockProvider()
+            XposedHelpers.findAndHookMethod(
+                "android.location.Location",
+                classLoader,
+                "isFromMockProvider",
+                antiMockHook
+            )
+            // Android 12+: isMock()
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "android.location.Location",
+                    classLoader,
+                    "isMock",
+                    antiMockHook
+                )
+            } catch (e: Throwable) { /* API < 31 没有此方法 */
+            }
+
+            // ★ Android 13 专项：直接对 Location 对象的 mMock / mIsFromMockProvider 字段写 false
+            // (Android 12+ 字段名改为 mMock，Android 6-11 为 mIsFromMockProvider)
+            val fieldCleanHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        val loc = param.thisObject ?: return
+                        try {
+                            XposedHelpers.setBooleanField(loc, "mMock", false)
+                        } catch (e: Throwable) {
+                        }
+                        try {
+                            XposedHelpers.setBooleanField(loc, "mIsFromMockProvider", false)
+                        } catch (e: Throwable) {
+                        }
+                        // 清理 extras bundle 中可能残留的 mock 标记
+                        try {
+                            val extras =
+                                XposedHelpers.callMethod(loc, "getExtras") as? android.os.Bundle
+                            extras?.remove("mockLocation")
+                            extras?.remove("isMock")
+                            // ★ Add fake satellites count to bundle
+                            val satCount = config.optInt("satellite_count", 10)
+                            if (extras == null) {
+                                val newBundle = android.os.Bundle()
+                                newBundle.putInt("satellites", satCount)
+                                XposedHelpers.setObjectField(loc, "mExtras", newBundle)
+                            } else {
+                                extras.putInt("satellites", satCount)
+                            }
+                        } catch (e: Throwable) {
+                        }
+                    }
+                }
+            }
+            // 在 getLatitude/getLongitude/getAccuracy 时同步清字段，确保在实际读值前已抹除
+            XposedHelpers.findAndHookMethod(
+                "android.location.Location",
+                classLoader,
+                "getLatitude",
+                fieldCleanHook
+            )
+            XposedHelpers.findAndHookMethod(
+                "android.location.Location",
+                classLoader,
+                "getLongitude",
+                fieldCleanHook
+            )
+
+            // ★ 拦截 Settings.Secure.getInt("mock_location") — 部分ROM通过这个判断是否开了开发者模式模拟位置
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "android.provider.Settings\$Secure",
+                    classLoader,
+                    "getInt",
+                    android.content.ContentResolver::class.java,
+                    String::class.java,
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val config = readConfig()
+                            if (config != null && config.optBoolean("active", false)) {
+                                val key = param.args[1] as? String ?: return
+                                if (key == "mock_location" || key == "allow_mock_location") {
+                                    param.result = 0 // 0 = 关闭模拟位置（欺骗系统认为我们没开）
+                                }
+                            }
+                        }
+                    }
+                )
+            } catch (e: Throwable) {
+                XposedBridge.log(e)
+            }
+
+            // ★ 拦截 getProvider：将 "mock" / "test" 提供者名隐藏，换成 "gps"
+            XposedHelpers.findAndHookMethod(
+                "android.location.Location", classLoader, "getProvider",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config != null && config.optBoolean("active", false)) {
+                            val provider = param.result as? String ?: return
+                            if (provider.contains("mock", ignoreCase = true) ||
+                                provider.contains("test", ignoreCase = true) ||
+                                provider.contains("fake", ignoreCase = true)
+                            ) {
+                                param.result = android.location.LocationManager.GPS_PROVIDER
+                            }
+                        }
+                    }
+                })
+
+            // ★ 拦截 LocationManager.getProviders() / getAllProviders()：移除 mock/test 提供者
+            val providerListHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        @Suppress("UNCHECKED_CAST")
+                        val list = param.result as? MutableList<String> ?: return
+                        val cleaned = list.filterNot {
+                            it.contains("mock", ignoreCase = true) ||
+                                    it.contains("test", ignoreCase = true) ||
+                                    it.contains("fake", ignoreCase = true)
+                        }.toMutableList()
+                        if (!cleaned.contains(android.location.LocationManager.GPS_PROVIDER))
+                            cleaned.add(android.location.LocationManager.GPS_PROVIDER)
+                        param.result = cleaned
+                    }
+                }
+            }
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "android.location.LocationManager", classLoader, "getProviders",
+                    Boolean::class.javaPrimitiveType!!, providerListHook
+                )
+                XposedHelpers.findAndHookMethod(
+                    "android.location.LocationManager", classLoader, "getAllProviders",
+                    providerListHook
+                )
+            } catch (e: Throwable) {
+                XposedBridge.log(e)
+            }
+
+            try {
+                val locationManagerClass = XposedHelpers.findClass("android.location.LocationManager", classLoader)
+                XposedHelpers.findAndHookMethod(
+                    locationManagerClass,
+                    "isLocationEnabled",
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val config = readConfig()
+                            if (config != null && config.optBoolean("active", false)) {
+                                param.result = true
+                            }
+                        }
+                    }
+                )
+                XposedHelpers.findAndHookMethod(
+                    locationManagerClass,
+                    "isProviderEnabled",
+                    String::class.java,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val config = readConfig()
+                            if (config != null && config.optBoolean("active", false)) {
+                                val provider = param.args.getOrNull(0) as? String
+                                if (provider == android.location.LocationManager.GPS_PROVIDER ||
+                                    provider == android.location.LocationManager.NETWORK_PROVIDER ||
+                                    provider == "fused"
+                                ) {
+                                    param.result = true
+                                }
+                            }
+                        }
+                    }
+                )
+                XposedHelpers.findAndHookMethod(
+                    locationManagerClass,
+                    "getLastKnownLocation",
+                    String::class.java,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val config = readConfig()
+                            if (config != null && config.optBoolean("active", false)) {
+                                param.result = buildSpoofedAndroidLocation(config)
+                            }
+                        }
+                    }
+                )
+
+                val singleLocationHook = object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config == null || !config.optBoolean("active", false)) return
+                        deliverLocationOnce(param.args, config)
+                        param.result = null
+                    }
+                }
+                val continuousLocationHook = object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config == null || !config.optBoolean("active", false)) return
+                        deliverLocationOnce(param.args, config)
+                        startContinuousLocationUpdates(param.args)
+                        param.result = null
+                    }
+                }
+                val removeUpdatesHook = object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        stopContinuousLocationUpdates(param.args)
+                        param.result = null
+                    }
+                }
+                XposedBridge.hookAllMethods(locationManagerClass, "requestLocationUpdates", continuousLocationHook)
+                XposedBridge.hookAllMethods(locationManagerClass, "requestSingleUpdate", singleLocationHook)
+                XposedBridge.hookAllMethods(locationManagerClass, "getCurrentLocation", singleLocationHook)
+                XposedBridge.hookAllMethods(locationManagerClass, "removeUpdates", removeUpdatesHook)
+            } catch (e: Throwable) {
+                XposedBridge.log("[LocationSpoofer] LocationManager active provider hook failed: $e")
+            }
+
+            // ★ NMEA-0183 报文劫持
+            try {
+                val addNmeaListenerHook = object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        // 强制启动代理注入，无论当前active是true还是false。
+                        // 真正的状态校验在代理注入器的Timer中进行。
+                        
+                        val args = param.args
+                        for (i in args.indices) {
+                            val arg = args[i] ?: continue
+                            
+                            // Check if it implements OnNmeaMessageListener
+                            val isOnNmea = try {
+                                val clazz = classLoader.loadClass("android.location.OnNmeaMessageListener")
+                                clazz.isInstance(arg)
+                            } catch (e: Exception) {
+                                false
+                            }
+                            
+                            // Check if it implements GpsStatus.NmeaListener
+                            val isGpsNmea = try {
+                                val clazz = classLoader.loadClass("android.location.GpsStatus\$NmeaListener")
+                                clazz.isInstance(arg)
+                            } catch (e: Exception) {
+                                false
+                            }
+                            
+                            if (isOnNmea) {
+                                XposedBridge.log("[GPS_Spoofer] Detected addNmeaListener(OnNmeaMessageListener)! Starting active injector.")
+                                args[i] = createOnNmeaMessageListenerProxy(arg, classLoader)
+                            } else if (isGpsNmea) {
+                                XposedBridge.log("[GPS_Spoofer] Detected addNmeaListener(GpsStatus.NmeaListener)! Starting active injector.")
+                                args[i] = createGpsStatusNmeaListenerProxy(arg, classLoader)
+                            }
+                        }
+                    }
+                }
+                val locationManagerClazz = XposedHelpers.findClass("android.location.LocationManager", classLoader)
+                XposedBridge.hookAllMethods(locationManagerClazz, "addNmeaListener", addNmeaListenerHook)
+                
+                // Hook removeNmeaListener
+                XposedBridge.hookAllMethods(locationManagerClazz, "removeNmeaListener", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        for (arg in param.args) {
+                            if (arg != null) {
+                                nmeaTimers.remove(arg)?.cancel()
+                                XposedBridge.log("[GPS_Spoofer] removeNmeaListener called, canceled timer.")
+                            }
+                        }
+                    }
+                })
+            } catch (e: Throwable) {
+                XposedBridge.log(e)
+            }
+
+            // ── 高德SDK专属Hook(含抖动,与原生Location保持同步) ──
+            // 使用findClassIfExists安全探测: 微信小程序子进程(:appbrand0等)不加载高德SDK,
+            // 直接findAndHookMethod会抛出ClassNotFoundError,中断整个hookLocationAPIs执行流。
+            // findClassIfExists在类不存在时返回null而非抛异常,可安全跳过。
+            val amapLocClazz = XposedHelpers.findClassIfExists(
+                "com.amap.api.location.AMapLocation", classLoader
+            )
+
+            if (amapLocClazz != null) {
+                XposedBridge.log("[LocationSpoofer] AMapLocation class found, installing AMap hooks")
+                val amapLocClass = "com.amap.api.location.AMapLocation"
+
+                // AMap SDK 专属 Hook（含抖动，与原生Location保持同步）
+                val amapHook = object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config != null && config.optBoolean("active", false)) {
+                            val baseLat = config.optDouble("lat", 0.0)
+                            val baseLng = config.optDouble("lng", 0.0)
+                            val jittered = getJitteredLocation(baseLat, baseLng)
+                            when (param.method!!.name) {
+                                "getLatitude" -> param.result = jittered.first
+                                "getLongitude" -> param.result = jittered.second
+                            }
+                        }
+                    }
+                }
+                try {
+                    XposedHelpers.findAndHookMethod(amapLocClass, classLoader, "getLatitude", amapHook)
+                    XposedHelpers.findAndHookMethod(amapLocClass, classLoader, "getLongitude", amapHook)
+                } catch (e: Throwable) { /* AMap SDK方法签名不匹配则跳过 */ }
+
+                // ★★★ 高德SDK深度反检测（strategy:500 的来源）
+                // mockData JSON 就是 AMapLocation.getMockData() 的返回值，直接抹零
+                val amapNullHook = object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config != null && config.optBoolean("active", false)) {
+                            param.result = null
+                        }
+                    }
+                }
+                val amapFalseHook = object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config != null && config.optBoolean("active", false)) {
+                            param.result = false
+                        }
+                    }
+                }
+                val amapZeroHook = object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config != null && config.optBoolean("active", false)) {
+                            param.result = 0
+                        }
+                    }
+                }
+
+                try {
+                    // 1. getMockData() -> null（直接砍掉mockData字段的数据来源）
+                    XposedHelpers.findAndHookMethod(amapLocClass, classLoader, "getMockData", amapNullHook)
+                    // 2. getMockFlag() / getMockType() -> 0
+                    try { XposedHelpers.findAndHookMethod(amapLocClass, classLoader, "getMockFlag", amapZeroHook) } catch (e: Throwable) {}
+                    try { XposedHelpers.findAndHookMethod(amapLocClass, classLoader, "getMockType", amapZeroHook) } catch (e: Throwable) {}
+                    // 3. isMocked() -> false（AMap SDK 12.0+ 新接口）
+                    try { XposedHelpers.findAndHookMethod(amapLocClass, classLoader, "isMocked", amapFalseHook) } catch (e: Throwable) {}
+                    // 4. getErrorCode() -> 0（非0表示定位失败）
+                    XposedHelpers.findAndHookMethod(amapLocClass, classLoader, "getErrorCode", amapZeroHook)
+                    // 5. getLocationType() -> 动态保留网络定位类型，否则强制返回GPS类型（1）
+                    XposedHelpers.findAndHookMethod(
+                        amapLocClass, classLoader, "getLocationType",
+                        object : XC_MethodHook() {
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                val config = readConfig()
+                                if (config != null && config.optBoolean("active", false)) {
+                                    val originalLocationType = param.result as? Int ?: 1
+                                    // 高德地图SDK中：1代表GPS定位，5代表Wifi网络定位，6代表基站网络定位，12代表系统网络定位
+                                    // 为了防止反作弊SDK检测到在室内（无卫星）却返回GPS定位的异常情况，
+                                    // 我们需要保留原有的网络定位类型，使其显得更加真实自然。
+                                    if (originalLocationType == 5 || originalLocationType == 6 || originalLocationType == 12) {
+                                        param.result = originalLocationType
+                                    } else {
+                                        param.result = 1 // 默认强制设置为GPS定位
+                                    }
+                                }
+                            }
+                        })
+                    // 6. getProvider() -> 动态保留网络提供者，否则强制返回"gps"
+                    XposedHelpers.findAndHookMethod(
+                        amapLocClass, classLoader, "getProvider",
+                        object : XC_MethodHook() {
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                val config = readConfig()
+                                if (config != null && config.optBoolean("active", false)) {
+                                    val originalProvider = param.result as? String ?: "gps"
+                                    // 同样为了真实性，如果原始提供者是网络（network）相关的，则保留原样
+                                    if (originalProvider == "network" || originalProvider.contains("wifi", ignoreCase = true)) {
+                                        param.result = originalProvider
+                                    } else {
+                                        param.result = "gps"
+                                    }
+                                }
+                            }
+                        })
+                    // 7. 直接写底层 mock 相关字段（防反射读字段绕过 getter）
+                    val setFieldHook = object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val config = readConfig()
+                            if (config != null && config.optBoolean("active", false)) {
+                                val obj = param.thisObject ?: return
+                                try { XposedHelpers.setObjectField(obj, "mockData", null) } catch (e: Throwable) {}
+                                try { XposedHelpers.setIntField(obj, "mockFlag", 0) } catch (e: Throwable) {}
+                                try { XposedHelpers.setIntField(obj, "mockType", 0) } catch (e: Throwable) {}
+                                try { XposedHelpers.setBooleanField(obj, "isMocked", false) } catch (e: Throwable) {}
+                                try { XposedHelpers.setBooleanField(obj, "mMock", false) } catch (e: Throwable) {}
+                                try { XposedHelpers.setIntField(obj, "errorCode", 0) } catch (e: Throwable) {}
+                            }
+                        }
+                    }
+                    XposedHelpers.findAndHookMethod(amapLocClass, classLoader, "getLatitude", setFieldHook)
+                } catch (e: Throwable) {
+                    XposedBridge.log(e)
+                }
+
+                // 8. AMapLocationQualityReport 质量报告也要清零
+                val qualityClazz = XposedHelpers.findClassIfExists(
+                    "com.amap.api.location.AMapLocationQualityReport", classLoader
+                )
+                if (qualityClazz != null) {
+                    try { XposedHelpers.findAndHookMethod(qualityClazz, "getMockInfo", amapNullHook) } catch (e: Throwable) {}
+                    try { XposedHelpers.findAndHookMethod(qualityClazz, "isMockLocation", amapFalseHook) } catch (e: Throwable) {}
+                }
+
+                // 9. setMockEnable(false) 让高德SDK禁用自身的 mock 校验流程
+                val clientClazz = XposedHelpers.findClassIfExists(
+                    "com.amap.api.location.AMapLocationClient", classLoader
+                )
+                if (clientClazz != null) {
+                    try {
+                        XposedHelpers.findAndHookMethod(
+                            clientClazz, "setMockEnable",
+                            Boolean::class.javaPrimitiveType!!,
+                            object : XC_MethodHook() {
+                                override fun beforeHookedMethod(param: MethodHookParam) {
+                                    val config = readConfig()
+                                    if (config != null && config.optBoolean("active", false)) {
+                                        // 强制设为 true，让高德自己相信当前位置是真实的
+                                        param.args[0] = true
+                                    }
+                                }
+                            }
+                        )
+                    } catch (e: Throwable) {}
+                }
+            } else {
+                XposedBridge.log("[LocationSpoofer] AMapLocation class not found in ${classLoader}, skipping AMap hooks")
+            }
+
+        } catch (e: Throwable) {
+            XposedBridge.log(e)
+        }
+
+        // ── 第三方地图SDK深度Hook(腾讯/百度) ──
+        hookTencentSDK(classLoader)
+        hookBaiduSDK(classLoader)
+    }
+
+    /**
+     * 腾讯定位SDK深度Hook
+     *
+     * 架构分析:
+     * TencentLocation在腾讯SDK中是一个**接口(interface)**,不是具体类。
+     * 其方法签名为: public interface TencentLocation { double getLatitude(); ... }
+     * Xposed的findAndHookMethod无法Hook接口方法(接口没有方法体),
+     * 必须找到实现该接口的具体类并对其进行Hook。
+     *
+     * 腾讯SDK常见的实现类名(不同版本可能不同):
+     * - com.tencent.map.geolocation.internal.TencentLocationImpl
+     * - com.tencent.map.geolocation.TencentLocationImpl
+     * - 部分版本使用ProGuard混淆后类名不固定
+     *
+     * 策略: 先尝试已知实现类名,若均不存在则降级为hookAllMethods扫描所有实现。
+     *
+     * 坐标系: GCJ-02(与高德相同)
+     */
+    private fun hookTencentSDK(classLoader: ClassLoader) {
+        // 腾讯SDK已知的实现类名(按优先级排列)
+        val implCandidates = listOf(
+            "com.tencent.map.geolocation.internal.TencentLocationImpl",
+            "com.tencent.map.geolocation.TencentLocationImpl",
+            "com.tencent.tencentmap.mapsdk.map.model.TencentLocationImpl"
+        )
+
+        // 阶段1: 尝试直接Hook已知实现类
+        var hooked = false
+        for (implClass in implCandidates) {
+            val clazz = XposedHelpers.findClassIfExists(implClass, classLoader)
+            if (clazz != null) {
+                hookTencentLocationClass(clazz)
+                hooked = true
+                XposedBridge.log("[LocationSpoofer] TencentLocation impl found: $implClass")
+                break
+            }
+        }
+
+        // 阶段2: 若已知类名均不存在,尝试通过接口反向查找
+        if (!hooked) {
+            val interfaceClazz = XposedHelpers.findClassIfExists(
+                "com.tencent.map.geolocation.TencentLocation", classLoader
+            )
+            if (interfaceClazz != null && interfaceClazz.isInterface) {
+                // TencentLocation是接口,无法直接Hook。
+                // 但腾讯SDK的定位结果最终会通过TencentLocationListener.onLocationChanged(TencentLocation)
+                // 回调给App。我们Hook这个回调,在App拿到结果前篡改TencentLocation实例的字段。
+                hookTencentLocationCallback(classLoader)
+                hooked = true
+            } else if (interfaceClazz != null) {
+                // 某些版本中TencentLocation是具体类而非接口
+                hookTencentLocationClass(interfaceClazz)
+                hooked = true
+            }
+        }
+
+        if (!hooked) {
+            XposedBridge.log("[LocationSpoofer] TencentLocation SDK not found, skipped")
+        }
+    }
+
+    /**
+     * 对TencentLocation的具体实现类进行方法Hook
+     */
+    private fun hookTencentLocationClass(clazz: Class<*>) {
+        val coordHook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val config = readConfig()
+                if (config != null && config.optBoolean("active", false)) {
+                    val baseLat = config.optDouble("lat", 0.0)
+                    val baseLng = config.optDouble("lng", 0.0)
+                    val jittered = getJitteredLocation(baseLat, baseLng)
+                    when (param.method!!.name) {
+                        "getLatitude" -> param.result = jittered.first
+                        "getLongitude" -> param.result = jittered.second
+                    }
+                }
+            }
+        }
+
+        try {
+            // hookAllMethods: 不管方法签名如何变化,只要方法名匹配就Hook
+            XposedBridge.hookAllMethods(clazz, "getLatitude", coordHook)
+            XposedBridge.hookAllMethods(clazz, "getLongitude", coordHook)
+        } catch (e: Throwable) {
+            XposedBridge.log("[LocationSpoofer] TencentLocation class hook failed: $e")
+            return
+        }
+
+        // 动态保留网络定位提供者标识，避免室内强行返回GPS引发风控检测
+        try {
+            XposedBridge.hookAllMethods(clazz, "getProvider", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        val originalProvider = param.result as? String ?: "gps"
+                        // 腾讯地图SDK的定位提供者通常也是"gps"或者"network"
+                        if (originalProvider == "network" || originalProvider.contains("wifi", ignoreCase = true)) {
+                            param.result = originalProvider
+                        } else {
+                            param.result = "gps" // 默认强制修改为GPS定位
+                        }
+                    }
+                }
+            })
+        } catch (e: Throwable) { /* 忽略 */ }
+
+        // getAccuracy -> 抖动精度
+        try {
+            XposedBridge.hookAllMethods(clazz, "getAccuracy", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        param.result = getJitteredAccuracy()
+                    }
+                }
+            })
+        } catch (e: Throwable) { /* 忽略 */ }
+
+        // isMockGps -> 0(非模拟)
+        try {
+            XposedBridge.hookAllMethods(clazz, "isMockGps", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        param.result = 0
+                    }
+                }
+            })
+        } catch (e: Throwable) { /* 忽略 */ }
+
+        XposedBridge.log("[LocationSpoofer] TencentLocation hooks installed on ${clazz.name}")
+    }
+
+    /**
+     * 通过拦截TencentLocationListener回调来修改坐标
+     *
+     * 当无法直接Hook TencentLocation实现类时的降级方案:
+     * Hook TencentLocationListener.onLocationChanged(TencentLocation, int, String)回调,
+     * 在回调触发时通过反射修改TencentLocation实例的内部字段。
+     */
+    private fun hookTencentLocationCallback(classLoader: ClassLoader) {
+        val listenerClass = XposedHelpers.findClassIfExists(
+            "com.tencent.map.geolocation.TencentLocationListener", classLoader
+        ) ?: return
+
+        try {
+            // hookAllMethods可以Hook接口的所有实现类中的方法
+            XposedBridge.hookAllMethods(
+                listenerClass, "onLocationChanged",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config == null || !config.optBoolean("active", false)) return
+                        if (param.args.isEmpty()) return
+
+                        val tencentLoc = param.args[0] ?: return
+                        val baseLat = config.optDouble("lat", 0.0)
+                        val baseLng = config.optDouble("lng", 0.0)
+                        val jittered = getJitteredLocation(baseLat, baseLng)
+
+                        // 通过反射直接写入TencentLocation实现类的经纬度字段
+                        try { XposedHelpers.callMethod(tencentLoc, "setLatitude", jittered.first) } catch (e: Throwable) {
+                            try { XposedHelpers.setDoubleField(tencentLoc, "latitude", jittered.first) } catch (e2: Throwable) {
+                                try { XposedHelpers.setDoubleField(tencentLoc, "mLatitude", jittered.first) } catch (e3: Throwable) {
+                                    try { XposedHelpers.setDoubleField(tencentLoc, "a", jittered.first) } catch (e4: Throwable) {}
+                                }
+                            }
+                        }
+                        try { XposedHelpers.callMethod(tencentLoc, "setLongitude", jittered.second) } catch (e: Throwable) {
+                            try { XposedHelpers.setDoubleField(tencentLoc, "longitude", jittered.second) } catch (e2: Throwable) {
+                                try { XposedHelpers.setDoubleField(tencentLoc, "mLongitude", jittered.second) } catch (e3: Throwable) {
+                                    try { XposedHelpers.setDoubleField(tencentLoc, "b", jittered.second) } catch (e4: Throwable) {}
+                                }
+                            }
+                        }
+                    }
+                }
+            )
+            XposedBridge.log("[LocationSpoofer] TencentLocationListener callback hook installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("[LocationSpoofer] TencentLocationListener hook failed: $e")
+        }
+    }
+
+    /**
+     * 百度定位SDK深度Hook
+     *
+     * 百度定位SDK的核心定位回调对象为com.baidu.location.BDLocation。
+     * 百度地图使用BD-09坐标系,这是在GCJ-02基础上施加二次偏移的专有坐标系。
+     *
+     * 关键区别:
+     * - 高德/腾讯: 使用GCJ-02,直接返回config中的lat/lng
+     * - 百度: 使用BD-09,必须调用gcj02ToBd09()转换后再返回
+     *
+     * 双重保险策略:
+     * 1. 直接Hook BDLocation.getLatitude/getLongitude(方法级拦截)
+     * 2. Hook BDAbstractLocationListener.onReceiveLocation回调(回调级拦截)
+     * 两者互为补充,确保无论百度SDK内部架构如何变化,BD-09坐标都能正确注入。
+     */
+    private fun hookBaiduSDK(classLoader: ClassLoader) {
+        val baiduLocClass = "com.baidu.location.BDLocation"
+
+        // 安全探测: 当前进程是否加载了百度定位SDK
+        val baiduClazz = XposedHelpers.findClassIfExists(baiduLocClass, classLoader)
+        if (baiduClazz == null) {
+            XposedBridge.log("[LocationSpoofer] BDLocation class not found, skipping")
+            return
+        }
+
+        // ── 方案1: 直接Hook BDLocation的Getter方法 ──
+        val baiduCoordHook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val config = readConfig()
+                if (config != null && config.optBoolean("active", false)) {
+                    // 动态获取当前BDLocation期望的坐标系(App可通过LocationClientOption.setCoorType设置)
+                    val coorType = try {
+                        XposedHelpers.callMethod(param.thisObject!!, "getCoorType") as? String
+                    } catch (e: Throwable) { null }
+
+                    val targetLat: Double
+                    val targetLng: Double
+                    
+                    when (coorType) {
+                        "bd09ll", "bd09mc", "bd09" -> {
+                            targetLat = config.optDouble("bd09_lat", 0.0)
+                            targetLng = config.optDouble("bd09_lng", 0.0)
+                        }
+                        "wgs84" -> {
+                            targetLat = config.optDouble("wgs84_lat", 0.0)
+                            targetLng = config.optDouble("wgs84_lng", 0.0)
+                        }
+                        else -> { // gcj02 或默认(中国标准坐标系)
+                            targetLat = config.optDouble("lat", 0.0)
+                            targetLng = config.optDouble("lng", 0.0)
+                        }
+                    }
+
+                    val jittered = getJitteredLocation(targetLat, targetLng)
+                    when (param.method!!.name) {
+                        "getLatitude" -> param.result = jittered.first
+                        "getLongitude" -> param.result = jittered.second
+                    }
+                }
+            }
+        }
+
+        try {
+            // 使用hookAllMethods: BDLocation在不同版本中可能有多个getLatitude重载
+            XposedBridge.hookAllMethods(baiduClazz, "getLatitude", baiduCoordHook)
+            XposedBridge.hookAllMethods(baiduClazz, "getLongitude", baiduCoordHook)
+
+            // getLocType -> 动态保留网络定位类型，适配百度SDK的161和601类型，否则强制返回GPS定位(61)
+            XposedBridge.hookAllMethods(baiduClazz, "getLocType", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val config = readConfig()
+                    if (config != null && config.optBoolean("active", false)) {
+                        val originalLocationType = param.result as? Int ?: 61
+                        // 百度地图SDK中：61代表GPS定位结果，161代表网络定位结果，601代表某些特殊或离线网络定位结果
+                        // 为了避免在室内环境（如没有GPS信号）强行返回61导致应用侧判定为作弊，
+                        // 我们直接放行原有的网络定位类型，由于经纬度已经被修改，这样显得更加真实自然。
+                        if (originalLocationType == 161 || originalLocationType == 601) {
+                            param.result = originalLocationType
+                        } else {
+                            param.result = 61 // 默认强制修改为GPS定位（61）
+                        }
+                    }
+                }
+            })
+
+            // getRadius(精度) -> 与全局抖动精度同步
+            try {
+                XposedBridge.hookAllMethods(baiduClazz, "getRadius", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config != null && config.optBoolean("active", false)) {
+                            param.result = getJitteredAccuracy()
+                        }
+                    }
+                })
+            } catch (e: Throwable) { /* 忽略 */ }
+
+            // getMockGps -> 0(非模拟)
+            try {
+                XposedBridge.hookAllMethods(baiduClazz, "getMockGps", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config != null && config.optBoolean("active", false)) {
+                            param.result = 0
+                        }
+                    }
+                })
+            } catch (e: Throwable) { /* 忽略 */ }
+
+            // getSatelliteNumber -> 12-18颗
+            try {
+                XposedBridge.hookAllMethods(baiduClazz, "getSatelliteNumber", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config != null && config.optBoolean("active", false)) {
+                            param.result = 12 + rng.nextInt(7)
+                        }
+                    }
+                })
+            } catch (e: Throwable) { /* 忽略 */ }
+
+            XposedBridge.log("[LocationSpoofer] BDLocation method hooks installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("[LocationSpoofer] BDLocation method hook failed: $e")
+        }
+
+        // ── 方案2(补充): Hook百度定位回调,在App接收BDLocation前修改其内部字段 ──
+        // BDAbstractLocationListener是百度SDK 7.0+推荐的回调基类
+        val listenerCandidates = listOf(
+            "com.baidu.location.BDAbstractLocationListener",
+            "com.baidu.location.BDLocationListener"
+        )
+        for (listenerClassName in listenerCandidates) {
+            val listenerClazz = XposedHelpers.findClassIfExists(listenerClassName, classLoader) ?: continue
+            try {
+                XposedBridge.hookAllMethods(
+                    listenerClazz, "onReceiveLocation",
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val config = readConfig() ?: return
+                            if (!config.optBoolean("active", false)) return
+                            if (param.args.isEmpty()) return
+
+                            val bdLoc = param.args[0] ?: return
+                            
+                            val coorType = try {
+                                XposedHelpers.callMethod(bdLoc, "getCoorType") as? String
+                            } catch (e: Throwable) { null }
+
+                            val targetLat: Double
+                            val targetLng: Double
+                            when (coorType) {
+                                "bd09ll", "bd09mc", "bd09" -> {
+                                    targetLat = config.optDouble("bd09_lat", 0.0)
+                                    targetLng = config.optDouble("bd09_lng", 0.0)
+                                }
+                                "wgs84" -> {
+                                    targetLat = config.optDouble("wgs84_lat", 0.0)
+                                    targetLng = config.optDouble("wgs84_lng", 0.0)
+                                }
+                                else -> { // gcj02 或默认(中国标准坐标系)
+                                    targetLat = config.optDouble("lat", 0.0)
+                                    targetLng = config.optDouble("lng", 0.0)
+                                }
+                            }
+                            
+                            val jittered = getJitteredLocation(targetLat, targetLng)
+
+                            // 通过反射直接写入BDLocation实例的经纬度
+                            try { XposedHelpers.callMethod(bdLoc, "setLatitude", jittered.first) } catch (e: Throwable) {
+                                try { XposedHelpers.setDoubleField(bdLoc, "mLatitude", jittered.first) } catch (e2: Throwable) {}
+                            }
+                            try { XposedHelpers.callMethod(bdLoc, "setLongitude", jittered.second) } catch (e: Throwable) {
+                                try { XposedHelpers.setDoubleField(bdLoc, "mLongitude", jittered.second) } catch (e2: Throwable) {}
+                            }
+                            // 动态设置定位类型：保留网络定位类型（161和601），其余强制覆盖为GPS定位（61）
+                            try {
+                                val currentLocationType = XposedHelpers.callMethod(bdLoc, "getLocType") as? Int ?: 61
+                                // 如果当前回调原本就是网络定位，那么我们不修改类型，只替换了上面的经纬度坐标
+                                if (currentLocationType != 161 && currentLocationType != 601) {
+                                    XposedHelpers.callMethod(bdLoc, "setLocType", 61)
+                                }
+                            } catch (e: Throwable) { /* 忽略反射调用可能出现的异常 */ }
+                        }
+                    }
+                )
+                XposedBridge.log("[LocationSpoofer] $listenerClassName callback hook installed")
+            } catch (e: Throwable) { /* 忽略 */ }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Wi-Fi 环境伪造 — 覆盖 WifiInfo / WifiManager / NetworkInfo
+    // ══════════════════════════════════════════════════════════════════════════
+    private fun selectSpoofedWifi(wifiObj: JSONObject?): JSONObject? {
+        if (wifiObj != null) {
+            val connected = wifiObj.optJSONObject("connectedWifi")
+            if (isUsableWifiObject(connected)) return connected
+            val nearbyArray = wifiObj.optJSONArray("nearbyWifi")
+            if (nearbyArray != null) {
+                for (i in 0 until nearbyArray.length()) {
+                    val candidate = nearbyArray.optJSONObject(i)
+                    if (isUsableWifiObject(candidate)) return candidate
+                }
+            }
+        }
+        return null
+    }
+
+    private fun isUsableWifiObject(wifi: JSONObject?): Boolean {
+        if (wifi == null) return false
+        val bssid = wifi.optString("bssid", "")
+        val ssid = wifi.optString("ssid", "")
+        return bssid.isNotBlank() || (ssid.isNotBlank() && ssid != "<unknown ssid>")
+    }
+
+    private fun hasSpoofedWifiData(wifiObj: JSONObject?): Boolean {
+        if (selectSpoofedWifi(wifiObj) != null) return true
+        return (wifiObj?.optJSONArray("nearbyWifi")?.length() ?: 0) > 0
+    }
+
+    private fun wifiSsid(wifi: JSONObject, fallback: String = "HOME_WIFI"): String {
+        val ssidVal = wifi.optString("ssid", "")
+        if (ssidVal.isNotBlank() && ssidVal != "<unknown ssid>") return ssidVal
+        val bssid = wifi.optString("bssid", "")
+        return if (bssid.isNotBlank()) "WIFI_${bssid.takeLast(5).replace(":", "")}" else fallback
+    }
+
+    private fun wifiBssid(wifi: JSONObject): String {
+        val bssid = wifi.optString("bssid", "")
+        return if (bssid.isNotBlank()) bssid else "02:00:00:00:00:00"
+    }
+
+    private fun wifiRssi(wifi: JSONObject): Int {
+        val level = wifi.optInt("level", Int.MIN_VALUE)
+        if (level in -95..-20) return level
+        val rssi = wifi.optInt("rssi", Int.MIN_VALUE)
+        if (rssi in -95..-20) return rssi
+        return -55
+    }
+
+    private fun applyWifiInfoFields(wifiInfo: Any, wifi: JSONObject, classLoader: ClassLoader) {
+        val finalSsid = wifiSsid(wifi)
+        val bssidVal = wifiBssid(wifi)
+        val freqVal = wifi.optInt("frequency", 2412).takeIf { it > 0 } ?: 2412
+        val levelVal = wifiRssi(wifi)
+        val linkSpeedVal = wifi.optInt("linkSpeed", 150).takeIf { it > 0 } ?: 150
+        val networkIdVal = wifi.optInt("networkId", 1).takeIf { it >= 0 } ?: 1
+        val standardVal = wifi.optInt("wifiStandard", 4).takeIf { it > 0 } ?: 4
+        val macAddressVal = wifi.optString("macAddress", "02:00:00:00:00:00")
+
+        try { XposedHelpers.callMethod(wifiInfo, "setBSSID", bssidVal) } catch (_: Throwable) {}
+        try { XposedHelpers.callMethod(wifiInfo, "setMacAddress", macAddressVal) } catch (_: Throwable) {}
+        try {
+            val wifiSsidClass = XposedHelpers.findClass("android.net.wifi.WifiSsid", classLoader)
+            val createMethod = XposedHelpers.findMethodExact(wifiSsidClass, "createFromAsciiEncoded", String::class.java)
+            XposedHelpers.setObjectField(wifiInfo, "mWifiSsid", createMethod.invoke(null, finalSsid))
+        } catch (_: Throwable) {
+            try { XposedHelpers.setObjectField(wifiInfo, "mSSID", "\"$finalSsid\"") } catch (_: Throwable) {}
+        }
+        try { XposedHelpers.setObjectField(wifiInfo, "mBSSID", bssidVal) } catch (_: Throwable) {}
+        try { XposedHelpers.setObjectField(wifiInfo, "mBssid", bssidVal) } catch (_: Throwable) {}
+        try { XposedHelpers.setObjectField(wifiInfo, "mMacAddress", macAddressVal) } catch (_: Throwable) {}
+        try { XposedHelpers.setIntField(wifiInfo, "mRssi", levelVal) } catch (_: Throwable) {}
+        try { XposedHelpers.setIntField(wifiInfo, "mRssiDbm", levelVal) } catch (_: Throwable) {}
+        try { XposedHelpers.setIntField(wifiInfo, "mFrequency", freqVal) } catch (_: Throwable) {}
+        try { XposedHelpers.setIntField(wifiInfo, "mLinkSpeed", linkSpeedVal) } catch (_: Throwable) {}
+        try { XposedHelpers.setIntField(wifiInfo, "mTxLinkSpeed", linkSpeedVal) } catch (_: Throwable) {}
+        try { XposedHelpers.setIntField(wifiInfo, "mRxLinkSpeed", linkSpeedVal) } catch (_: Throwable) {}
+        try { XposedHelpers.setIntField(wifiInfo, "mNetworkId", networkIdVal) } catch (_: Throwable) {}
+        try { XposedHelpers.setIntField(wifiInfo, "mWifiStandard", standardVal) } catch (_: Throwable) {}
+        try { XposedHelpers.setBooleanField(wifiInfo, "mTrusted", true) } catch (_: Throwable) {}
+        try { XposedHelpers.setBooleanField(wifiInfo, "mIsUsable", true) } catch (_: Throwable) {}
+        try { XposedHelpers.setIntField(wifiInfo, "mScore", 60) } catch (_: Throwable) {}
+        try {
+            val supplicantState = XposedHelpers.findClass("android.net.wifi.SupplicantState", classLoader)
+            XposedHelpers.setObjectField(wifiInfo, "mSupplicantState", supplicantState.getField("COMPLETED").get(null))
+        } catch (_: Throwable) {}
+    }
+
+    private fun buildSpoofedWifiInfo(classLoader: ClassLoader, wifi: JSONObject): Any {
+        val finalSsid = wifiSsid(wifi)
+        val bssidVal = wifiBssid(wifi)
+        val freqVal = wifi.optInt("frequency", 2412).takeIf { it > 0 } ?: 2412
+        val levelVal = wifiRssi(wifi)
+        val linkSpeedVal = wifi.optInt("linkSpeed", 150).takeIf { it > 0 } ?: 150
+        val macAddressVal = wifi.optString("macAddress", "02:00:00:00:00:00")
+        return try {
+            val builderClass = XposedHelpers.findClass("android.net.wifi.WifiInfo\$Builder", classLoader)
+            val builder = XposedHelpers.newInstance(builderClass)
+            try { XposedHelpers.callMethod(builder, "setSsid", finalSsid) } catch (_: Throwable) {
+                try { XposedHelpers.callMethod(builder, "setSsid", finalSsid.toByteArray(Charsets.UTF_8)) } catch (_: Throwable) {}
+            }
+            try { XposedHelpers.callMethod(builder, "setBssid", bssidVal) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(builder, "setMacAddress", macAddressVal) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(builder, "setRssi", levelVal) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(builder, "setFrequency", freqVal) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(builder, "setLinkSpeed", linkSpeedVal) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(builder, "setNetworkId", wifi.optInt("networkId", 1)) } catch (_: Throwable) {}
+            val builtInfo = XposedHelpers.callMethod(builder, "build")!!
+            applyWifiInfoFields(builtInfo, wifi, classLoader)
+            builtInfo
+        } catch (_: Throwable) {
+            val wifiInfoClass = XposedHelpers.findClass("android.net.wifi.WifiInfo", classLoader)
+            val info = XposedHelpers.newInstance(wifiInfoClass)
+            applyWifiInfoFields(info, wifi, classLoader)
+            info
+        }
+    }
+
+    private fun hookWifiEnvironment(classLoader: ClassLoader) {
+
+        // ── 1. WifiInfo getter Hook ──
+        val wifiInfoHook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                val config = readConfig() ?: return
+                if (!config.optBoolean("active", false)) return
+                val mockWifi = config.optBoolean("mock_wifi", true)
+                val wifiObj = if (mockWifi) config.optJSONObject("wifi_json") else null
+                val connectedWifi = selectSpoofedWifi(wifiObj)
+                val isConnected = connectedWifi != null
+                
+                when (param.method!!.name) {
+                    "getBSSID" -> param.result =
+                        connectedWifi?.let { wifiBssid(it) } ?: "02:00:00:00:00:00"
+                    "getMacAddress" -> param.result =
+                        connectedWifi?.optString("macAddress") ?: "02:00:00:00:00:00"
+                    "getSSID" -> {
+                        param.result = connectedWifi?.let { "\"${wifiSsid(it)}\"" } ?: "<unknown ssid>"
+                    }
+                    "getNetworkId" -> param.result =
+                        connectedWifi?.optInt("networkId", 1) ?: -1
+                    "getRssi" -> param.result =
+                        connectedWifi?.let { wifiRssi(it) } ?: -127
+                    "getLinkSpeed" -> param.result =
+                        connectedWifi?.optInt("linkSpeed", 150) ?: -1
+                    "getFrequency" -> param.result =
+                        connectedWifi?.optInt("frequency", 2412) ?: -1
+                    "getIpAddress" -> param.result =
+                        if (isConnected) 0x6401A8C0 else 0 // 192.168.1.100 小端序
+                }
+            }
+        }
+
+        try {
+            val wifiInfoMethods = listOf(
+                "getBSSID", "getMacAddress", "getSSID", "getNetworkId",
+                "getRssi", "getLinkSpeed", "getFrequency", "getIpAddress"
+            )
+            for (method in wifiInfoMethods) {
+                try {
+                    XposedHelpers.findAndHookMethod(
+                        "android.net.wifi.WifiInfo", classLoader, method, wifiInfoHook
+                    )
+                } catch (e: Throwable) { /* 部分方法在低版本可能不存在 */ }
+            }
+        } catch (e: Throwable) { XposedBridge.log(e) }
+
+        // ── 1b. WifiInfo.getSupplicantState() ──
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.net.wifi.WifiInfo", classLoader, "getSupplicantState",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        val mockWifi = config.optBoolean("mock_wifi", true)
+                        val wifiObj = if (mockWifi) config.optJSONObject("wifi_json") else null
+                        val isConnected = selectSpoofedWifi(wifiObj) != null
+                        try {
+                            val enumClass = XposedHelpers.findClass(
+                                "android.net.wifi.SupplicantState", classLoader
+                            )
+                            val stateStr = if (mockWifi && isConnected) "COMPLETED" else "DISCONNECTED"
+                            param.result = enumClass.getField(stateStr).get(null)
+                        } catch (e: Throwable) { /* 忽略 */ }
+                    }
+                }
+            )
+        } catch (e: Throwable) { /* 忽略 */ }
+
+        // ── 2. Wi-Fi 扫描结果伪造 (getScanResults) ──
+        val realCapabilities = listOf(
+            "[WPA2-PSK-CCMP][RSN-PSK-CCMP][ESS]",
+            "[WPA2-PSK-CCMP+TKIP][RSN-PSK-CCMP+TKIP][ESS]",
+            "[WPA2-PSK-CCMP][ESS][WPS]",
+            "[WPA-PSK-TKIP+CCMP][WPA2-PSK-TKIP+CCMP][ESS]",
+            "[RSN-PSK-CCMP][ESS]",
+            "[WPA2-EAP-CCMP][RSN-EAP-CCMP][ESS]",
+            "[ESS]",
+            "[WPA2-PSK-CCMP][RSN-PSK-CCMP][ESS][WPS]",
+            "[WPA2-SAE-CCMP][RSN-SAE-CCMP][ESS]",
+            "[WPA2-PSK+SAE-CCMP][RSN-PSK+SAE-CCMP][ESS]"
+        )
+
+        val wifiScanHook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                val config = readConfig() ?: return
+                if (!config.optBoolean("active", false)) return
+                val fakeList = java.util.ArrayList<Any>()
+                val mockWifi = config.optBoolean("mock_wifi", true)
+                val wifiObj = if (mockWifi) config.optJSONObject("wifi_json") else null
+                if (wifiObj != null) {
+                    try {
+                        val scanResultClass =
+                            XposedHelpers.findClass("android.net.wifi.ScanResult", classLoader)
+                        val baseTimestamp = android.os.SystemClock.elapsedRealtimeNanos()
+                        
+                        fun addFakeScanResult(wifi: org.json.JSONObject) {
+                            val fakeScanResult = XposedHelpers.newInstance(scanResultClass)
+                            val ssidVal = wifi.optString("ssid", "")
+                            val bssidVal = wifi.optString("bssid", "")
+                            val finalSsid = if (ssidVal.isEmpty() || ssidVal == "<unknown ssid>") {
+                                "WIFI_${bssidVal.takeLast(5).replace(":", "")}"
+                            } else {
+                                ssidVal
+                            }
+                            XposedHelpers.setObjectField(fakeScanResult, "SSID", finalSsid)
+                            XposedHelpers.setObjectField(fakeScanResult, "BSSID", bssidVal)
+                            val level = wifi.optInt("level", -65)
+                            XposedHelpers.setIntField(fakeScanResult, "level", level)
+                            XposedHelpers.setIntField(
+                                fakeScanResult, "frequency",
+                                wifi.optInt("frequency", 2412)
+                            )
+                            XposedHelpers.setObjectField(
+                                fakeScanResult, "capabilities",
+                                wifi.optString("capabilities", realCapabilities.random())
+                            )
+                            try {
+                                val offsetNanos = (rng.nextInt(200_000) * 1000L)
+                                XposedHelpers.setLongField(
+                                    fakeScanResult, "timestamp",
+                                    (baseTimestamp - offsetNanos) / 1000
+                                )
+                            } catch (e: Throwable) {}
+                            fakeList.add(fakeScanResult)
+                        }
+
+                        val connectedWifi = selectSpoofedWifi(wifiObj)
+                        if (connectedWifi != null) {
+                            addFakeScanResult(connectedWifi)
+                        }
+
+                        val nearbyArray = wifiObj.optJSONArray("nearbyWifi")
+                        if (nearbyArray != null && nearbyArray.length() > 0) {
+                            for (i in 0 until nearbyArray.length()) {
+                                val wifi = nearbyArray.getJSONObject(i)
+                                if (connectedWifi != null && wifiBssid(wifi).equals(wifiBssid(connectedWifi), ignoreCase = true)) continue
+                                addFakeScanResult(wifi)
+                            }
+                        }
+                    } catch (e: Throwable) { /* 忽略 */ }
+                }
+                param.result = fakeList
+            }
+        }
+
+        // ── 3. WifiManager 整体 Hook ──
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.net.wifi.WifiManager", classLoader, "getScanResults", wifiScanHook
+            )
+
+            // getWifiState()
+            XposedHelpers.findAndHookMethod(
+                "android.net.wifi.WifiManager", classLoader, "getWifiState",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        val mockWifi = config.optBoolean("mock_wifi", true)
+                        val wifiObj = config.optJSONObject("wifi_json")
+                        val hasWifiData = hasSpoofedWifiData(wifiObj)
+                        if (mockWifi) {
+                            param.result = if (hasWifiData) 3 else 1 // 3 is WIFI_STATE_ENABLED, 1 is disabled
+                        }
+                    }
+                })
+
+            // isWifiEnabled()
+            XposedHelpers.findAndHookMethod(
+                "android.net.wifi.WifiManager", classLoader, "isWifiEnabled",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        val mockWifi = config.optBoolean("mock_wifi", true)
+                        val wifiObj = config.optJSONObject("wifi_json")
+                        val hasWifiData = hasSpoofedWifiData(wifiObj)
+                        if (mockWifi) {
+                            param.result = hasWifiData
+                        }
+                    }
+                })
+
+            // getConnectionInfo() — 返回伪造的 WifiInfo 对象
+            XposedHelpers.findAndHookMethod(
+                "android.net.wifi.WifiManager", classLoader, "getConnectionInfo",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        val mockWifi = config.optBoolean("mock_wifi", true)
+                        val wifiObj = if (mockWifi) config.optJSONObject("wifi_json") else null
+                        val connectedWifi = selectSpoofedWifi(wifiObj)
+                        
+                        if (connectedWifi != null) {
+                            try {
+                                param.result = buildSpoofedWifiInfo(classLoader, connectedWifi)
+                            } catch (e: Throwable) { /* 忽略 */ }
+                        } else {
+                            try {
+                                val wifiInfoClass = XposedHelpers.findClass("android.net.wifi.WifiInfo", classLoader)
+                                val fakeWifiInfo = XposedHelpers.newInstance(wifiInfoClass)
+                                try { XposedHelpers.setObjectField(fakeWifiInfo, "mBSSID", "02:00:00:00:00:00") } catch(e:Throwable){}
+                                try { XposedHelpers.setObjectField(fakeWifiInfo, "mMacAddress", "02:00:00:00:00:00") } catch(e:Throwable){}
+                                try { XposedHelpers.setIntField(fakeWifiInfo, "mNetworkId", -1) } catch(e:Throwable){}
+                                try { XposedHelpers.setIntField(fakeWifiInfo, "mRssi", -127) } catch(e:Throwable){}
+                                try { XposedHelpers.setIntField(fakeWifiInfo, "mLinkSpeed", -1) } catch(e:Throwable){}
+                                try { XposedHelpers.setIntField(fakeWifiInfo, "mFrequency", -1) } catch(e:Throwable){}
+                                param.result = fakeWifiInfo
+                            } catch (e: Throwable) {}
+                        }
+                    }
+                })
+
+            // getConfiguredNetworks()
+            XposedHelpers.findAndHookMethod(
+                "android.net.wifi.WifiManager", classLoader, "getConfiguredNetworks",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        param.result = java.util.ArrayList<Any>()
+                    }
+                })
+
+            // getDhcpInfo()
+            XposedHelpers.findAndHookMethod(
+                "android.net.wifi.WifiManager", classLoader, "getDhcpInfo",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        try {
+                            val dhcpClass = XposedHelpers.findClass("android.net.DhcpInfo", classLoader)
+                            val dhcp = XposedHelpers.newInstance(dhcpClass)
+                            XposedHelpers.setIntField(dhcp, "ipAddress", 0x6401A8C0.toInt())
+                            XposedHelpers.setIntField(dhcp, "gateway", 0x0101A8C0)     // 192.168.1.1
+                            XposedHelpers.setIntField(dhcp, "netmask", 0x00FFFFFF)     // 255.255.255.0
+                            XposedHelpers.setIntField(dhcp, "dns1", 0x0101A8C0)        // 192.168.1.1
+                            XposedHelpers.setIntField(dhcp, "dns2", 0x08080808)        // 8.8.8.8
+                            XposedHelpers.setIntField(dhcp, "serverAddress", 0x0101A8C0)
+                            param.result = dhcp
+                        } catch (e: Throwable) { /* 忽略 */ }
+                    }
+                })
+        } catch (e: Throwable) { XposedBridge.log(e) }
+
+        // ── 4. NetworkInfo.getExtraInfo() ──
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.net.NetworkInfo", classLoader, "getExtraInfo",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        val mockWifi = config.optBoolean("mock_wifi", true)
+                        val wifiObj = if (mockWifi) config.optJSONObject("wifi_json") else null
+                        val connectedWifi = selectSpoofedWifi(wifiObj)
+                        if (connectedWifi != null) {
+                            param.result = "\"${wifiSsid(connectedWifi)}\""
+                        } else {
+                            param.result = null
+                        }
+                    }
+                }
+            )
+        } catch (e: Throwable) { XposedBridge.log(e) }
+
+        // ── 5. WifiScanner Hook ──
+        try {
+            val wifiScannerClass = XposedHelpers.findClassIfExists("android.net.wifi.WifiScanner", classLoader)
+            if (wifiScannerClass != null) {
+                val scannerHook = object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        
+                        param.result = null
+                        val mockWifi = config.optBoolean("mock_wifi", true)
+                        val wifiObj = if (mockWifi) config.optJSONObject("wifi_json") else null
+                        fun dispatchWifiScanResults(fakeScanDataArray: Any) {
+                            val candidates = param.args.filterNotNull().asReversed()
+                            var delivered = false
+                            for (candidate in candidates) {
+                                if (XposedHelpers.tryCallMethodDeep(candidate, "onResults", fakeScanDataArray)) {
+                                    delivered = true
+                                    break
+                                }
+                            }
+                            if (!delivered) {
+                                for (candidate in candidates) {
+                                    if (XposedHelpers.tryCallMethodDeep(candidate, "onSuccess")) {
+                                        delivered = true
+                                        break
+                                    }
+                                }
+                            }
+                            if (!delivered) {
+                                XposedBridge.logOpenCellIdEvery(
+                                    "wifiScanner:no-callback",
+                                    "WifiScanner.startScan intercepted but no listener callback accepted args=${param.args.map { it?.javaClass?.name }}",
+                                    30_000L
+                                )
+                            }
+                        }
+                        if (wifiObj != null) {
+                            try {
+                                val scanResultClass = XposedHelpers.findClass("android.net.wifi.ScanResult", classLoader)
+                                val baseTimestamp = android.os.SystemClock.elapsedRealtimeNanos()
+                                val fakeList = java.util.ArrayList<Any>()
+                                
+                                fun addFakeScanResult(wifi: org.json.JSONObject) {
+                                    val fakeScanResult = XposedHelpers.newInstance(scanResultClass)
+                                    val finalSsid = wifiSsid(wifi)
+                                    val bssidVal = wifiBssid(wifi)
+                                    XposedHelpers.setObjectField(fakeScanResult, "SSID", finalSsid)
+                                    XposedHelpers.setObjectField(fakeScanResult, "BSSID", bssidVal)
+                                    val level = wifiRssi(wifi)
+                                    XposedHelpers.setIntField(fakeScanResult, "level", level)
+                                    XposedHelpers.setIntField(fakeScanResult, "frequency", wifi.optInt("frequency", 2412))
+                                    XposedHelpers.setObjectField(fakeScanResult, "capabilities", wifi.optString("capabilities", "[WPA2-PSK-CCMP][ESS]"))
+                                    try {
+                                        val offsetNanos = (rng.nextInt(200_000) * 1000L)
+                                        XposedHelpers.setLongField(fakeScanResult, "timestamp", (baseTimestamp - offsetNanos) / 1000)
+                                    } catch (e: Throwable) {}
+                                    fakeList.add(fakeScanResult)
+                                }
+
+                                val connectedWifi = selectSpoofedWifi(wifiObj)
+                                if (connectedWifi != null) {
+                                    addFakeScanResult(connectedWifi)
+                                }
+
+                                val nearbyArray = wifiObj.optJSONArray("nearbyWifi")
+                                if (nearbyArray != null && nearbyArray.length() > 0) {
+                                    for (i in 0 until nearbyArray.length()) {
+                                        val wifi = nearbyArray.getJSONObject(i)
+                                        if (connectedWifi != null && wifiBssid(wifi).equals(wifiBssid(connectedWifi), ignoreCase = true)) continue
+                                        addFakeScanResult(wifi)
+                                    }
+                                }
+
+                                if (fakeList.isNotEmpty()) {
+                                    val scanResultArray = java.lang.reflect.Array.newInstance(scanResultClass, fakeList.size)
+                                    for (i in 0 until fakeList.size) {
+                                        java.lang.reflect.Array.set(scanResultArray, i, fakeList[i])
+                                    }
+                                    
+                                    // 构造 ScanData 对象（包含 ScanResult 数组）
+                                    val scanDataClass = XposedHelpers.findClass("android.net.wifi.WifiScanner\$ScanData", classLoader)
+                                    val fakeScanData = XposedHelpers.newInstance(scanDataClass, 0, 0, scanResultArray)
+                                    val fakeScanDataArray = java.lang.reflect.Array.newInstance(scanDataClass, 1)
+                                    java.lang.reflect.Array.set(fakeScanDataArray, 0, fakeScanData)
+                                    
+                                    // 主动回调 Listener，把假数据塞回去
+                                    dispatchWifiScanResults(fakeScanDataArray)
+                                } else {
+                                    val scanDataClass = XposedHelpers.findClass("android.net.wifi.WifiScanner\$ScanData", classLoader)
+                                    val emptyScanData = XposedHelpers.newInstance(scanDataClass, 0, 0, java.lang.reflect.Array.newInstance(scanResultClass, 0))
+                                    val fakeScanDataArray = java.lang.reflect.Array.newInstance(scanDataClass, 1)
+                                    java.lang.reflect.Array.set(fakeScanDataArray, 0, emptyScanData)
+                                    dispatchWifiScanResults(fakeScanDataArray)
+                                }
+                            } catch (e: Throwable) {
+                                XposedBridge.log("[LocationSpoofer] WifiScanner 伪造失败: $e")
+                            }
+                        } else {
+                            try {
+                                val scanDataClass = XposedHelpers.findClass("android.net.wifi.WifiScanner\$ScanData", classLoader)
+                                val scanResultClass = XposedHelpers.findClass("android.net.wifi.ScanResult", classLoader)
+                                val emptyScanData = XposedHelpers.newInstance(scanDataClass, 0, 0, java.lang.reflect.Array.newInstance(scanResultClass, 0))
+                                val fakeScanDataArray = java.lang.reflect.Array.newInstance(scanDataClass, 1)
+                                java.lang.reflect.Array.set(fakeScanDataArray, 0, emptyScanData)
+                                dispatchWifiScanResults(fakeScanDataArray)
+                            } catch (e: Throwable) { /* 忽略 */ }
+                        }
+                    }
+                }
+                
+                // startScan(ScanSettings, ScanListener) 和重载
+                XposedBridge.hookAllMethods(wifiScannerClass, "startScan", scannerHook)
+            }
+        } catch (e: Throwable) { XposedBridge.log(e) }
+
+        XposedBridge.log("[LocationSpoofer] Wi-Fi environment hooks installed")
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // 基站/蜂窝网络环境伪造 — 覆盖 TelephonyManager / PhoneStateListener
+    // ══════════════════════════════════════════════════════════════════════════
+    private fun hookCellEnvironment(classLoader: ClassLoader) {
+        XposedBridge.logOpenCellId("Installing cell hooks classLoader=$classLoader")
+
+        // ── 1. 基站信息伪造（CellLocation / AllCellInfo / NeighboringCellInfo）──
+        val cellHook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                val methodName = param.method!!.name
+                val config = readConfig()
+                if (config == null) {
+                    XposedBridge.logOpenCellIdEvery("$methodName:config-null", "$methodName skipped: config=null", 30_000L)
+                    return
+                }
+                if (!config.optBoolean("active", false)) {
+                    XposedBridge.logOpenCellIdEvery("$methodName:inactive", "$methodName skipped: active=false", 30_000L)
+                    return
+                }
+                val lat = config.optDouble("lat", 0.0)
+                val lng = config.optDouble("lng", 0.0)
+                val mockCellForLog = config.optBoolean("mock_cell", true)
+                val cellCountForLog = config.optJSONArray("cell_json")?.length() ?: 0
+                XposedBridge.logOpenCellIdEvery(
+                    "$methodName:called:$mockCellForLog:$cellCountForLog",
+                    "$methodName called active=true mockCell=$mockCellForLog cellJsonCount=$cellCountForLog lat=$lat lng=$lng"
+                )
+
+                when (methodName) {
+                    "getCellLocation" -> {
+                        try {
+                            val mockCell = config.optBoolean("mock_cell", true)
+                            if (mockCell) {
+                                val gsmCellLocationClass = XposedHelpers.findClass(
+                                    "android.telephony.gsm.GsmCellLocation", classLoader
+                                )
+                                val fakeLocation = XposedHelpers.newInstance(gsmCellLocationClass)
+                                val cellArray = config.optJSONArray("cell_json")
+                                if (cellArray == null || cellArray.length() == 0) {
+                                    XposedBridge.logOpenCellId("getCellLocation returning null because cell_json is empty")
+                                    param.result = null
+                                    return
+                                }
+                                val cell = cellArray.getJSONObject(0)
+                                val lac = cellAreaCode(cell, 0)
+                                val cid = cellIdentityCode(cell, 0)
+                                if (lac <= 0 || cid <= 0) {
+                                    XposedBridge.logOpenCellId("getCellLocation returning null because first cell has invalid lac/cid")
+                                    param.result = null
+                                    return
+                                }
+                                XposedHelpers.callMethod(fakeLocation, "setLacAndCid", lac, cid)
+                                XposedBridge.logOpenCellId("getCellLocation returning GsmCellLocation lac=$lac cid=$cid")
+                                param.result = fakeLocation
+                            } else {
+                                XposedBridge.logOpenCellId("getCellLocation returning null because mock_cell=false")
+                                param.result = null
+                            }
+                        } catch (e: Throwable) {
+                            XposedBridge.logOpenCellId("getCellLocation failed: $e")
+                            param.result = null
+                        }
+                    }
+
+                    "getAllCellInfo" -> {
+                        try {
+                            if (config.optBoolean("mock_cell", true)) {
+                                val fakeCells = buildFakeCellInfoList(classLoader, config)
+                                XposedBridge.logOpenCellIdEvery(
+                                    "getAllCellInfo:return:${fakeCells.size}",
+                                    "getAllCellInfo returning fakeCells=${fakeCells.size}"
+                                )
+                                param.result = fakeCells
+                            } else {
+                                XposedBridge.logOpenCellId("getAllCellInfo returning empty because mock_cell=false")
+                                param.result = java.util.ArrayList<Any>()
+                            }
+                        } catch (e: Throwable) {
+                            XposedBridge.logOpenCellId("getAllCellInfo build failed: $e")
+                            param.result = java.util.ArrayList<Any>()
+                        }
+                    }
+
+                    "getNeighboringCellInfo" -> {
+                        XposedBridge.logOpenCellId("getNeighboringCellInfo returning empty list")
+                        param.result = java.util.ArrayList<Any>()
+                    }
+                }
+            }
+        }
+
+        try {
+            XposedHelpers.findAndHookMethod("android.telephony.TelephonyManager", classLoader, "getAllCellInfo", cellHook)
+            XposedHelpers.findAndHookMethod("android.telephony.TelephonyManager", classLoader, "getCellLocation", cellHook)
+            XposedHelpers.findAndHookMethod("android.telephony.TelephonyManager", classLoader, "getNeighboringCellInfo", cellHook)
+            XposedBridge.logOpenCellId("Installed TelephonyManager getAllCellInfo/getCellLocation/getNeighboringCellInfo hooks")
+        } catch (e: Throwable) {
+            XposedBridge.logOpenCellId("Install basic TelephonyManager cell hooks failed: $e")
+        }
+
+        // ── 2. TelephonyManager 元数据 Hook ──
+        // 防止 MCC/MNC/运营商名称/网络类型泄漏真实地理位置
+        // 高德用 getNetworkOperator() 验证基站数据是否与 GPS 位置地理一致
+        val telephonyMetaHook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                val methodName = param.method!!.name
+                val config = readConfig()
+                if (config == null) {
+                    XposedBridge.logOpenCellIdEvery("$methodName:config-null", "$methodName skipped: config=null", 30_000L)
+                    return
+                }
+                if (!config.optBoolean("active", false)) {
+                    XposedBridge.logOpenCellIdEvery("$methodName:inactive", "$methodName skipped: active=false", 30_000L)
+                    return
+                }
+                val mockCell = config.optBoolean("mock_cell", true)
+                val cellArray = if (mockCell) config.optJSONArray("cell_json") else null
+                XposedBridge.logOpenCellIdEvery(
+                    "$methodName:called:$mockCell:${cellArray?.length() ?: 0}",
+                    "$methodName called mockCell=$mockCell cellJsonCount=${cellArray?.length() ?: 0}"
+                )
+                when (methodName) {
+                    "getNetworkOperator" -> {
+                        if (cellArray != null && cellArray.length() > 0) {
+                            val cell = cellArray.getJSONObject(0)
+                            val mcc = positiveJsonInt(cell, "mcc", default = 460)
+                            val mnc = positiveJsonInt(cell, "mnc", "net", default = 0)
+                            val operator = String.format(java.util.Locale.US, "%d%02d", mcc, mnc)
+                            XposedBridge.logOpenCellIdEvery(
+                                "getNetworkOperator:return:$operator",
+                                "getNetworkOperator returning $operator"
+                            )
+                            param.result = operator
+                        } else if (!mockCell) {
+                            param.result = ""
+                        }
+                    }
+                    "getNetworkOperatorName" -> {
+                        if (cellArray != null && cellArray.length() > 0) {
+                            val mnc = positiveJsonInt(cellArray.getJSONObject(0), "mnc", "net", default = 0)
+                            param.result = when (mnc) {
+                                0, 2, 7 -> "中国移动"
+                                1, 6, 9 -> "中国联通"
+                                3, 5, 11 -> "中国电信"
+                                else -> "中国移动"
+                            }
+                            XposedBridge.logOpenCellIdEvery(
+                                "getNetworkOperatorName:return:${param.result}",
+                                "getNetworkOperatorName returning ${param.result}"
+                            )
+                        } else if (!mockCell) {
+                            param.result = ""
+                        }
+                    }
+                    "getSimOperator" -> { /* 保留真实值 */ }
+                    "getSimOperatorName" -> { /* 保留真实值 */ }
+                    "getNetworkType" -> param.result = if (mockCell) 13 else 0
+                    "getDataNetworkType" -> param.result = if (mockCell) 13 else 0
+                    "getDataState" -> param.result = if (mockCell) 2 else param.result // DATA_CONNECTED = 2
+                    "isDataEnabled", "isDataConnectionAllowed" -> param.result = if (mockCell) true else param.result
+                    "getPhoneType" -> param.result = 1      // PHONE_TYPE_GSM
+                    "getServiceState", "getServiceStateForSlot" -> {
+                        if (mockCell) buildFakeServiceState(classLoader, cellArray)?.let {
+                            XposedBridge.logOpenCellIdEvery(
+                                "$methodName:return-service-state",
+                                "$methodName returning fake ServiceState"
+                            )
+                            param.result = it
+                        }
+                    }
+                    "getSignalStrength" -> {
+                        if (mockCell) buildFakeSignalStrength(classLoader, config)?.let {
+                            XposedBridge.logOpenCellIdEvery(
+                                "getSignalStrength:return-signal-strength",
+                                "getSignalStrength returning fake SignalStrength"
+                            )
+                            param.result = it
+                        }
+                    }
+                }
+            }
+        }
+
+        val telephonyMetaMethods = listOf(
+            "getNetworkOperator", "getNetworkOperatorName",
+            "getNetworkType", "getDataNetworkType", "getPhoneType",
+            "getServiceState", "getServiceStateForSlot", "getSignalStrength",
+            "getDataState", "isDataEnabled", "isDataConnectionAllowed"
+        )
+        for (method in telephonyMetaMethods) {
+            try {
+                XposedBridge.hookAllMethods(
+                    XposedHelpers.findClass("android.telephony.TelephonyManager", classLoader),
+                    method,
+                    telephonyMetaHook
+                )
+                XposedBridge.logOpenCellId("Installed TelephonyManager.$method hook")
+            } catch (e: Throwable) {
+                XposedBridge.logOpenCellId("Install TelephonyManager.$method hook failed: $e")
+            }
+        }
+
+        // ── 3. PhoneStateListener 回调拦截 ──
+        // 防止应用通过 TelephonyManager.listen() 的 LISTEN_CELL_INFO 回调
+        // 绕过 getAllCellInfo() 的 Hook 获取真实基站数据
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.telephony.TelephonyManager", classLoader, "listen",
+                "android.telephony.PhoneStateListener",
+                Int::class.javaPrimitiveType!!,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config == null) {
+                            XposedBridge.logOpenCellIdEvery("listen:config-null", "TelephonyManager.listen skipped: config=null", 30_000L)
+                            return
+                        }
+                        if (!config.optBoolean("active", false)) {
+                            XposedBridge.logOpenCellIdEvery("listen:inactive", "TelephonyManager.listen skipped: active=false", 30_000L)
+                            return
+                        }
+                        val listener = param.args[0] ?: return
+                        val originalEvents = param.args[1] as Int
+                        val mockCell = config.optBoolean("mock_cell", true)
+                        val cellJsonCount = config.optJSONArray("cell_json")?.length() ?: 0
+                        val needsCellInfo = (originalEvents and 0x400) != 0
+                        val needsCellLocation = (originalEvents and 0x10) != 0
+                        val needsServiceState = (originalEvents and 0x1) != 0
+                        val needsSignalStrength = (originalEvents and 0x100) != 0
+                        if (!needsCellInfo && !needsCellLocation && !needsServiceState && !needsSignalStrength) {
+                            return
+                        }
+                        XposedBridge.logOpenCellIdEvery(
+                            "listen:called:${listener.javaClass.name}:$originalEvents:$mockCell:$cellJsonCount",
+                            "TelephonyManager.listen called listener=${listener.javaClass.name} events=0x${originalEvents.toString(16)} mockCell=$mockCell cellJsonCount=$cellJsonCount"
+                        )
+                        val fakeCells by lazy {
+                            if (mockCell) {
+                                buildFakeCellInfoList(classLoader, config)
+                            } else {
+                                java.util.ArrayList<Any>()
+                            }
+                        }
+                        if ((originalEvents and 0x10) != 0) {
+                            try {
+                                if (mockCell) {
+                                    val gsmCellLocationClass = XposedHelpers.findClass(
+                                        "android.telephony.gsm.GsmCellLocation", classLoader
+                                    )
+                                    val fakeLocation = XposedHelpers.newInstance(gsmCellLocationClass)
+                                    val cellArray = config.optJSONArray("cell_json")
+                                    if (cellArray == null || cellArray.length() == 0) {
+                                        XposedBridge.logOpenCellIdEvery(
+                                            "listen:onCellLocationChanged:empty",
+                                            "listen skipped onCellLocationChanged because cell_json is empty"
+                                        )
+                                        return
+                                    }
+                                    val cell = cellArray.getJSONObject(0)
+                                    val lac = cellAreaCode(cell, 0)
+                                    val cid = cellIdentityCode(cell, 0)
+                                    if (lac <= 0 || cid <= 0) {
+                                        XposedBridge.logOpenCellIdEvery(
+                                            "listen:onCellLocationChanged:invalid",
+                                            "listen skipped onCellLocationChanged because first cell has invalid lac/cid"
+                                        )
+                                        return
+                                    }
+                                    XposedHelpers.callMethod(
+                                        fakeLocation,
+                                        "setLacAndCid",
+                                        lac,
+                                        cid
+                                    )
+                                    if (XposedHelpers.tryCallMethodDeep(listener, "onCellLocationChanged", fakeLocation)) {
+                                        XposedBridge.logOpenCellIdEvery(
+                                            "listen:onCellLocationChanged:$lac:$cid",
+                                            "listen dispatched onCellLocationChanged lac=$lac cid=$cid"
+                                        )
+                                    } else {
+                                        XposedBridge.logOpenCellIdEvery(
+                                            "listen:onCellLocationChanged:not-accepted:${listener.javaClass.name}",
+                                            "listen listener did not accept onCellLocationChanged class=${listener.javaClass.name}",
+                                            30_000L
+                                        )
+                                    }
+                                }
+                            } catch (e: Throwable) {
+                                XposedBridge.logOpenCellId("listen onCellLocationChanged failed: $e")
+                            }
+                        }
+                        if ((originalEvents and 0x400) != 0) {
+                            try {
+                                if (XposedHelpers.tryCallMethodDeep(listener, "onCellInfoChanged", fakeCells)) {
+                                    XposedBridge.logOpenCellIdEvery(
+                                        "listen:onCellInfoChanged:${fakeCells.size}",
+                                        "listen dispatched onCellInfoChanged fakeCells=${fakeCells.size}"
+                                    )
+                                } else {
+                                    XposedBridge.logOpenCellIdEvery(
+                                        "listen:onCellInfoChanged:not-accepted:${listener.javaClass.name}",
+                                        "listen listener did not accept onCellInfoChanged class=${listener.javaClass.name}",
+                                        30_000L
+                                    )
+                                }
+                            } catch (e: Throwable) {
+                                XposedBridge.logOpenCellId("listen onCellInfoChanged failed: $e")
+                            }
+                        }
+                        if ((originalEvents and 0x1) != 0) {
+                            try {
+                                buildFakeServiceState(classLoader, config.optJSONArray("cell_json"))
+                                    ?.let { XposedHelpers.tryCallMethodDeep(listener, "onServiceStateChanged", it) }
+                                XposedBridge.logOpenCellIdEvery("listen:onServiceStateChanged", "listen dispatched onServiceStateChanged")
+                            } catch (e: Throwable) {
+                                XposedBridge.logOpenCellId("listen onServiceStateChanged failed: $e")
+                            }
+                        }
+                        if ((originalEvents and 0x100) != 0) {
+                            try {
+                                buildFakeSignalStrength(classLoader, config)
+                                    ?.let { XposedHelpers.tryCallMethodDeep(listener, "onSignalStrengthsChanged", it) }
+                                XposedBridge.logOpenCellIdEvery("listen:onSignalStrengthsChanged", "listen dispatched onSignalStrengthsChanged")
+                            } catch (e: Throwable) {
+                                XposedBridge.logOpenCellId("listen onSignalStrengthsChanged failed: $e")
+                            }
+                        }
+                        var events = originalEvents
+                        // 移除会泄漏真实蜂窝环境的标志位
+                        // 这样系统就不会将真实的基站变更回调给应用
+                        events = events and 0x1.inv()    // LISTEN_SERVICE_STATE
+                        events = events and 0x10.inv()   // LISTEN_CELL_LOCATION
+                        events = events and 0x100.inv()  // LISTEN_SIGNAL_STRENGTHS
+                        events = events and 0x400.inv()  // LISTEN_CELL_INFO
+                        param.args[1] = events
+                        XposedBridge.logOpenCellIdEvery(
+                            "listen:sanitized:$originalEvents:$events",
+                            "TelephonyManager.listen sanitized events=0x${events.toString(16)}"
+                        )
+                    }
+                }
+            )
+            XposedBridge.logOpenCellId("Installed TelephonyManager.listen hook")
+        } catch (e: Throwable) {
+            XposedBridge.logOpenCellId("Install TelephonyManager.listen hook failed: $e")
+        }
+
+// ── 4. TelephonyManager.requestCellInfoUpdate 异步刷新拦截 (Android 10+) ──
+        try {
+            XposedBridge.hookAllMethods(
+                XposedHelpers.findClass("android.telephony.TelephonyManager", classLoader),
+                "requestCellInfoUpdate",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config == null) {
+                            XposedBridge.logOpenCellIdEvery("requestCellInfoUpdate:config-null", "requestCellInfoUpdate skipped: config=null", 30_000L)
+                            return
+                        }
+                        if (!config.optBoolean("active", false)) {
+                            XposedBridge.logOpenCellIdEvery("requestCellInfoUpdate:inactive", "requestCellInfoUpdate skipped: active=false", 30_000L)
+                            return
+                        }
+                        
+                        // 阻断真实请求
+                        param.result = null
+                        
+                        val executor = param.args[0] as? java.util.concurrent.Executor ?: return
+                        val callback = param.args[1] ?: return
+                        XposedBridge.logOpenCellIdEvery(
+                            "requestCellInfoUpdate:called:${callback.javaClass.name}",
+                            "requestCellInfoUpdate called callback=${callback.javaClass.name} args=${param.args.size}"
+                        )
+                        
+                        val mockCell = config.optBoolean("mock_cell", true)
+                        
+                        val fakeCells = if (mockCell) {
+                            buildFakeCellInfoList(classLoader, config)
+                        } else {
+                            java.util.ArrayList<Any>()
+                        }
+                        
+                        // 异步回调
+                        executor.execute {
+                            try {
+                                if (XposedHelpers.tryCallMethodDeep(callback, "onCellInfo", fakeCells)) {
+                                    XposedBridge.logOpenCellId("requestCellInfoUpdate dispatched onCellInfo fakeCells=${fakeCells.size}")
+                                } else {
+                                    XposedBridge.logOpenCellId("requestCellInfoUpdate callback did not accept onCellInfo class=${callback.javaClass.name}")
+                                }
+                            } catch (e: Throwable) {
+                                XposedBridge.logOpenCellId("requestCellInfoUpdate onCellInfo failed: $e")
+                            }
+                        }
+                    }
+                }
+            )
+            XposedBridge.logOpenCellId("Installed TelephonyManager.requestCellInfoUpdate hook")
+        } catch (e: Throwable) {
+            XposedBridge.logOpenCellId("Install TelephonyManager.requestCellInfoUpdate hook failed: $e")
+        }
+
+        // ── 5. TelephonyCallback 拦截 (Android 12+ / API 31+) ──
+        // registerTelephonyCallback 替代了旧版 listen()，
+        // 通过 TelephonyCallback.CellInfoListener 接收基站变化。
+        // 需要 hook 注册过程，对每个 callback 实例的 onCellInfoChanged 进行拦截。
+        try {
+            XposedBridge.hookAllMethods(
+                XposedHelpers.findClass("android.telephony.TelephonyManager", classLoader),
+                "registerTelephonyCallback",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config == null) {
+                            XposedBridge.logOpenCellIdEvery("registerTelephonyCallback:config-null", "registerTelephonyCallback skipped: config=null", 30_000L)
+                            return
+                        }
+                        if (!config.optBoolean("active", false)) {
+                            XposedBridge.logOpenCellIdEvery("registerTelephonyCallback:inactive", "registerTelephonyCallback skipped: active=false", 30_000L)
+                            return
+                        }
+
+                        // 找到 TelephonyCallback 实例参数
+                        val callback = param.args.firstOrNull { arg ->
+                            arg != null && arg.javaClass.interfaces.any { iface ->
+                                iface.name.contains("TelephonyCallback")
+                            } || (arg != null && runCatching {
+                                val base = XposedHelpers.findClass(
+                                    "android.telephony.TelephonyCallback", classLoader
+                                )
+                                base.isInstance(arg)
+                            }.getOrElse { false })
+                        }
+                        if (callback == null) {
+                            XposedBridge.logOpenCellId("registerTelephonyCallback called but callback not found args=${param.args.map { it?.javaClass?.name }}")
+                            return
+                        }
+
+                        val callbackClass = callback.javaClass
+                        XposedBridge.logOpenCellIdEvery(
+                            "registerTelephonyCallback:called:${callbackClass.name}",
+                            "registerTelephonyCallback called callback=${callbackClass.name} interfaces=${callbackClass.interfaces.joinToString { it.name }}"
+                        )
+
+                        if (isTelephonyCallbackListener(classLoader, callback, "CellInfoListener")) {
+                            XposedBridge.logOpenCellIdEvery(
+                                "registerTelephonyCallback:CellInfoListener:${callbackClass.name}",
+                                "registerTelephonyCallback installing CellInfoListener hook on ${callbackClass.name}",
+                                60_000L
+                            )
+                            XposedBridge.hookAllMethods(
+                                callbackClass,
+                                "onCellInfoChanged",
+                                object : XC_MethodHook() {
+                                    override fun beforeHookedMethod(param: MethodHookParam) {
+                                        val freshConfig = readConfig() ?: return
+                                        if (!freshConfig.optBoolean("active", false)) return
+                                        val fakeCells = buildFakeCellInfoList(classLoader, freshConfig)
+                                        param.args[0] = fakeCells
+                                        XposedBridge.logOpenCellId("TelephonyCallback.onCellInfoChanged injected fakeCells=${fakeCells.size}")
+                                    }
+                                }
+                            )
+                        }
+
+                        if (isTelephonyCallbackListener(classLoader, callback, "ServiceStateListener")) {
+                            XposedBridge.logOpenCellIdEvery(
+                                "registerTelephonyCallback:ServiceStateListener:${callbackClass.name}",
+                                "registerTelephonyCallback installing ServiceStateListener hook on ${callbackClass.name}",
+                                60_000L
+                            )
+                            XposedBridge.hookAllMethods(
+                                callbackClass,
+                                "onServiceStateChanged",
+                                object : XC_MethodHook() {
+                                    override fun beforeHookedMethod(param: MethodHookParam) {
+                                        val freshConfig = readConfig() ?: return
+                                        if (!freshConfig.optBoolean("active", false)) return
+                                        buildFakeServiceState(classLoader, freshConfig.optJSONArray("cell_json"))
+                                            ?.let {
+                                                param.args[0] = it
+                                                XposedBridge.logOpenCellId("TelephonyCallback.onServiceStateChanged injected fake ServiceState")
+                                            }
+                                    }
+                                }
+                            )
+                        }
+
+                        if (isTelephonyCallbackListener(classLoader, callback, "SignalStrengthsListener")) {
+                            XposedBridge.logOpenCellIdEvery(
+                                "registerTelephonyCallback:SignalStrengthsListener:${callbackClass.name}",
+                                "registerTelephonyCallback installing SignalStrengthsListener hook on ${callbackClass.name}",
+                                60_000L
+                            )
+                            XposedBridge.hookAllMethods(
+                                callbackClass,
+                                "onSignalStrengthsChanged",
+                                object : XC_MethodHook() {
+                                    override fun beforeHookedMethod(param: MethodHookParam) {
+                                        val freshConfig = readConfig() ?: return
+                                        if (!freshConfig.optBoolean("active", false)) return
+                                        buildFakeSignalStrength(classLoader, freshConfig)
+                                            ?.let {
+                                                param.args[0] = it
+                                                XposedBridge.logOpenCellId("TelephonyCallback.onSignalStrengthsChanged injected fake SignalStrength")
+                                            }
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+            )
+            XposedBridge.logOpenCellId("Installed TelephonyManager.registerTelephonyCallback hook")
+        } catch (e: Throwable) {
+            XposedBridge.logOpenCellId("Install TelephonyManager.registerTelephonyCallback hook failed: $e")
+        }
+
+        XposedBridge.logOpenCellId("Cell environment hooks installed")
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // 网络连接层伪造 — 覆盖 ConnectivityManager / NetworkCapabilities / NetworkInterface
+    // ══════════════════════════════════════════════════════════════════════════
+    private fun hookConnectivityLayer(classLoader: ClassLoader) {
+        val buildFakeNetworkInfo = fun(): Any? {
+            try {
+                val networkInfoClass = XposedHelpers.findClass("android.net.NetworkInfo", classLoader)
+                val fakeNetworkInfo = XposedHelpers.newInstance(networkInfoClass, 1, 0, "WIFI", "")
+                XposedHelpers.callMethod(fakeNetworkInfo, "setIsAvailable", true)
+                try {
+                    val stateEnum = XposedHelpers.findClass("android.net.NetworkInfo\$State", classLoader)
+                    XposedHelpers.setObjectField(fakeNetworkInfo, "mState", stateEnum.getField("CONNECTED").get(null))
+                } catch (e: Throwable) { /* 忽略 */ }
+                try {
+                    val detailedStateEnum = XposedHelpers.findClass("android.net.NetworkInfo\$DetailedState", classLoader)
+                    XposedHelpers.setObjectField(fakeNetworkInfo, "mDetailedState", detailedStateEnum.getField("CONNECTED").get(null))
+                } catch (e: Throwable) { /* 忽略 */ }
+                return fakeNetworkInfo
+            } catch (e: Throwable) { return null }
+        }
+
+        // ── 1. 强制让系统以为连着 Wi-Fi ──
+        val networkInfoHook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val config = readConfig() ?: return
+                if (!config.optBoolean("active", false)) return
+                if (config.optBoolean("mock_wifi", true)) {
+                    val wifiObj = config.optJSONObject("wifi_json")
+                    val hasWifiData = selectSpoofedWifi(wifiObj) != null
+                    if (hasWifiData) {
+                        val fakeInfo = buildFakeNetworkInfo()
+                        if (fakeInfo != null) {
+                            param.result = fakeInfo
+                        }
+                    } else {
+                        // 如果用户要求模拟 Wi-Fi，但实际上数据库里没有 Wi-Fi 数据
+                        // 我们需要向系统返回 Wi-Fi 断开的状态
+                        val currentInfo = param.result
+                        if (currentInfo != null) {
+                            try {
+                                val type = XposedHelpers.callMethod(currentInfo, "getType") as Int
+                                if (type == 1) { // TYPE_WIFI
+                                    val stateEnum = XposedHelpers.findClass("android.net.NetworkInfo\$State", classLoader)
+                                    XposedHelpers.setObjectField(currentInfo, "mState", stateEnum.getField("DISCONNECTED").get(null))
+                                    XposedHelpers.callMethod(currentInfo, "setIsAvailable", false)
+                                    param.result = currentInfo
+                                }
+                            } catch (e: Throwable) {}
+                        }
+                    }
+                }
+            }
+        }
+
+        try { XposedHelpers.findAndHookMethod("android.net.ConnectivityManager", classLoader, "getActiveNetworkInfo", networkInfoHook) } catch (e: Throwable) {}
+        try { XposedHelpers.findAndHookMethod("android.net.ConnectivityManager", classLoader, "getNetworkInfo", Int::class.javaPrimitiveType, networkInfoHook) } catch (e: Throwable) {}
+
+        // ── 2. NetworkCapabilities 包含 WifiInfo ──
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.net.ConnectivityManager", classLoader,
+                "getNetworkCapabilities",
+                "android.net.Network",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        if (!config.optBoolean("mock_wifi", true)) return
+                        
+                        val nc = param.result ?: return
+                        try {
+                            val wifiObj = config.optJSONObject("wifi_json")
+                            val firstWifi = selectSpoofedWifi(wifiObj)
+                            if (firstWifi != null) {
+                                val fakeWifiInfo = buildSpoofedWifiInfo(classLoader, firstWifi)
+                                
+                                // Inject TRANSPORT_WIFI (1) into NetworkCapabilities so DevCheck sees it as Wi-Fi
+                                try {
+                                    val field = nc.javaClass.getDeclaredField("mTransportTypes")
+                                    field.isAccessible = true
+                                    val currentTypes = field.getLong(nc)
+                                    field.setLong(nc, currentTypes or (1L shl 1))
+                                } catch (e: Throwable) {
+                                    try {
+                                        XposedHelpers.callMethod(nc, "addTransportType", 1)
+                                    } catch (e2: Throwable) {}
+                                }
+                                
+                                XposedBridge.log("[LocationSpoofer] fakeWifiInfo build result: " + fakeWifiInfo.toString())
+                                XposedHelpers.setObjectField(nc, "mTransportInfo", fakeWifiInfo)
+                            } else {
+                                // 库中无 Wi-Fi 数据，移除 TransportInfo 以伪造非 Wi-Fi 环境
+                                try { XposedHelpers.setObjectField(nc, "mTransportInfo", null) } catch (e: Throwable) {}
+                                XposedBridge.log("[LocationSpoofer] fakeWifiInfo: No wifi data, removed TransportInfo")
+                            }
+                        } catch (e: Throwable) {
+                            XposedBridge.log("[LocationSpoofer] fakeWifiInfo error: " + e.message)
+                        }
+                    }
+                }
+            )
+        } catch (e: Throwable) { /* 忽略 */ }
+
+        // ── 3. NetworkInterface.getNetworkInterfaces() ──
+        try {
+            XposedHelpers.findAndHookMethod(
+                "java.net.NetworkInterface", classLoader, "getNetworkInterfaces",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        val result = param.result as? java.util.Enumeration<*> ?: return
+                        val filtered = java.util.Collections.list(result).filter { iface ->
+                            val name = try {
+                                (iface as java.net.NetworkInterface).name
+                            } catch (e: Throwable) { "" }
+                            !name.startsWith("wlan") && !name.startsWith("p2p") && !name.startsWith("swlan")
+                        }
+                        param.result = java.util.Collections.enumeration(filtered)
+                    }
+                }
+            )
+        } catch (e: Throwable) { /* 忽略 */ }
+
+        XposedBridge.log("[LocationSpoofer] Connectivity layer hooks installed")
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // 蓝牙 BLE 扫描拦截 — 防止通过 iBeacon / Eddystone 信标定位
+    // ══════════════════════════════════════════════════════════════════════════
+    private fun hookBluetoothLE(classLoader: ClassLoader) {
+
+        // ── BLE 扫描结果伪造的核心逻辑（复用于不同 startScan 重载）──
+        val buildAndDeliverBleResults = fun(config: JSONObject, callbackObj: Any, cl: ClassLoader) {
+            if (!config.optBoolean("mock_bluetooth", true)) return
+            try {
+                val bluetoothArray = config.optJSONArray("bluetooth_json")
+                if (bluetoothArray != null && bluetoothArray.length() > 0) {
+                    val results = java.util.ArrayList<Any>()
+                    val scanResultClass = XposedHelpers.findClass("android.bluetooth.le.ScanResult", cl)
+                    val bluetoothDeviceClass = XposedHelpers.findClass("android.bluetooth.BluetoothDevice", cl)
+                    val scanRecordClass = XposedHelpers.findClass("android.bluetooth.le.ScanRecord", cl)
+
+                    for (i in 0 until bluetoothArray.length()) {
+                        try {
+                            val obj = bluetoothArray.getJSONObject(i)
+                            val address = obj.optString("address", "00:11:22:33:44:55")
+                            val rssi = obj.optInt("rssi", -60)
+                            val hexRecord = obj.optString("scanRecordHex", "")
+
+                            // 1. 构造 BluetoothDevice
+                            val device = XposedHelpers.newInstance(bluetoothDeviceClass, address)
+
+                            // 2. 构造 ScanRecord
+                            var scanRecord: Any? = null
+                            if (hexRecord.isNotEmpty()) {
+                                try {
+                                    val bytes = hexStringToByteArray(hexRecord)
+                                    scanRecord = XposedHelpers.callStaticMethod(scanRecordClass, "parseFromBytes", bytes)
+                                } catch (e: Throwable) { /* 忽略 */ }
+                            }
+
+                            // 3. 构造 ScanResult（兼容新旧构造器）
+                            val timestampNanos = android.os.SystemClock.elapsedRealtimeNanos()
+                            var scanResultObj: Any? = null
+                            try {
+                                // Android 8.0+ 构造器
+                                scanResultObj = XposedHelpers.newInstance(
+                                    scanResultClass, device,
+                                    0x001B, 1, 0, 255, 127, rssi, 0, scanRecord, timestampNanos
+                                )
+                            } catch (e: Throwable) {
+                                try {
+                                    // 旧版本构造器
+                                    scanResultObj = XposedHelpers.newInstance(
+                                        scanResultClass, device, scanRecord, rssi, timestampNanos
+                                    )
+                                } catch (e2: Throwable) { /* 忽略 */ }
+                            }
+
+                            if (scanResultObj != null) {
+                                results.add(scanResultObj)
+                                try { XposedHelpers.callMethod(callbackObj, "onScanResult", 1, scanResultObj) } catch (e: Throwable) {}
+                            }
+                        } catch (e: Throwable) {
+                            XposedBridge.log("[LocationSpoofer] 构建虚拟BLE失败: $e")
+                        }
+                    }
+
+                    // 批量触发回调
+                    if (results.isNotEmpty()) {
+                        try { XposedHelpers.callMethod(callbackObj, "onBatchScanResults", results) } catch (e: Throwable) {}
+                    }
+                }
+            } catch (e: Throwable) { XposedBridge.log(e) }
+            Unit
+        }
+
+        // ── 1. startScan(List<ScanFilter>, ScanSettings, ScanCallback) — 3参数重载 ──
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.bluetooth.le.BluetoothLeScanner", classLoader, "startScan",
+                java.util.List::class.java,
+                android.bluetooth.le.ScanSettings::class.java,
+                android.bluetooth.le.ScanCallback::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        param.result = null // 短路原始扫描
+                        val callback = param.args[2] ?: return
+                        buildAndDeliverBleResults(config, callback, classLoader)
+                    }
+                }
+            )
+        } catch (e: Throwable) { XposedBridge.log(e) }
+
+        // ── 2. startScan(ScanCallback) — 1参数重载 ──
+        // 部分 App（如微信）使用无 filter 的简化版 startScan
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.bluetooth.le.BluetoothLeScanner", classLoader, "startScan",
+                android.bluetooth.le.ScanCallback::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        param.result = null
+                        val callback = param.args[0] ?: return
+                        buildAndDeliverBleResults(config, callback, classLoader)
+                    }
+                }
+            )
+        } catch (e: Throwable) { XposedBridge.log(e) }
+
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.bluetooth.BluetoothAdapter", classLoader, "isEnabled",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        if (!config.optBoolean("mock_bluetooth", true)) {
+                            param.result = false
+                        }
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                "android.bluetooth.BluetoothAdapter", classLoader, "getState",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        if (!config.optBoolean("mock_bluetooth", true)) {
+                            param.result = 10 // STATE_OFF
+                        }
+                    }
+                }
+            )
+        } catch (e: Throwable) { /* 忽略 */ }
+
+        // ── 3. BluetoothAdapter.getBondedDevices() → 空集合 ──
+        // 防止通过已配对蓝牙设备列表进行指纹识别
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.bluetooth.BluetoothAdapter", classLoader, "getBondedDevices",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        param.result = java.util.HashSet<Any>()
+                    }
+                }
+            )
+        } catch (e: Throwable) { /* 忽略 */ }
+
+        // ── 4. BluetoothAdapter.startDiscovery() → false ──
+        // 阻止经典蓝牙扫描发现周围真实设备
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.bluetooth.BluetoothAdapter", classLoader, "startDiscovery",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        param.result = false
+                    }
+                }
+            )
+        } catch (e: Throwable) { /* 忽略 */ }
+
+        // ── 5. 老接口 BluetoothAdapter.startLeScan（Android 4.x）──
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.bluetooth.BluetoothAdapter", classLoader, "startLeScan",
+                android.bluetooth.BluetoothAdapter.LeScanCallback::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!config.optBoolean("active", false)) return
+                        // 老接口不具备很好的伪造性，直接返回启动失败
+                        param.result = false
+                    }
+                }
+            )
+        } catch (e: Throwable) { XposedBridge.log(e) }
+
+        XposedBridge.log("[LocationSpoofer] Bluetooth LE hooks installed")
+    }
+    
+    private fun hexStringToByteArray(s: String): ByteArray {
+        val len = s.length
+        val data = ByteArray(len / 2)
+        var i = 0
+        while (i < len) {
+            data[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
+            i += 2
+        }
+        return data
+    }
+
+    /**
+     * 通过反射+Parcel机制构造CellInfoLte对象列表
+     *
+     * CellInfoLte/CellIdentityLte等类的构造器在Android各版本中签名不同,
+     * 直接new会因API版本差异崩溃。通过反射调用内部构造器并设置字段值,
+     * 兼容Android 7.0~14。
+     *
+     * 数据策略:
+     * - Only consume cell_json populated from local scans or OpenCellID normalization.
+     * - Do not generate coordinate-derived tower identities when cell_json is empty.
+     * - Return an empty list in fail-closed mode so real base stations remain blocked.
+     *
+     * @param classLoader 目标App的ClassLoader
+     * @return CellInfo objects built from cell_json only.
+     */
+    private fun buildFakeCellInfoList(
+        classLoader: ClassLoader, config: org.json.JSONObject?
+    ): java.util.ArrayList<Any> {
+        val result = java.util.ArrayList<Any>()
+        
+        val cellArray = config?.optJSONArray("cell_json")
+        XposedBridge.logOpenCellIdEvery(
+            "buildFakeCellInfoList:called:${cellArray?.length() ?: 0}",
+            "buildFakeCellInfoList called cellJsonCount=${cellArray?.length() ?: 0}"
+        )
+        if (cellArray != null && cellArray.length() > 0) {
+            var gsmCount = 0
+            var wcdmaCount = 0
+            var lteCount = 0
+            var nrCount = 0
+            var firstSummary: String? = null
+            for (i in 0 until cellArray.length()) {
+                try {
+                    val obj = cellArray.getJSONObject(i)
+                    val type = normalizeCellType(obj.optString("type", obj.optString("radio", "LTE")))
+                    val isRegistered = obj.optBoolean("isRegistered", i == 0)
+                    when (type) {
+                        "GSM" -> gsmCount++
+                        "WCDMA", "UMTS" -> wcdmaCount++
+                        "NR" -> nrCount++
+                        else -> lteCount++
+                    }
+                    
+                    val mcc = positiveJsonInt(obj, "mcc", default = 460)
+                    val mnc = positiveJsonInt(obj, "mnc", "net", default = 0)
+                    val tacOrLac = cellAreaCode(obj, 0)
+                    val ciOrCid = cellIdentityCode(obj, 0)
+                    if (tacOrLac <= 0 || ciOrCid <= 0) {
+                        XposedBridge.logOpenCellId("Skipping cell_json[$i] because area or identity is missing: $obj")
+                        continue
+                    }
+                    val pci = positiveJsonInt(obj, "pci", "psc", default = (ciOrCid % 504).coerceIn(0, 503))
+                    val dbm = signalDbm(obj, i)
+                    if (firstSummary == null) {
+                        firstSummary = "$type/$mcc-$mnc area=$tacOrLac identity=$ciOrCid dbm=$dbm registered=$isRegistered"
+                    }
+                    if (VERBOSE_CELL_BUILD_LOGS) {
+                        XposedBridge.logOpenCellId(
+                            "buildFakeCellInfoList source[$i] radio=${obj.optString("radio", "")} type=$type registered=$isRegistered mcc=$mcc mnc=$mnc area=$tacOrLac identity=$ciOrCid pci=$pci dbm=$dbm"
+                        )
+                    }
+                    
+                    // 1. 寻找并构造具体的 CellInfo 派生类
+                    val cellInfoClass = when (type) {
+                        "GSM" -> XposedHelpers.findClass("android.telephony.CellInfoGsm", classLoader)
+                        "WCDMA", "UMTS" -> XposedHelpers.findClass("android.telephony.CellInfoWcdma", classLoader)
+                        "NR" -> try { XposedHelpers.findClass("android.telephony.CellInfoNr", classLoader) } catch (e: Throwable) { XposedHelpers.findClass("android.telephony.CellInfoLte", classLoader) }
+                        else -> XposedHelpers.findClass("android.telephony.CellInfoLte", classLoader)
+                    }
+                    val cellInfo = XposedHelpers.newInstance(cellInfoClass)
+                    
+                    // 设置注册标志（Android 9 及以下用 mRegistered；Android 10+ 用 mCellConnectionStatus）
+                    // CONNECTION_NONE=0, CONNECTION_PRIMARY_SERVING=1, CONNECTION_SECONDARY_SERVING=2
+                    val connectionStatus = if (isRegistered) 1 else 0
+                    try { XposedHelpers.setBooleanField(cellInfo, "mRegistered", isRegistered) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(cellInfo, "mCellConnectionStatus", connectionStatus) } catch (_: Throwable) {}
+                    try { if (isRegistered) XposedHelpers.callMethod(cellInfo, "setRegistered", true) } catch (_: Throwable) {}
+
+                    try { XposedHelpers.setLongField(cellInfo, "mTimeStamp", android.os.SystemClock.elapsedRealtimeNanos()) } catch (e: Throwable) {}
+
+                    // 2. 构造 CellIdentity（尝试多种有参构造器，避免 final 字段反射问题）
+                    val cellIdentityClass = when (type) {
+                        "GSM" -> XposedHelpers.findClass("android.telephony.CellIdentityGsm", classLoader)
+                        "WCDMA", "UMTS" -> XposedHelpers.findClass("android.telephony.CellIdentityWcdma", classLoader)
+                        "NR" -> try { XposedHelpers.findClass("android.telephony.CellIdentityNr", classLoader) } catch (e: Throwable) { XposedHelpers.findClass("android.telephony.CellIdentityLte", classLoader) }
+                        else -> XposedHelpers.findClass("android.telephony.CellIdentityLte", classLoader)
+                    }
+                    val mccStr = mcc.toString()
+                    val mncStr = if (mnc < 10) "0$mnc" else mnc.toString()
+                    val cellIdentity = constructCellIdentityByType(
+                        type, cellIdentityClass, mcc, mccStr, mnc, mncStr, tacOrLac, ciOrCid, pci
+                    )
+                    if (VERBOSE_CELL_BUILD_LOGS) {
+                        XposedBridge.logOpenCellId("Built $type identity: MCC=$mcc MNC=$mnc TAC/LAC=$tacOrLac CI/CID=$ciOrCid PCI=$pci -> ${cellIdentity.javaClass.simpleName}")
+                    }
+
+                    // 验证注入是否成功（如果 getCi()/getLac() 返回 Integer.MAX_VALUE 说明注入失败）
+                    try {
+                        val verifyMethod = when (type) {
+                            "LTE"        -> "getCi"
+                            "GSM"        -> "getLac"
+                            "WCDMA", "UMTS" -> "getLac"
+                            "NR"         -> "getPci"
+                            else         -> "getCi"
+                        }
+                        val readBack = XposedHelpers.callMethod(cellIdentity, verifyMethod) as? Int
+                        if (readBack == Int.MAX_VALUE || readBack == -1) {
+                            XposedBridge.logOpenCellId("WARNING: $type.$verifyMethod()=$readBack, identity injection may have failed")
+                        } else if (VERBOSE_CELL_BUILD_LOGS) {
+                            XposedBridge.logOpenCellId("VERIFY OK: $type.$verifyMethod()=$readBack")
+                        }
+                    } catch (_: Throwable) {}
+
+                    // 将 CellIdentity 存入 CellInfo (兼容新老版本字段名)
+                    val identityField = when (type) {
+                        "GSM" -> "mCellIdentityGsm"
+                        "WCDMA", "UMTS" -> "mCellIdentityWcdma"
+                        "NR" -> "mCellIdentityNr"
+                        else -> "mCellIdentityLte"
+                    }
+                    try { XposedHelpers.setObjectField(cellInfo, identityField, cellIdentity) } catch (e: Throwable) {}
+                    try { XposedHelpers.setObjectField(cellInfo, "mCellIdentity", cellIdentity) } catch (e: Throwable) {}
+
+                    // 3. 构造并配置对应的 CellSignalStrength
+                    val cssClass = when (type) {
+                        "GSM" -> XposedHelpers.findClass("android.telephony.CellSignalStrengthGsm", classLoader)
+                        "WCDMA", "UMTS" -> XposedHelpers.findClass("android.telephony.CellSignalStrengthWcdma", classLoader)
+                        "NR" -> try { XposedHelpers.findClass("android.telephony.CellSignalStrengthNr", classLoader) } catch (e: Throwable) { XposedHelpers.findClass("android.telephony.CellSignalStrengthLte", classLoader) }
+                        else -> XposedHelpers.findClass("android.telephony.CellSignalStrengthLte", classLoader)
+                    }
+                    val css = XposedHelpers.newInstance(cssClass)
+                    
+                    when (type) {
+                        "GSM" -> {
+                            val asu = ((dbm + 113) / 2).coerceIn(0, 31)
+                            try { XposedHelpers.setIntField(css, "mRssi", dbm) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mGsmSignalStrength", asu) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mSignalStrength", dbm) } catch (e: Throwable) {}
+                        }
+                        "WCDMA", "UMTS" -> {
+                            try { XposedHelpers.setIntField(css, "mRscp", dbm) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mSignalStrength", dbm) } catch (e: Throwable) {}
+                        }
+                        "NR" -> {
+                            try { XposedHelpers.setIntField(css, "mCsiRsrp", dbm) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mCsiRsrq", -10) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mCsiSinr", 15) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mSsRsrp", dbm) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mSsRsrq", -10) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mSsSinr", 15) } catch (e: Throwable) {}
+                        }
+                        else -> { // LTE
+                            try { XposedHelpers.setIntField(css, "mRsrp", dbm) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mRsrq", -10) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mRssnr", 300) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mSignalStrength", dbm + 113) } catch (e: Throwable) {}
+                        }
+                    }
+
+                    // 将 CellSignalStrength 存入 CellInfo (兼容新老版本字段名)
+                    val cssField = when (type) {
+                        "GSM" -> "mCellSignalStrengthGsm"
+                        "WCDMA", "UMTS" -> "mCellSignalStrengthWcdma"
+                        "NR" -> "mCellSignalStrengthNr"
+                        else -> "mCellSignalStrengthLte"
+                    }
+                    try { XposedHelpers.setObjectField(cellInfo, cssField, css) } catch (e: Throwable) {}
+                    try { XposedHelpers.setObjectField(cellInfo, "mCellSignalStrength", css) } catch (e: Throwable) {}
+
+                    result.add(cellInfo)
+                } catch (e: Throwable) {
+                    XposedBridge.logOpenCellId("buildFakeCellInfoList failed to parse/build cell_json[$i]", e)
+                }
+            }
+            XposedBridge.logOpenCellIdEvery(
+                "buildFakeCellInfoList:return:$lteCount:$nrCount:$wcdmaCount:$gsmCount:${result.size}:$firstSummary",
+                "buildFakeCellInfoList returning ${result.size} cells from cell_json types=LTE:$lteCount NR:$nrCount WCDMA:$wcdmaCount GSM:$gsmCount first=$firstSummary"
+            )
+            return result
+        }
+
+        XposedBridge.logOpenCellIdEvery(
+            "buildFakeCellInfoList:empty",
+            "buildFakeCellInfoList has no cell_json; returning empty list",
+            60_000L
+        )
+        return result
+    }
+
+    private fun normalizeCellType(rawType: String): String {
+        return when (rawType.uppercase(java.util.Locale.US)) {
+            "GSM" -> "GSM"
+            "UMTS", "WCDMA" -> "WCDMA"
+            "NR", "NR5G", "5G" -> "NR"
+            else -> "LTE"
+        }
+    }
+
+    private fun cellAreaCode(cell: org.json.JSONObject, default: Int): Int =
+        positiveJsonInt(cell, "tac", "lac", "area", default = default)
+
+    private fun cellIdentityCode(cell: org.json.JSONObject, default: Int): Int =
+        positiveJsonInt(cell, "ci", "cid", "cellid", "cell", default = default)
+
+    private fun positiveJsonInt(cell: org.json.JSONObject, vararg keys: String, default: Int): Int {
+        for (key in keys) {
+            if (!cell.has(key) || cell.isNull(key)) continue
+            val value = cell.optInt(key, Int.MIN_VALUE)
+            if (value > 0) return value
+            val parsed = cell.optString(key).toIntOrNull()
+            if (parsed != null && parsed > 0) return parsed
+        }
+        return default
+    }
+
+    private fun signalDbm(cell: org.json.JSONObject, index: Int): Int {
+        val direct = cell.optInt("dbm", Int.MIN_VALUE)
+        if (direct in -140..-40) return direct
+
+        val average = cell.optInt("averageSignalStrength", Int.MIN_VALUE)
+        if (average in -140..-40) return average
+
+        val signal = cell.optInt("signal", Int.MIN_VALUE)
+        if (signal in -140..-40) return signal
+
+        return (-70 - index * 3).coerceAtLeast(-110)
+    }
+
+    private fun firstCell(config: org.json.JSONObject?): org.json.JSONObject? {
+        val cells = config?.optJSONArray("cell_json") ?: return null
+        return if (cells.length() > 0) cells.optJSONObject(0) else null
+    }
+
+    private fun isTelephonyCallbackListener(classLoader: ClassLoader, callback: Any, listenerName: String): Boolean {
+        return runCatching {
+            val listenerIface = XposedHelpers.findClass(
+                "android.telephony.TelephonyCallback\$$listenerName", classLoader
+            )
+            listenerIface.isInstance(callback)
+        }.getOrElse { false }
+    }
+
+    private fun buildFakeServiceState(classLoader: ClassLoader, cellArray: org.json.JSONArray?): Any? {
+        XposedBridge.logOpenCellIdEvery(
+            "buildFakeServiceState:called:${cellArray?.length() ?: 0}",
+            "buildFakeServiceState called cellJsonCount=${cellArray?.length() ?: 0}"
+        )
+        return try {
+            val clazz = XposedHelpers.findClass("android.telephony.ServiceState", classLoader)
+            val state = XposedHelpers.newInstance(clazz)
+            val cell = if (cellArray != null && cellArray.length() > 0) cellArray.optJSONObject(0) else null
+            val operator = if (cell != null) {
+                val mcc = positiveJsonInt(cell, "mcc", default = 460)
+                val mnc = positiveJsonInt(cell, "mnc", "net", default = 0)
+                String.format(java.util.Locale.US, "%d%02d", mcc, mnc)
+            } else {
+                "46000"
+            }
+            val operatorName = when (operator.takeLast(2).toIntOrNull() ?: 0) {
+                1, 6, 9 -> "中国联通"
+                3, 5, 11 -> "中国电信"
+                else -> "中国移动"
+            }
+
+            try { XposedHelpers.callMethod(state, "setState", 0) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(state, "setVoiceRegState", 0) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(state, "setDataRegState", 0) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(state, "setOperatorName", operatorName, operatorName, operator) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(state, "setRoaming", false) } catch (_: Throwable) {}
+            try { XposedHelpers.setBooleanField(state, "mIsManualNetworkSelection", false) } catch (_: Throwable) {}
+            try {
+                val nriBuilderClass = XposedHelpers.findClass("android.telephony.NetworkRegistrationInfo" + "$" + "Builder", classLoader)
+                
+                val psBuilder = XposedHelpers.newInstance(nriBuilderClass)
+                XposedHelpers.callMethod(psBuilder, "setDomain", 2) // DOMAIN_PS = 2
+                XposedHelpers.callMethod(psBuilder, "setTransportType", 1) // TRANSPORT_TYPE_WWAN = 1
+                XposedHelpers.callMethod(psBuilder, "setRegistrationState", 1) // REGISTRATION_STATE_HOME = 1
+                XposedHelpers.callMethod(psBuilder, "setAccessNetworkTechnology", 14) // NETWORK_TYPE_LTE = 14
+                val psNri = XposedHelpers.callMethod(psBuilder, "build")
+                
+                val csBuilder = XposedHelpers.newInstance(nriBuilderClass)
+                XposedHelpers.callMethod(csBuilder, "setDomain", 1) // DOMAIN_CS = 1
+                XposedHelpers.callMethod(csBuilder, "setTransportType", 1) // TRANSPORT_TYPE_WWAN = 1
+                XposedHelpers.callMethod(csBuilder, "setRegistrationState", 1) // REGISTRATION_STATE_HOME = 1
+                XposedHelpers.callMethod(csBuilder, "setAccessNetworkTechnology", 14) // NETWORK_TYPE_LTE = 14
+                val csNri = XposedHelpers.callMethod(csBuilder, "build")
+
+                XposedHelpers.callMethod(state, "addNetworkRegistrationInfo", psNri)
+                XposedHelpers.callMethod(state, "addNetworkRegistrationInfo", csNri)
+            } catch (e: Throwable) {
+                XposedBridge.log("[LocationSpoofer] Failed to add NetworkRegistrationInfo to ServiceState: " + e.message)
+            }
+            try { XposedHelpers.setIntField(state, "mVoiceRegState", 0) } catch (_: Throwable) {}
+            try { XposedHelpers.setIntField(state, "mDataRegState", 0) } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(state, "mVoiceOperatorAlphaLong", operatorName) } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(state, "mVoiceOperatorAlphaShort", operatorName) } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(state, "mVoiceOperatorNumeric", operator) } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(state, "mDataOperatorAlphaLong", operatorName) } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(state, "mDataOperatorAlphaShort", operatorName) } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(state, "mDataOperatorNumeric", operator) } catch (_: Throwable) {}
+            XposedBridge.logOpenCellIdEvery(
+                "buildFakeServiceState:success:$operator:$operatorName",
+                "buildFakeServiceState success operator=$operator operatorName=$operatorName"
+            )
+            state
+        } catch (e: Throwable) {
+            XposedBridge.logOpenCellId("buildFakeServiceState failed", e)
+            null
+        }
+    }
+
+    private fun buildFakeSignalStrength(classLoader: ClassLoader, config: org.json.JSONObject?): Any? {
+        val cellCount = config?.optJSONArray("cell_json")?.length() ?: 0
+        XposedBridge.logOpenCellIdEvery(
+            "buildFakeSignalStrength:called:$cellCount",
+            "buildFakeSignalStrength called cellJsonCount=$cellCount"
+        )
+        return try {
+            val clazz = XposedHelpers.findClass("android.telephony.SignalStrength", classLoader)
+            val signalStrength = XposedHelpers.newInstance(clazz)
+            val dbm = signalDbm(firstCell(config) ?: org.json.JSONObject(), 0)
+            val lteSignalClass = XposedHelpers.findClass("android.telephony.CellSignalStrengthLte", classLoader)
+            val lteSignal = XposedHelpers.newInstance(lteSignalClass)
+            try { XposedHelpers.setIntField(lteSignal, "mRsrp", dbm) } catch (_: Throwable) {}
+            try { XposedHelpers.setIntField(lteSignal, "mRsrq", -10) } catch (_: Throwable) {}
+            try { XposedHelpers.setIntField(lteSignal, "mRssnr", 300) } catch (_: Throwable) {}
+            try { XposedHelpers.setIntField(lteSignal, "mSignalStrength", dbm + 113) } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(signalStrength, "mLte", lteSignal) } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(signalStrength, "mCellSignalStrengths", listOf(lteSignal)) } catch (_: Throwable) {}
+            try { XposedHelpers.setBooleanField(signalStrength, "mLteAsPrimaryInNrNsa", true) } catch (_: Throwable) {}
+            XposedBridge.logOpenCellIdEvery(
+                "buildFakeSignalStrength:success:$dbm",
+                "buildFakeSignalStrength success dbm=$dbm"
+            )
+            signalStrength
+        } catch (e: Throwable) {
+            XposedBridge.logOpenCellId("buildFakeSignalStrength failed", e)
+            null
+        }
+    }
+
+    /**
+     * 构造 CellIdentity 派生类，完整兼容 Android 9 ~ Android 14+。
+     * 按以下优先级尝试：
+     *   1. 各 Android 版本已知的有参构造器（最优，字段由构造器写入）
+     *   2. sun.misc.Unsafe.allocateInstance + 反射写字段
+     *      （字段初始值为 0 而非 MAX_VALUE，避免 JIT 内联问题）
+     *   3. 最小参数构造器 + 默认值填充（最后手段）
+     */
+    private fun constructCellIdentityByType(
+        type: String,
+        clazz: Class<*>,
+        mcc: Int, mccStr: String,
+        mnc: Int, mncStr: String,
+        tacOrLac: Int, ciOrCid: Int, pci: Int
+    ): Any {
+        val ctors = clazz.declaredConstructors.onEach { it.isAccessible = true }
+
+        // 按参数个数匹配构造器，调用失败则返回 null
+        fun tryNewInstance(vararg args: Any?): Any? = ctors
+            .firstOrNull { it.parameterCount == args.size }
+            ?.runCatching { newInstance(*args) }
+            ?.getOrNull()
+
+        // ── 阶段一：尝试各版本有参构造器 ──
+        val identity: Any? = when (type) {
+            "LTE" -> {
+                // Android 9 / API 28: (int mcc, int mnc, int ci, int pci, int tac) — 5 参数
+                tryNewInstance(mcc, mnc, ciOrCid, pci, tacOrLac)
+                // Android 10 / API 29: (int ci, int pci, int tac, int earfcn, int bandwidth, String mcc, String mnc, String alphaLong, String alphaShort) — 9 参数
+                    ?: tryNewInstance(ciOrCid, pci, tacOrLac, 0, 0, mccStr, mncStr, "", "")
+                // Android 11+ / API 30+: (int ci, int pci, int tac, int earfcn, int[] bands, int bandwidth, String mcc, String mnc, String alphaLong, String alphaShort, Collection, ClosedSubscriberGroupInfo) — 12 参数
+                    ?: tryNewInstance(ciOrCid, pci, tacOrLac, 0, IntArray(0), 0, mccStr, mncStr, "", "", emptyList<Any>(), null)
+            }
+            "GSM" -> {
+                // Android 9 / API 28: (int mcc, int mnc, int lac, int cid) — 4 参数
+                tryNewInstance(mcc, mnc, tacOrLac, ciOrCid)
+                // Android 9 / API 28: (int mcc, int mnc, int lac, int cid, int arfcn, int bsic) — 6 参数
+                    ?: tryNewInstance(mcc, mnc, tacOrLac, ciOrCid, 0, 0)
+                // Android 10 / API 29: (int lac, int cid, int arfcn, int bsic, String mcc, String mnc, String alphaLong, String alphaShort) — 8 参数
+                    ?: tryNewInstance(tacOrLac, ciOrCid, 0, 0, mccStr, mncStr, "", "")
+                // Android 11+ / API 30+: 10 参数
+                    ?: tryNewInstance(tacOrLac, ciOrCid, 0, 0, mccStr, mncStr, "", "", emptyList<Any>(), null)
+            }
+            "WCDMA", "UMTS" -> {
+                // Android 9: (int mcc, int mnc, int lac, int cid, int psc, int uarfcn) — 6 参数
+                tryNewInstance(mcc, mnc, tacOrLac, ciOrCid, pci, 0)
+                // Android 10: (int lac, int cid, int psc, int uarfcn, String mcc, String mnc, String alphaLong, String alphaShort) — 8 参数
+                    ?: tryNewInstance(tacOrLac, ciOrCid, pci, 0, mccStr, mncStr, "", "")
+                // Android 11+: 10 参数
+                    ?: tryNewInstance(tacOrLac, ciOrCid, pci, 0, mccStr, mncStr, "", "", emptyList<Any>(), null)
+            }
+            "NR" -> {
+                // Android 11+: (int pci, int tac, long nci, int[] bands, String mcc, String mnc, String alphaLong, String alphaShort) — 8 参数
+                tryNewInstance(pci, tacOrLac, ciOrCid.toLong(), IntArray(0), mccStr, mncStr, "", "")
+                // Android 12+: 10 参数
+                    ?: tryNewInstance(pci, tacOrLac, ciOrCid.toLong(), IntArray(0), mccStr, mncStr, "", "", emptyList<Any>(), null)
+            }
+            else -> null
+        }
+
+        if (identity != null) return identity
+
+        // ── 阶段二：Unsafe.allocateInstance + 反射写字段 ──
+        // 字段初始值为 0（非 MAX_VALUE），避免 JIT 内联问题
+        try {
+            val unsafeClass = Class.forName("sun.misc.Unsafe")
+            val unsafeField = unsafeClass.getDeclaredField("theUnsafe")
+            unsafeField.isAccessible = true
+            val unsafe = unsafeField.get(null)
+            val allocate = unsafeClass.getMethod("allocateInstance", Class::class.java)
+            val obj = allocate.invoke(unsafe, clazz) as Any
+
+            // 设置类型标识（CellIdentity.mType）
+            val typeInt = when (type) { "GSM" -> 1; "LTE" -> 3; "WCDMA", "UMTS" -> 4; "NR" -> 6; else -> 3 }
+            try { XposedHelpers.setIntField(obj, "mType", typeInt) } catch (_: Throwable) {}
+            // MCC/MNC（Int 版 Android 9，String 版 Android 10+）
+            try { XposedHelpers.setIntField(obj, "mMcc", mcc) } catch (_: Throwable) {}
+            try { XposedHelpers.setIntField(obj, "mMnc", mnc) } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(obj, "mMccStr", mccStr) } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(obj, "mMncStr", mncStr) } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(obj, "mAlphaLong", "") } catch (_: Throwable) {}
+            try { XposedHelpers.setObjectField(obj, "mAlphaShort", "") } catch (_: Throwable) {}
+
+            when (type) {
+                "LTE" -> {
+                    try { XposedHelpers.setIntField(obj, "mCi", ciOrCid) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(obj, "mTac", tacOrLac) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(obj, "mPci", pci) } catch (_: Throwable) {}
+                    try { XposedHelpers.setObjectField(obj, "mBands", IntArray(0)) } catch (_: Throwable) {}
+                }
+                "GSM" -> {
+                    try { XposedHelpers.setIntField(obj, "mLac", tacOrLac) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(obj, "mCid", ciOrCid) } catch (_: Throwable) {}
+                }
+                "WCDMA", "UMTS" -> {
+                    try { XposedHelpers.setIntField(obj, "mLac", tacOrLac) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(obj, "mCid", ciOrCid) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(obj, "mPsc", pci) } catch (_: Throwable) {}
+                }
+                "NR" -> {
+                    try { XposedHelpers.setIntField(obj, "mTac", tacOrLac) } catch (_: Throwable) {}
+                    try { XposedHelpers.setLongField(obj, "mNci", ciOrCid.toLong()) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(obj, "mPci", pci) } catch (_: Throwable) {}
+                    try { XposedHelpers.setObjectField(obj, "mBands", IntArray(0)) } catch (_: Throwable) {}
+                }
+            }
+            XposedBridge.log("[LocationSpoofer][CellMock] Unsafe.allocateInstance succeeded for $type: CI=$ciOrCid, TAC=$tacOrLac")
+            return obj
+        } catch (e: Throwable) {
+            XposedBridge.log("[LocationSpoofer][CellMock] Unsafe failed for $type: $e")
+        }
+
+        // ── 阶段三：最小参数构造器 + 安全默认值填充（绝对保底）──
+        val minCtor = ctors.minByOrNull { it.parameterCount }
+            ?: throw IllegalStateException("No constructors for ${clazz.name}")
+        val safeArgs = minCtor.parameterTypes.map { t ->
+            when {
+                t == Int::class.javaPrimitiveType    -> 0
+                t == Long::class.javaPrimitiveType   -> 0L
+                t == Boolean::class.javaPrimitiveType -> false
+                t == Float::class.javaPrimitiveType  -> 0f
+                t == Double::class.javaPrimitiveType -> 0.0
+                t == IntArray::class.java            -> IntArray(0)
+                t == java.util.Collection::class.java || t.isAssignableFrom(java.util.ArrayList::class.java) -> emptyList<Any>()
+                else -> null
+            }
+        }.toTypedArray()
+        val fallbackObj = try {
+            minCtor.newInstance(*safeArgs)
+        } catch (e: Throwable) {
+            throw IllegalStateException("Cannot construct ${clazz.name}: $e")
+        }
+        // 写字段
+        try { XposedHelpers.setIntField(fallbackObj, "mMcc", mcc) } catch (_: Throwable) {}
+        try { XposedHelpers.setIntField(fallbackObj, "mMnc", mnc) } catch (_: Throwable) {}
+        try { XposedHelpers.setObjectField(fallbackObj, "mMccStr", mccStr) } catch (_: Throwable) {}
+        try { XposedHelpers.setObjectField(fallbackObj, "mMncStr", mncStr) } catch (_: Throwable) {}
+        when (type) {
+            "LTE" -> {
+                try { XposedHelpers.setIntField(fallbackObj, "mCi", ciOrCid) } catch (_: Throwable) {}
+                try { XposedHelpers.setIntField(fallbackObj, "mTac", tacOrLac) } catch (_: Throwable) {}
+                try { XposedHelpers.setIntField(fallbackObj, "mPci", pci) } catch (_: Throwable) {}
+            }
+            "GSM" -> {
+                try { XposedHelpers.setIntField(fallbackObj, "mLac", tacOrLac) } catch (_: Throwable) {}
+                try { XposedHelpers.setIntField(fallbackObj, "mCid", ciOrCid) } catch (_: Throwable) {}
+            }
+            "WCDMA", "UMTS" -> {
+                try { XposedHelpers.setIntField(fallbackObj, "mLac", tacOrLac) } catch (_: Throwable) {}
+                try { XposedHelpers.setIntField(fallbackObj, "mCid", ciOrCid) } catch (_: Throwable) {}
+                try { XposedHelpers.setIntField(fallbackObj, "mPsc", pci) } catch (_: Throwable) {}
+            }
+            "NR" -> {
+                try { XposedHelpers.setIntField(fallbackObj, "mTac", tacOrLac) } catch (_: Throwable) {}
+                try { XposedHelpers.setLongField(fallbackObj, "mNci", ciOrCid.toLong()) } catch (_: Throwable) {}
+                try { XposedHelpers.setIntField(fallbackObj, "mPci", pci) } catch (_: Throwable) {}
+            }
+        }
+        XposedBridge.log("[LocationSpoofer][CellMock] MinCtor fallback used for $type identity")
+        return fallbackObj
+    }
+
+    data class SatelliteData(
+        val svid: Int,
+        val type: Int, // 1=GPS, 3=GLONASS, 5=BDS
+        val elevation: Float,
+        val azimuth: Float,
+        val cn0: Float,
+        val usedInFix: Boolean
+    )
+
+    private var cachedSatellites: Array<SatelliteData>? = null
+    private var lastSatelliteUpdate: Long = 0L
+    private var isSpoofingActiveCache: Boolean = false
+    private var spoofingCountCache: Int = 0
+
+    private fun updateSatelliteCacheIfNeeded() {
+        val now = System.currentTimeMillis()
+        if (cachedSatellites == null || now - lastSatelliteUpdate > 1000) {
+            val config = readConfig()
+            isSpoofingActiveCache = config?.optBoolean("active", false) ?: false
+            if (isSpoofingActiveCache) {
+                val count = config?.optInt("satellite_count", 10) ?: 10
+                spoofingCountCache = count
+                val timeSec = now / 1000.0
+                val enableJitter = config?.optBoolean("enable_jitter", true) ?: true
+                
+                val newCache = Array(count) { i ->
+                    generateSatelliteData(i, enableJitter, timeSec)
+                }
+                cachedSatellites = newCache
+            }
+            lastSatelliteUpdate = now
+        }
+    }
+
+    private fun getCachedSatellite(satIndex: Int): SatelliteData? {
+        if (!isSpoofingActiveCache || cachedSatellites == null || cachedSatellites!!.isEmpty()) return null
+        val safeIndex = satIndex % cachedSatellites!!.size
+        return cachedSatellites!![safeIndex]
+    }
+
+    private fun generateSatelliteData(satIndex: Int, enableJitter: Boolean, timeSec: Double): SatelliteData {
+        // 增量刷新优化 (Incremental Update Optimization):
+        // 强制每个卫星的数据每 4 秒才变化一次，并使用 satIndex 进行错开 (Staggering)。
+        // 这意味着在任何一秒钟，只有 25% 的卫星数据发生变化。
+        // 目标 App 的 DiffUtil 会发现 75% 的卫星数据完全没变，从而跳过大部分 UI 重绘，彻底解决滑动卡顿！
+        val updateIntervalSec = 4.0
+        val steppedTimeSec = Math.floor((timeSec + satIndex) / updateIntervalSec) * updateIntervalSec - satIndex
+        val steppedDeltaTimeMin = steppedTimeSec / 60.0
+
+        val rng = java.util.Random(satIndex.toLong() + 1000L)
+        val initialPhase = rng.nextDouble() * Math.PI * 2
+        val amplitude = 20.0 + rng.nextDouble() * 20.0
+        val baseElevation = 30.0 + rng.nextDouble() * 20.0
+        val elevation = (baseElevation + amplitude * Math.sin(steppedDeltaTimeMin * 0.05 + initialPhase)).toFloat().coerceIn(0f, 90f)
+
+        val rngAz = java.util.Random(satIndex.toLong() + 4000L)
+        val initialAzimuth = rngAz.nextDouble() * 360.0
+        val currentAzimuth = ((initialAzimuth + steppedDeltaTimeMin * 0.5) % 360.0).toFloat()
+
+        val baseCn0 = 20.0 + (elevation / 90.0) * 20.0
+        val noise = if (enableJitter) {
+            val dynamicRng = java.util.Random((steppedTimeSec / 3.0).toLong() + satIndex)
+            (dynamicRng.nextDouble() - 0.5) * 4.0 // +/- 2 dB
+        } else 0.0
+        val cn0 = (baseCn0 + noise).coerceIn(10.0, 45.0).toFloat()
+
+        val rngType = java.util.Random(satIndex.toLong() + 3000L)
+        val rand = rngType.nextDouble()
+        val type = when {
+            rand < 0.5 -> 1
+            rand < 0.7 -> 3
+            else -> 5
+        }
+        val svid = when (type) {
+            1 -> 1 + (satIndex * 7) % 32 // GPS
+            3 -> 1 + (satIndex * 3) % 24 // GLONASS (GnssStatus standard is 1-24)
+            else -> 1 + (satIndex * 5) % 63 // BDS
+        }
+        
+        // Log satellite generated occasionally or if debugging
+        // XposedBridge.log("[GPS_Spoofer] Generated Sat: type=$type, svid=$svid, cn0=$cn0, elev=$elevation, az=$currentAzimuth")
+
+        val rngFix = java.util.Random(satIndex.toLong() + 2000L)
+        val usedInFix = rngFix.nextDouble() < 0.75
+
+        return SatelliteData(svid, type, elevation, currentAzimuth, cn0, usedInFix)
+    }
+
+    /**
+     * 拦截GnssStatus回调,注入伪造的卫星星座数据
+     *
+     * 反作弊SDK通过registerGnssStatusCallback获取卫星可见数和信噪比(C/N0),
+     * 若Location坐标正常但卫星数为0或信噪比全为0,则判定为模拟位置。
+     *
+     * 伪造策略:
+     * - 可见卫星数: 12-18颗(真实室外环境的典型值)
+     * - 信噪比(C/N0): 15-40 dB-Hz(真实GPS信号的典型范围)
+     * - 卫星类型: GPS(1) + GLONASS(3) + BDS(5)混合星座
+     */
+    private fun hookGnssStatus(classLoader: ClassLoader) {
+        try {
+            val locationManagerClazz = XposedHelpers.findClass("android.location.LocationManager", classLoader)
+            
+            // Hook addGpsStatusListener
+            try {
+                XposedBridge.hookAllMethods(locationManagerClazz, "addGpsStatusListener", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val listener = param.args[0]
+                        if (listener != null) {
+                            val clazz = listener.javaClass
+                            if (hookedCallbackClasses.putIfAbsent(clazz, true) == null) {
+                                try {
+                                    XposedBridge.hookAllMethods(clazz, "onGpsStatusChanged", object : XC_MethodHook() {
+                                        private var lastCallTime = 0L
+                                        override fun beforeHookedMethod(param: MethodHookParam) {
+                                            val event = param.args[0] as? Int
+                                            if (event == 4) { // GPS_EVENT_SATELLITE_STATUS
+                                                val now = System.currentTimeMillis()
+                                                if (now - lastCallTime < 1000) {
+                                                    param.result = null // Throttle
+                                                } else {
+                                                    lastCallTime = now
+                                                }
+                                            }
+                                        }
+                                    })
+                                } catch (e: Throwable) {}
+                            }
+                        }
+                    }
+                })
+            } catch (e: Throwable) { XposedBridge.log(e) }
+
+            // Hook removeGpsStatusListener
+            try {
+                XposedBridge.hookAllMethods(locationManagerClazz, "removeGpsStatusListener", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        // No longer needed
+                    }
+                })
+            } catch (e: Throwable) {}
+
+            // Hook registerGnssStatusCallback
+            try {
+                XposedBridge.hookAllMethods(locationManagerClazz, "registerGnssStatusCallback", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        var callbackObj: Any? = null
+                        val cbClass = try {
+                            classLoader.loadClass("android.location.GnssStatus\$Callback")
+                        } catch (e: Exception) { null }
+
+                        for (arg in param.args) {
+                            if (arg != null && cbClass != null && cbClass.isInstance(arg)) {
+                                callbackObj = arg
+                                break
+                            }
+                        }
+                        if (callbackObj != null) {
+                            val clazz = callbackObj.javaClass
+                            if (hookedCallbackClasses.putIfAbsent(clazz, true) == null) {
+                                try {
+                                    XposedBridge.hookAllMethods(clazz, "onSatelliteStatusChanged", object : XC_MethodHook() {
+                                        private var lastCallTime = 0L
+                                        private var cachedGnssStatus: Any? = null
+                                        private var lastGnssStatusUpdate = 0L
+
+                                        override fun beforeHookedMethod(param: MethodHookParam) {
+                                            val now = System.currentTimeMillis()
+                                            if (now - lastCallTime < 1000) {
+                                                param.result = null // Throttle
+                                                return
+                                            }
+                                            lastCallTime = now
+
+                                            val statusObj = param.args[0] ?: return
+                                            updateSatelliteCacheIfNeeded()
+
+                                            if (isSpoofingActiveCache && cachedSatellites != null) {
+                                                val count = spoofingCountCache
+                                                val sats = cachedSatellites!!
+
+                                                // 1. Android 11+ (API 30+) 优先使用原生 Builder
+                                                // 解决了 Android 11+ mSvidWithFlags 的位移变化 (8 -> 12) 导致的 SVID 全部变 0 的致命 Bug。
+                                                try {
+                                                    val builderClass = XposedHelpers.findClassIfExists("android.location.GnssStatus\$Builder", clazz.classLoader)
+                                                    if (builderClass != null) {
+                                                        if (cachedGnssStatus == null || now - lastGnssStatusUpdate > 1000) {
+                                                            val builder = builderClass.getDeclaredConstructor().newInstance()
+                                                            val addMethod = builderClass.getDeclaredMethod(
+                                                                "addSatellite",
+                                                                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, Float::class.javaPrimitiveType,
+                                                                Float::class.javaPrimitiveType, Float::class.javaPrimitiveType, Boolean::class.javaPrimitiveType,
+                                                                Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType,
+                                                                Float::class.javaPrimitiveType, Boolean::class.javaPrimitiveType, Float::class.javaPrimitiveType
+                                                            )
+                                                            addMethod.isAccessible = true
+                                                            for (i in 0 until count) {
+                                                                val sat = sats[i]
+                                                                addMethod.invoke(
+                                                                    builder, sat.type, sat.svid, sat.cn0, sat.elevation, sat.azimuth,
+                                                                    true, true, sat.usedInFix, false, 0f, false, 0f
+                                                                )
+                                                            }
+                                                            val buildMethod = builderClass.getDeclaredMethod("build")
+                                                            buildMethod.isAccessible = true
+                                                            cachedGnssStatus = buildMethod.invoke(builder)
+                                                            lastGnssStatusUpdate = now
+                                                        }
+                                                        param.args[0] = cachedGnssStatus
+                                                        return // 成功构建并替换，直接返回
+                                                    }
+                                                } catch (e: Throwable) {}
+
+                                                // 2. Android 10 及以下 (API 24-29) 回退到反射直接篡改底层数组
+                                                // 旧版系统的 SVID_SHIFT_WIDTH = 8，以下位运算完全兼容。
+                                                try {
+                                                    val countField = statusObj.javaClass.getDeclaredField("mSvCount")
+                                                    countField.isAccessible = true
+                                                    countField.setInt(statusObj, count)
+
+                                                    val cn0DbHzs = FloatArray(count)
+                                                    val elevations = FloatArray(count)
+                                                    val azimuths = FloatArray(count)
+                                                    val svidWithFlags = IntArray(count)
+
+                                                    for (i in 0 until count) {
+                                                        val sat = sats[i]
+                                                        cn0DbHzs[i] = sat.cn0
+                                                        elevations[i] = sat.elevation
+                                                        azimuths[i] = sat.azimuth
+                                                        var flags = 1 or 2
+                                                        if (sat.usedInFix) flags = flags or 4
+                                                        svidWithFlags[i] = (sat.svid shl 8) or (sat.type and 0xF) or (flags shl 4)
+                                                    }
+
+                                                    val setField = { name: String, value: Any ->
+                                                        try {
+                                                            val f = statusObj.javaClass.getDeclaredField(name)
+                                                            f.isAccessible = true
+                                                            f.set(statusObj, value)
+                                                        } catch (e: Exception) {}
+                                                    }
+
+                                                    setField("mSvidWithFlags", svidWithFlags)
+                                                    setField("mCn0DbHz", cn0DbHzs)
+                                                    setField("mElevations", elevations)
+                                                    setField("mAzimuths", azimuths)
+                                                    setField("mCarrierFrequencies", FloatArray(count))
+                                                    setField("mBasebandCn0DbHzs", FloatArray(count))
+                                                } catch (e: Exception) {}
+                                            }
+                                        }
+                                    })
+                                } catch (e: Throwable) {}
+                            }
+                        }
+                    }
+                })
+            } catch (e: Throwable) { XposedBridge.log(e) }
+
+            // Hook unregisterGnssStatusCallback
+            try {
+                XposedBridge.hookAllMethods(locationManagerClazz, "unregisterGnssStatusCallback", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        // No longer needed
+                    }
+                })
+            } catch (e: Throwable) {}
+
+            // Hook GpsStatus.getSatellites() for legacy Apps like DevCheck
+            try {
+                XposedHelpers.findAndHookMethod("android.location.GpsStatus", classLoader, "getSatellites", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig()
+                        if (config != null && config.optBoolean("active", false)) {
+                            param.result = createSpoofedGpsSatellites(classLoader)
+                        }
+                    }
+                })
+            } catch (e: Throwable) { XposedBridge.log(e) }
+
+
+            XposedBridge.log("[LocationSpoofer] GnssStatus hooks installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("[LocationSpoofer] GnssStatus hook failed: $e")
+        }
+    }
+
+    @Volatile
+    private var lastConfig: JSONObject? = null
+    @Volatile
+    private var lastOpenCellConfigLogKey: String? = null
+    @Volatile
+    private var lastOpenCellConfigReadFailureLogTime = 0L
+    @Volatile
+    private var isConfigPollingStarted = false
+    @Volatile
+    private var configPollIntervalMs = 1_000L
+    private val pollingLock = Any()
+    private val localConfigPath = "/data/local/tmp/locationspoofer_config.json"
+    private val systemConfigPath = "/data/system/locationspoofer_config.json"
+    private val activeConfigTtlMs = 30_000L
+
+    private fun logOpenCellConfigLoaded(source: String, config: JSONObject) {
+        val cellArray = config.optJSONArray("cell_json")
+        val cellCount = cellArray?.length() ?: 0
+        val firstCell = if (cellArray != null && cellArray.length() > 0) cellArray.optJSONObject(0) else null
+        val firstSummary = if (firstCell != null) {
+            val type = normalizeCellType(firstCell.optString("type", firstCell.optString("radio", "LTE")))
+            val mcc = positiveJsonInt(firstCell, "mcc", default = 460)
+            val mnc = positiveJsonInt(firstCell, "mnc", "net", default = 0)
+            val area = cellAreaCode(firstCell, 0)
+            val identity = cellIdentityCode(firstCell, 0)
+            "$type/$mcc-$mnc area=$area identity=$identity"
+        } else {
+            "none"
+        }
+        val logKey = "${config.optBoolean("active", false)}|${config.optBoolean("mock_cell", true)}|${config.optDouble("lat", 0.0)}|${config.optDouble("lng", 0.0)}|$cellCount|$firstSummary"
+        if (logKey != lastOpenCellConfigLogKey) {
+            lastOpenCellConfigLogKey = logKey
+            XposedBridge.logOpenCellId(
+                "readConfig[$source] active=${config.optBoolean("active", false)} mockCell=${config.optBoolean("mock_cell", true)} lat=${config.optDouble("lat", 0.0)} lng=${config.optDouble("lng", 0.0)} cellJsonCount=$cellCount firstCell=$firstSummary"
+            )
+        }
+    }
+
+    private fun configReadPaths(): Array<String> {
+        return if (android.os.Process.myUid() == 1000) {
+            arrayOf(systemConfigPath, localConfigPath)
+        } else {
+            arrayOf(localConfigPath, systemConfigPath)
+        }
+    }
+
+    private fun normalizeConfig(config: JSONObject): JSONObject {
+        if (!config.has("wifi_json")) config.put("wifi_json", org.json.JSONArray())
+        if (config.optBoolean("active", false)) {
+            val now = System.currentTimeMillis()
+            val configBootId = config.optString("boot_id", "")
+            val currentBootId = readBootId()
+            if (configBootId.isNotEmpty() && currentBootId.isNotEmpty() && configBootId != currentBootId) {
+                config.put("active", false)
+                config.put("fail_closed", false)
+                XposedBridge.logOpenCellIdEvery(
+                    "config:boot-expired",
+                    "readConfig disabled previous-boot active config",
+                    30_000L
+                )
+            }
+            val heartbeatAt = maxOf(
+                config.optLong("heartbeat_at", 0L),
+                config.optLong("config_updated_at", 0L),
+                config.optLong("_file_modified_at", 0L)
+            )
+            if (config.optBoolean("active", false) && heartbeatAt > 0L && now - heartbeatAt > activeConfigTtlMs) {
+                markFailClosed(config)
+                XposedBridge.logOpenCellIdEvery(
+                    "config:expired",
+                    "readConfig entered fail-closed after stale active config age=${now - heartbeatAt}ms",
+                    30_000L
+                )
+            }
+        } else if (!config.has("fail_closed")) {
+            config.put("fail_closed", false)
+        }
+        val lat = config.optDouble("lat", 0.0)
+        val lng = config.optDouble("lng", 0.0)
+        val wgs84 = gcj02ToWgs84(lat, lng)
+        config.put("wgs84_lat", wgs84.first)
+        config.put("wgs84_lng", wgs84.second)
+        val bd09 = gcj02ToBd09(lat, lng)
+        config.put("bd09_lat", bd09.first)
+        config.put("bd09_lng", bd09.second)
+        config.put(
+            "jitter_radius_meters",
+            config.optDouble("jitter_radius_meters", DEFAULT_JITTER_RADIUS_METERS)
+                .coerceIn(MIN_JITTER_RADIUS_METERS, MAX_JITTER_RADIUS_METERS)
+        )
+        val jitterSpeed = config.optString("jitter_speed", "MEDIUM").uppercase()
+        config.put("jitter_speed", if (jitterSpeed in setOf("SLOW", "MEDIUM", "FAST")) jitterSpeed else "MEDIUM")
+        return config
+    }
+
+    private fun markFailClosed(config: JSONObject) {
+        config.put("active", true)
+        config.put("fail_closed", true)
+        config.put(
+            "wifi_json",
+            org.json.JSONObject().apply {
+                put("isConnected", false)
+                put("connectedWifi", org.json.JSONObject.NULL)
+                put("nearbyWifi", org.json.JSONArray())
+            }
+        )
+        config.put("cell_json", org.json.JSONArray())
+        config.put("bluetooth_json", org.json.JSONArray())
+        config.put("satellite_count", 0)
+    }
+
+    private fun readBootId(): String {
+        return try {
+            File("/proc/sys/kernel/random/boot_id").readText().trim()
+        } catch (e: Throwable) {
+            ""
+        }
+    }
+
+    private fun loadConfigFromDisk(source: String): JSONObject? {
+        val errors = ArrayList<String>()
+        for (path in configReadPaths()) {
+            try {
+                val file = File(path)
+                if (!file.exists()) {
+                    errors.add("$path missing")
+                    continue
+                }
+                val rawConfig = JSONObject(file.readText())
+                rawConfig.put("_file_modified_at", file.lastModified())
+                val config = normalizeConfig(rawConfig)
+                lastConfig = config
+                configPollIntervalMs = 1_000L
+                logOpenCellConfigLoaded("$source:$path", config)
+                return config
+            } catch (e: Throwable) {
+                errors.add("$path ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+
+        loadConfigFromContentProvider()?.let {
+            return it
+        }
+
+        val now = System.currentTimeMillis()
+        val isPermissionDenied = errors.any { it.contains("EACCES") || it.contains("Permission denied") }
+        val shouldBackoff = currentPackageName == "com.android.phone" && isPermissionDenied
+        val logIntervalMs = if (isPermissionDenied) 60_000L else 10_000L
+        if (shouldBackoff) {
+            configPollIntervalMs = 60_000L
+        }
+        if (now - lastOpenCellConfigReadFailureLogTime > logIntervalMs) {
+            lastOpenCellConfigReadFailureLogTime = now
+            XposedBridge.logOpenCellId("readConfig[$source] no readable config (${errors.joinToString(" | ")})")
+        }
+
+        // Fall back to XSharedPreferences before system properties.
+        loadConfigFromXSharedPreferences()?.let {
+            return it
+        }
+
+        // If disk read failed, attempt to fall back to system properties
+        loadConfigFromProperties()?.let {
+            return it
+        }
+
+        lastConfig?.let { cached ->
+            if (cached.optBoolean("active", false)) {
+                normalizeConfig(cached)
+            }
+        }
+        return null
+    }
+
+    private fun getSystemProperty(key: String, default: String): String {
+        return try {
+            val clazz = Class.forName("android.os.SystemProperties")
+            val method = clazz.getMethod("get", String::class.java, String::class.java)
+            method.invoke(null, key, default) as String
+        } catch (e: Throwable) {
+            default
+        }
+    }
+
+    private fun findXSharedPreferencesClass(): Class<*>? {
+        // 1. Try default Class.forName
+        try {
+            return Class.forName("de.robv.android.xposed.XSharedPreferences")
+        } catch (_: Throwable) {}
+
+        // 2. Try current loader parent
+        try {
+            val loader = LocationHooker::class.java.classLoader
+            loader?.parent?.let { parent ->
+                return Class.forName("de.robv.android.xposed.XSharedPreferences", true, parent)
+            }
+        } catch (_: Throwable) {}
+
+        // 3. Try SystemClassLoader
+        try {
+            return Class.forName("de.robv.android.xposed.XSharedPreferences", true, ClassLoader.getSystemClassLoader())
+        } catch (_: Throwable) {}
+
+        // 4. Try SystemClassLoader parent
+        try {
+            val loader = ClassLoader.getSystemClassLoader()
+            loader?.parent?.let { parent ->
+                return Class.forName("de.robv.android.xposed.XSharedPreferences", true, parent)
+            }
+        } catch (_: Throwable) {}
+
+        // 5. Try Thread context loader
+        try {
+            val loader = Thread.currentThread().contextClassLoader
+            if (loader != null) {
+                return Class.forName("de.robv.android.xposed.XSharedPreferences", true, loader)
+            }
+        } catch (_: Throwable) {}
+
+        // 6. Search entire classloader hierarchy
+        var loader = LocationHooker::class.java.classLoader
+        while (loader != null) {
+            try {
+                return Class.forName("de.robv.android.xposed.XSharedPreferences", true, loader)
+            } catch (_: Throwable) {}
+            loader = loader.parent
+        }
+
+        return null
+    }
+
+    private fun initXSharedPreferences() {
+        try {
+            val clazz = findXSharedPreferencesClass()
+            if (clazz == null) {
+                android.util.Log.d("LocationSpoofer_Debug", "XSharedPreferences class not found anywhere in $currentPackageName")
+                return
+            }
+            xsharedPrefs = clazz.getConstructor(String::class.java, String::class.java)
+                .newInstance("com.shiraka.locatiobprovid", "locationspoofer_prefs")
+            XposedHelpers.callMethod(xsharedPrefs!!, "makeWorldReadable")
+            android.util.Log.d("LocationSpoofer_Debug", "XSharedPreferences initialized successfully in $currentPackageName")
+        } catch (e: Throwable) {
+            android.util.Log.d("LocationSpoofer_Debug", "XSharedPreferences init failed in $currentPackageName: " + e.message, e)
+        }
+    }
+
+    private fun loadConfigFromXSharedPreferences(): JSONObject? {
+        val prefs = xsharedPrefs ?: return null
+        return try {
+            XposedHelpers.callMethod(prefs, "reload")
+            val active = XposedHelpers.callMethod(prefs, "getBoolean", "active", false) as Boolean
+            android.util.Log.d("LocationSpoofer_Debug", "loadConfigFromXSharedPreferences in $currentPackageName: active=$active")
+            if (!active) {
+                return null
+            }
+            val lat = XposedHelpers.callMethod(prefs, "getFloat", "lat", 0f) as Float
+            val lng = XposedHelpers.callMethod(prefs, "getFloat", "lng", 0f) as Float
+            val alt = XposedHelpers.callMethod(prefs, "getFloat", "alt", 0f) as Float
+            val bearing = XposedHelpers.callMethod(prefs, "getFloat", "bearing", 0f) as Float
+            val satCount = XposedHelpers.callMethod(prefs, "getInt", "sat_count", 10) as Int
+            val heartbeat = XposedHelpers.callMethod(prefs, "getLong", "heartbeat", 0L) as Long
+            val bootId = XposedHelpers.callMethod(prefs, "getString", "boot_id", "") as String
+            val enableJitter = XposedHelpers.callMethod(prefs, "getBoolean", "enable_jitter", true) as Boolean
+            val jitterRadius = XposedHelpers.callMethod(prefs, "getInt", "jitter_radius_meters", DEFAULT_JITTER_RADIUS_METERS.toInt()) as Int
+            val jitterSpeed = XposedHelpers.callMethod(prefs, "getString", "jitter_speed", "MEDIUM") as String
+
+            val config = JSONObject().apply {
+                put("active", true)
+                put("lat", lat.toDouble())
+                put("lng", lng.toDouble())
+                put("altitude", alt.toDouble())
+                put("sim_bearing", bearing.toDouble())
+                put("satellite_count", satCount)
+                put("heartbeat_at", heartbeat)
+                put("config_updated_at", heartbeat)
+                put("boot_id", bootId)
+                put("mock_cell", true)
+                put("mock_wifi", true)
+                put("mock_bluetooth", true)
+                put("enable_jitter", enableJitter)
+                put("jitter_radius_meters", jitterRadius.coerceIn(1, 80))
+                put("jitter_speed", jitterSpeed)
+                put("cell_json", org.json.JSONArray())
+            }
+            val normConfig = normalizeConfig(config)
+            lastConfig = normConfig
+            configPollIntervalMs = 1000L
+            normConfig
+        } catch (e: Throwable) {
+            android.util.Log.e("LocationSpoofer_Debug", "loadConfigFromContentProvider in $currentPackageName error", e)
+            null
+        }
+    }
+
+    private fun loadConfigFromContentProvider(): JSONObject? {
+        return try {
+            val context = Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication")
+                .invoke(null) as? android.content.Context ?: return null
+            
+            val uri = Uri.parse("content://com.suseoaa.locationspoofer.provider")
+            val cursor = context.contentResolver.query(uri, null, null, null, null) ?: return null
+            cursor.use { c ->
+                if (c.moveToFirst()) {
+                    val activeInt = c.getInt(c.getColumnIndexOrThrow("active"))
+                    if (activeInt != 1) {
+                        return null
+                    }
+                    
+                    val lat = c.getDouble(c.getColumnIndexOrThrow("lat"))
+                    val lng = c.getDouble(c.getColumnIndexOrThrow("lng"))
+                    val wifiJson = c.getString(c.getColumnIndexOrThrow("wifi_json"))
+                    val cellJson = c.getString(c.getColumnIndexOrThrow("cell_json"))
+                    val simBearing = c.getFloat(c.getColumnIndexOrThrow("sim_bearing"))
+                    val altitude = c.getDouble(c.getColumnIndexOrThrow("altitude"))
+                    val satelliteCount = c.getInt(c.getColumnIndexOrThrow("satellite_count"))
+                    val enableJitter = runCatching {
+                        c.getInt(c.getColumnIndexOrThrow("enable_jitter")) == 1
+                    }.getOrDefault(true)
+                    val jitterRadius = runCatching {
+                        c.getInt(c.getColumnIndexOrThrow("jitter_radius_meters"))
+                    }.getOrDefault(DEFAULT_JITTER_RADIUS_METERS.toInt())
+                    val jitterSpeed = runCatching {
+                        c.getString(c.getColumnIndexOrThrow("jitter_speed"))
+                    }.getOrDefault("MEDIUM")
+                    
+                    val config = JSONObject().apply {
+                        put("active", true)
+                        put("lat", lat)
+                        put("lng", lng)
+                        put("altitude", altitude)
+                        put("sim_bearing", simBearing.toDouble())
+                        put("satellite_count", satelliteCount)
+                        put("heartbeat_at", System.currentTimeMillis())
+                        put("config_updated_at", System.currentTimeMillis())
+                        put("boot_id", readBootId())
+                        put("mock_cell", true)
+                        put("mock_wifi", true)
+                        put("mock_bluetooth", true)
+                        put("enable_jitter", enableJitter)
+                        put("jitter_radius_meters", jitterRadius.coerceIn(1, 80))
+                        put("jitter_speed", jitterSpeed)
+                        put("cell_json", org.json.JSONArray(cellJson))
+                        put("wifi_json", org.json.JSONObject(wifiJson))
+                    }
+                    val normConfig = normalizeConfig(config)
+                    lastConfig = normConfig
+                    configPollIntervalMs = 1000L
+                    android.util.Log.d("LocationSpoofer_Debug", "loadConfigFromContentProvider in $currentPackageName: SUCCESS active=true lat=$lat lng=$lng")
+                    normConfig
+                } else {
+                    null
+                }
+            }
+        } catch (e: Throwable) {
+            android.util.Log.e("LocationSpoofer_Debug", "loadConfigFromContentProvider in $currentPackageName error", e)
+            null
+        }
+    }
+
+    private fun loadConfigFromProperties(): JSONObject? {
+        val activeStr = getSystemProperty("gsm.locsp.active", "false")
+        android.util.Log.d("LocationSpoofer_Debug", "loadConfigFromProperties in $currentPackageName: activeStr=$activeStr")
+        if (activeStr != "true") {
+            return null
+        }
+        return try {
+            val latStr = getSystemProperty("gsm.locsp.lat", "0.0")
+            val lngStr = getSystemProperty("gsm.locsp.lng", "0.0")
+            val altStr = getSystemProperty("gsm.locsp.alt", "0.0")
+            val bearingStr = getSystemProperty("gsm.locsp.bearing", "0.0")
+            val satCountStr = getSystemProperty("gsm.locsp.sat_count", "10")
+            val enableJitterStr = getSystemProperty("gsm.locsp.enable_jitter", "true")
+            val jitterRadiusStr = getSystemProperty("gsm.locsp.jitter_radius", DEFAULT_JITTER_RADIUS_METERS.toInt().toString())
+            val jitterSpeed = getSystemProperty("gsm.locsp.jitter_speed", "MEDIUM")
+            val heartbeatStr = getSystemProperty("gsm.locsp.heartbeat", "0")
+            val bootId = getSystemProperty("gsm.locsp.boot_id", "")
+            
+            val config = JSONObject().apply {
+                put("active", true)
+                put("lat", latStr.toDoubleOrNull() ?: 0.0)
+                put("lng", lngStr.toDoubleOrNull() ?: 0.0)
+                put("altitude", altStr.toDoubleOrNull() ?: 0.0)
+                put("sim_bearing", bearingStr.toDoubleOrNull() ?: 0.0)
+                put("satellite_count", satCountStr.toIntOrNull() ?: 10)
+                put("heartbeat_at", heartbeatStr.toLongOrNull() ?: 0L)
+                put("config_updated_at", heartbeatStr.toLongOrNull() ?: 0L)
+                put("boot_id", bootId)
+                put("mock_cell", true)
+                put("mock_wifi", true)
+                put("mock_bluetooth", true)
+                put("enable_jitter", enableJitterStr == "true")
+                put("jitter_radius_meters", (jitterRadiusStr.toIntOrNull() ?: DEFAULT_JITTER_RADIUS_METERS.toInt()).coerceIn(1, 80))
+                put("jitter_speed", jitterSpeed)
+                put("cell_json", org.json.JSONArray())
+            }
+            val normConfig = normalizeConfig(config)
+            lastConfig = normConfig
+            configPollIntervalMs = 1000L
+            normConfig
+        } catch (e: Throwable) {
+            android.util.Log.e("LocationSpoofer_Debug", "loadConfigFromContentProvider in $currentPackageName error", e)
+            null
+        }
+    }
+
+    /**
+     * 从本地文件读取模拟配置(纯文件方案,无ContentProvider跨进程调用)
+     *
+     * 架构优化:
+     *    由于此方法会被各种 Hook 在主线程极其高频地调用（例如每秒数百次），
+     *    任何在主线程进行的文件 IO（哪怕是偶尔一次）都会导致严重的丢帧卡顿（Stutter）。
+     *    因此重构为：在首次调用时启动一个后台守护线程（Daemon Thread），
+     *    每隔 1000ms 在后台异步读取文件并更新 Volatile 的 lastConfig。
+     *    主线程的 readConfig() 永远只返回内存中的 lastConfig，实现真正的 0 IO 延迟。
+     */
+    private fun readConfig(): JSONObject? {
+        if (!isConfigPollingStarted) {
+            synchronized(pollingLock) {
+                if (!isConfigPollingStarted) {
+                    isConfigPollingStarted = true
+
+                    initXSharedPreferences()
+                    // 首次调用时同步读取一次，确保立即有数据可用
+                    loadConfigFromDisk("initial")
+
+                    // 启动后台轮询守护线程
+                    Thread {
+                        while (true) {
+                            Thread.sleep(configPollIntervalMs)
+                            loadConfigFromDisk("poll")
+                        }
+                    }.apply {
+                        isDaemon = true
+                        name = "LocationSpoofer_ConfigPoller"
+                        start()
+                    }
+                }
+            }
+        }
+        return lastConfig
+    }
+
+    private var cachedGpsSatellitesList: Iterable<Any>? = null
+    private var lastGpsSatellitesUpdate = 0L
+
+    private fun createSpoofedGpsSatellites(classLoader: ClassLoader): Iterable<Any> {
+        val now = System.currentTimeMillis()
+        if (cachedGpsSatellitesList == null || now - lastGpsSatellitesUpdate > 1000) {
+            val list = ArrayList<Any>()
+            try {
+                updateSatelliteCacheIfNeeded()
+                if (!isSpoofingActiveCache || cachedSatellites == null) return list
+
+                val satelliteClass = classLoader.loadClass("android.location.GpsSatellite")
+                val constructor = satelliteClass.getDeclaredConstructor(Int::class.javaPrimitiveType)
+                constructor.isAccessible = true
+
+                for (i in 0 until spoofingCountCache) {
+                    val data = getCachedSatellite(i) ?: continue
+                    val prn = if (data.type == 3) data.svid + 64 else data.svid
+                    val sat = constructor.newInstance(prn)
+                    try { XposedHelpers.setBooleanField(sat, "mValid", true) } catch (e: Throwable) {}
+                    try { XposedHelpers.setBooleanField(sat, "mHasEphemeris", true) } catch (e: Throwable) {}
+                    try { XposedHelpers.setBooleanField(sat, "mHasAlmanac", true) } catch (e: Throwable) {}
+                    try { XposedHelpers.setBooleanField(sat, "mUsedInFix", data.usedInFix) } catch (e: Throwable) {}
+                    try { 
+                        val f = satelliteClass.getDeclaredField("mSnr")
+                        f.isAccessible = true
+                        f.setFloat(sat, data.cn0)
+                    } catch (e: Throwable) {}
+                    try { 
+                        val f = satelliteClass.getDeclaredField("mElevation")
+                        f.isAccessible = true
+                        f.setFloat(sat, data.elevation)
+                    } catch (e: Throwable) {}
+                    try { 
+                        val f = satelliteClass.getDeclaredField("mAzimuth")
+                        f.isAccessible = true
+                        f.setFloat(sat, data.azimuth)
+                    } catch (e: Throwable) {}
+                    list.add(sat)
+                }
+                cachedGpsSatellitesList = list
+                lastGpsSatellitesUpdate = now
+        } catch (e: Throwable) {
+            XposedBridge.log(e)
+        }
+    }
+
+        return cachedGpsSatellitesList ?: ArrayList()
+    }
+
+    private fun buildSpoofedAndroidLocation(config: JSONObject): android.location.Location {
+        return android.location.Location(android.location.LocationManager.GPS_PROVIDER).also {
+            applySpoofedLocationToObject(it, config)
+        }
+    }
+
+    private fun locationCallbackTargets(args: Array<Any?>): List<Any> {
+        return args.filterNotNull().filterNot { arg ->
+            arg is String ||
+                arg is Number ||
+                arg is Boolean ||
+                arg is android.os.Looper ||
+                arg is android.os.CancellationSignal ||
+                arg is java.util.concurrent.Executor
+        }
+    }
+
+    private fun deliverLocationOnce(args: Array<Any?>, config: JSONObject) {
+        val loc = buildSpoofedAndroidLocation(config)
+        val executor = args.firstOrNull { it is java.util.concurrent.Executor } as? java.util.concurrent.Executor
+        val callbacks = locationCallbackTargets(args)
+        val deliver = {
+            for (callback in callbacks) {
+                if (XposedHelpers.tryCallMethodDeep(callback, "onLocationChanged", loc) ||
+                    XposedHelpers.tryCallMethodDeep(callback, "accept", loc)
+                ) {
+                    break
+                }
+            }
+        }
+        if (executor != null) {
+            executor.execute { deliver() }
+        } else {
+            deliver()
+        }
+    }
+
+    private fun startContinuousLocationUpdates(args: Array<Any?>) {
+        val executor = args.firstOrNull { it is java.util.concurrent.Executor } as? java.util.concurrent.Executor
+        for (callback in locationCallbackTargets(args)) {
+            val key = System.identityHashCode(callback)
+            if (activeLocationUpdateRunnables.containsKey(key)) continue
+            lateinit var runnable: Runnable
+            runnable = Runnable {
+                val config = readConfig()
+                if (config == null || !config.optBoolean("active", false)) {
+                    activeLocationUpdateRunnables.remove(key)
+                    return@Runnable
+                }
+                deliverLocationOnce(arrayOf(callback, executor).filterNotNull().toTypedArray(), config)
+                locationUpdateHandler.postDelayed(runnable, 1000L)
+            }
+            activeLocationUpdateRunnables[key] = runnable
+            locationUpdateHandler.postDelayed(runnable, 1000L)
+        }
+    }
+
+    private fun stopContinuousLocationUpdates(args: Array<Any?>) {
+        for (callback in locationCallbackTargets(args)) {
+            val key = System.identityHashCode(callback)
+            val runnable = activeLocationUpdateRunnables.remove(key) ?: continue
+            locationUpdateHandler.removeCallbacks(runnable)
+        }
+    }
+
+    private fun applySpoofedLocationToObject(loc: Any, config: JSONObject) {
+        val baseLat = config.optDouble("lat", 0.0)
+        val baseLng = config.optDouble("lng", 0.0)
+        val jittered = getJitteredLocation(baseLat, baseLng)
+        val timestamps = nextSpoofedTimestamps()
+
+        try { XposedHelpers.callMethod(loc, "setLatitude", jittered.first) } catch (e: Throwable) {
+            try { XposedHelpers.setDoubleField(loc, "mLatitude", jittered.first) } catch (_: Throwable) {}
+        }
+        try { XposedHelpers.callMethod(loc, "setLongitude", jittered.second) } catch (e: Throwable) {
+            try { XposedHelpers.setDoubleField(loc, "mLongitude", jittered.second) } catch (_: Throwable) {}
+        }
+        try { XposedHelpers.callMethod(loc, "setAccuracy", getJitteredAccuracy()) } catch (e: Throwable) {
+            try { XposedHelpers.setFloatField(loc, "mHorizontalAccuracyMeters", getJitteredAccuracy()) } catch (_: Throwable) {}
+        }
+        try { XposedHelpers.callMethod(loc, "setTime", timestamps.wallTimeMs) } catch (e: Throwable) {
+            try { XposedHelpers.setLongField(loc, "mTimeMs", timestamps.wallTimeMs) } catch (_: Throwable) {}
+        }
+        try { XposedHelpers.callMethod(loc, "setElapsedRealtimeNanos", timestamps.elapsedRealtimeNanos) } catch (e: Throwable) {
+            try { XposedHelpers.setLongField(loc, "mElapsedRealtimeNs", timestamps.elapsedRealtimeNanos) } catch (_: Throwable) {}
+        }
+        rememberLocationTimestamps(loc, timestamps)
+        try { XposedHelpers.callMethod(loc, "setProvider", android.location.LocationManager.GPS_PROVIDER) } catch (_: Throwable) {}
+
+        val baseAlt = config.optDouble("altitude", 0.0)
+        if (baseAlt > 0.0) {
+            try { XposedHelpers.callMethod(loc, "setAltitude", baseAlt + (rng.nextDouble() - 0.5)) } catch (_: Throwable) {}
+        }
+
+        try { XposedHelpers.setBooleanField(loc, "mMock", false) } catch (_: Throwable) {}
+        try { XposedHelpers.setBooleanField(loc, "mIsFromMockProvider", false) } catch (_: Throwable) {}
+        try {
+            val extras = XposedHelpers.callMethod(loc, "getExtras") as? android.os.Bundle
+            val bundle = extras ?: android.os.Bundle()
+            bundle.remove("mockLocation")
+            bundle.remove("isMock")
+            bundle.putInt("satellites", config.optInt("satellite_count", 10))
+            if (extras == null) {
+                XposedHelpers.callMethod(loc, "setExtras", bundle)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun createOnNmeaMessageListenerProxy(original: Any, classLoader: ClassLoader): Any {
+        val interfaceClass = classLoader.loadClass("android.location.OnNmeaMessageListener")
+        val proxy = java.lang.reflect.Proxy.newProxyInstance(
+            classLoader,
+            arrayOf(interfaceClass),
+            object : java.lang.reflect.InvocationHandler {
+                override fun invoke(proxy: Any, method: java.lang.reflect.Method, args: Array<out Any>?): Any? {
+                    if (method.name == "onNmeaMessage" && args != null && args.size >= 1) {
+                        val originalMsg = args[0] as? String
+                        if (originalMsg != null) {
+                            val spoofedMsg = spoofNmeaMessage(originalMsg)
+                            if (spoofedMsg == null) return null // Allow dropping messages
+                            val newArgs = arrayOfNulls<Any>(args.size)
+                            for (i in args.indices) {
+                                newArgs[i] = if (i == 0) spoofedMsg else args[i]
+                            }
+                            return method.invoke(original, *newArgs)
+                        }
+                    }
+                    val methodArgs = if (args == null) emptyArray<Any>() else Array(args.size) { i -> args[i] }
+                    return method.invoke(original, *methodArgs)
+                }
+            }
+        )
+        // startNmeaGsvInjector(original, "onNmeaMessage", classLoader)
+        return proxy
+    }
+
+    private fun createGpsStatusNmeaListenerProxy(original: Any, classLoader: ClassLoader): Any {
+        val interfaceClass = classLoader.loadClass("android.location.GpsStatus\$NmeaListener")
+        val proxy = java.lang.reflect.Proxy.newProxyInstance(
+            classLoader,
+            arrayOf(interfaceClass),
+            object : java.lang.reflect.InvocationHandler {
+                override fun invoke(proxy: Any, method: java.lang.reflect.Method, args: Array<out Any>?): Any? {
+                    if (method.name == "onNmeaReceived" && args != null && args.size >= 2) {
+                        val originalMsg = args[1] as? String
+                        if (originalMsg != null) {
+                            val spoofedMsg = spoofNmeaMessage(originalMsg)
+                            if (spoofedMsg == null) return null // Allow dropping messages
+                            val newArgs = arrayOfNulls<Any>(args.size)
+                            for (i in args.indices) {
+                                newArgs[i] = if (i == 1) spoofedMsg else args[i]
+                            }
+                            return method.invoke(original, *newArgs)
+                        }
+                    }
+                    val methodArgs = if (args == null) emptyArray<Any>() else Array(args.size) { i -> args[i] }
+                    return method.invoke(original, *methodArgs)
+                }
+            }
+        )
+        // startNmeaGsvInjector(original, "onNmeaReceived", classLoader)
+        return proxy
+    }
+
+    private fun spoofNmeaMessage(sentence: String): String? {
+        try {
+            val config = readConfig() ?: return sentence
+            if (!config.optBoolean("active", false)) return sentence
+            
+            val targetLat = config.optDouble("wgs84_lat", 0.0)
+            val targetLng = config.optDouble("wgs84_lng", 0.0)
+            if (targetLat == 0.0 && targetLng == 0.0) return sentence
+            
+            val parts = sentence.split("*")
+            val mainPart = parts[0]
+            val fields = mainPart.split(",").toMutableList()
+            if (fields.isEmpty()) return sentence
+            
+            val type = fields[0]
+            var modified = false
+            
+            // Drop GSV sentences to hide real hardware satellites.
+            // (We removed the fake GSV injector, so the app will simply not see GSV sentences,
+            // which is safer than showing real hardware GSV sentences that conflict with our fake GnssStatus).
+            if (type.endsWith("GSV")) {
+                return null
+            }
+            
+            if (type.endsWith("RMC") && fields.size >= 7) {
+                val (latStr, latDir) = convertToNmeaLatitude(targetLat)
+                val (lngStr, lngDir) = convertToNmeaLongitude(targetLng)
+                fields[3] = latStr
+                fields[4] = latDir
+                fields[5] = lngStr
+                fields[6] = lngDir
+                modified = true
+            } else if (type.endsWith("GGA") && fields.size >= 6) {
+                val (latStr, latDir) = convertToNmeaLatitude(targetLat)
+                val (lngStr, lngDir) = convertToNmeaLongitude(targetLng)
+                fields[2] = latStr
+                fields[3] = latDir
+                fields[4] = lngStr
+                fields[5] = lngDir
+                modified = true
+            } else if (type.endsWith("GLL") && fields.size >= 5) {
+                val (latStr, latDir) = convertToNmeaLatitude(targetLat)
+                val (lngStr, lngDir) = convertToNmeaLongitude(targetLng)
+                fields[1] = latStr
+                fields[2] = latDir
+                fields[3] = lngStr
+                fields[4] = lngDir
+                modified = true
+            }
+            
+            if (!modified) return sentence
+            
+            val newMainPart = fields.joinToString(",")
+            val newChecksum = calculateNmeaChecksum(newMainPart)
+            
+            val tail = if (parts.size > 1) {
+                val rawTail = parts[1]
+                val lineEnding = rawTail.substring(Math.min(2, rawTail.length))
+                "*$newChecksum$lineEnding"
+            } else {
+                "*$newChecksum"
+            }
+            return newMainPart + tail
+        } catch (e: Exception) {
+            XposedBridge.log(e)
+            return sentence
+        }
+    }
+
+    private fun convertToNmeaLatitude(lat: Double): Pair<String, String> {
+        val absLat = Math.abs(lat)
+        val degrees = absLat.toInt()
+        val minutes = (absLat - degrees) * 60.0
+        val latStr = String.format(java.util.Locale.US, "%02d%08.5f", degrees, minutes)
+        val dir = if (lat >= 0) "N" else "S"
+        return Pair(latStr, dir)
+    }
+
+    private fun convertToNmeaLongitude(lng: Double): Pair<String, String> {
+        val absLng = Math.abs(lng)
+        val degrees = absLng.toInt()
+        val minutes = (absLng - degrees) * 60.0
+        val lngStr = String.format(java.util.Locale.US, "%03d%08.5f", degrees, minutes)
+        val dir = if (lng >= 0) "E" else "W"
+        return Pair(lngStr, dir)
+    }
+
+    private fun calculateNmeaChecksum(sentence: String): String {
+        var checksum = 0
+        val startIndex = if (sentence.startsWith("$")) 1 else 0
+        val endIndex = sentence.indexOf('*')
+        val limit = if (endIndex != -1) endIndex else sentence.length
+        for (i in startIndex until limit) {
+            checksum = checksum xor sentence[i].code
+        }
+        return String.format(java.util.Locale.US, "%02X", checksum)
+    }
+
+}

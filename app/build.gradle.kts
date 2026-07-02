@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.suseoaa.locationspoofer"
+    namespace = "com.shiraka.locatiobprovid"
     compileSdk = 36
 
     fun getLocalConfig(key: String): String? {
@@ -25,7 +25,7 @@ android {
         System.getenv("GOOGLE_MAPS_API_KEY") ?: getLocalConfig("GOOGLE_MAPS_API_KEY") ?: ""
 
     defaultConfig {
-        applicationId = "com.suseoaa.locationspoofer"
+        applicationId = "com.shiraka.locatiobprovid"
         minSdk = 26
         //noinspection OldTargetApi
         targetSdk = 36
@@ -99,11 +99,6 @@ dependencies {
     compileOnly(libs.xposed.api)
     implementation(libs.xposed.service)
     implementation(libs.koin.androidx.compose)
-    implementation(libs.amap.map)
-    implementation(libs.amap.search)
-    implementation(libs.baidu.map)
-    implementation(libs.baidu.location)
-    implementation(libs.baidu.search)
     implementation(libs.google.maps)
     implementation(libs.google.places)
     implementation(libs.kotlinx.serialization.json)
