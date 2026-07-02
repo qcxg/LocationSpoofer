@@ -2,222 +2,202 @@
 
 <h1>LocationSpoofer</h1>
 
-<p>基于 KernelSU + LSPosed 的高保真 Android 系统级虚拟定位与无线环境伪装模块</p>
+<p>基於 KernelSU + LSPosed 的高保真 Android 系統級虛擬定位與無線環境偽裝模組</p>
 <p>High-fidelity Android system-level location spoofing and wireless environment simulation module based on KernelSU + LSPosed</p>
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL%20v3-blue.svg)](LICENSE)
 [![Android](https://img.shields.io/badge/Android-8.0%2B-green.svg)](https://developer.android.com)
 [![KernelSU](https://img.shields.io/badge/Root-KernelSU-orange.svg)](https://kernelsu.org)
 [![LSPosed](https://img.shields.io/badge/Framework-LSPosed-purple.svg)](https://github.com/LSPosed/LSPosed)
-[![Telegram](https://img.shields.io/badge/Telegram-交流群-blue.svg)](https://t.me/+CsxZGItXdW40ZWVl)
 
-[简体中文](README.md) | [English](README_EN.md)
+[繁體中文](README.md) | [English](README_EN.md)
 
 </div>
 
 ---
 
-> **📢 加入我们的 [Telegram 交流群](https://t.me/+CsxZGItXdW40ZWVl) 进行**~~技术探讨、催更、~~**吹牛逼、搞抽象。**
->
-> **📖 查看 [LocationSpoofer 详细使用教程](https://docs.google.com/document/d/1fFEz3k7ATdN2dwY1L3RJn1QuzgokIsslNa88-vUPxPk/edit?usp=sharing)**
+> **📖 查看 [LocationSpoofer 詳細使用教學](https://docs.google.com/document/d/1fFEz3k7ATdN2dwY1L3RJn1QuzgokIsslNa88-vUPxPk/edit?usp=sharing)**
 
 ---
 
-## 📖 项目简介
+## 📖 專案簡介
 
-在现代 Android 系统的风控环境中，传统的“模拟位置（Mock Location）”开发者选项早已被各类反作弊 SDK（如高德风控、腾讯安全、网易易盾等）列为高风险特征。它们不仅能够轻松检测到 `isFromMockProvider` 标志，还会通过收集周围的以下信息来识别异常：
+在現代 Android 系統的風控環境中，傳統的「模擬位置（Mock Location）」開發者選項早已被各類反作弊 SDK（如高德風控、騰訊安全、網易易盾等）列為高風險特徵。它們不僅能夠輕鬆檢測到 `isFromMockProvider` 標誌，還會透過收集周圍的以下資訊來識別異常：
 
 *   **Wi-Fi BSSID 列表**
-*   **移动基站蜂窝小区的蜂窝指纹**
-*   **附近 BLE 蓝牙信标**
-*   甚至通过对定位数据序列进行傅里叶变换（FFT）来识别规律的静态或线性模拟轨迹。
+*   **行動基站蜂窩小區的蜂窩指紋**
+*   **附近 BLE 藍牙信標**
+*   甚至透過對定位數據序列進行傅立葉變換（FFT）來識別規律的靜態或線性模擬軌跡。
 
-**LocationSpoofer** 是专为应对此类高强度风控而设计的**系统级虚拟定位与无线电环境克隆方案**。
-它基于 **KernelSU / Magisk / APatch** 获取底层 Root 权限，并利用 **LSPosed (libxposed)** 框架注入目标进程，以极高的物理契合度拦截并伪造所有与定位、网络环境相关的底层 API 响应，确保应用在无法察觉的情况下获取高度一致的虚假位置指纹。
+**LocationSpoofer** 是專為因應此類高強度風控而設計的**系統級虛擬定位與無線電環境克隆方案**。
+它基於 **KernelSU / Magisk / APatch** 獲取底層 Root 權限，並利用 **LSPosed (libxposed)** 框架注入目標進程，以極高的物理契合度攔截並偽造所有與定位、網路環境相關的底層 API 響應，確保應用在無法察覺的情況下獲取高度一致的虛假位置指紋。
 
 > [!TIP]
 > **🌟 最新版本重要更新**
 > 
-> 新增了更完整的 **Wi-Fi 环境模拟** 与 **移动基站模拟**：可从本地扫街数据、WiGLE 云端热点数据以及 OpenCellID 基站数据中构建目标坐标附近的真实无线电指纹，并在目标 App 进程内同步伪造 `WifiManager`、`TelephonyManager`、`PhoneStateListener` 与 `TelephonyCallback` 等接口返回，让位置、Wi-Fi、运营商、基站小区与信号强度保持一致。
+> 重構並強化了 **Wi-Fi 環境模擬** 與 **行動基站模擬** 的真實性與安全性：
+> * **嚴格拒絕生成虛擬 AP**：移除所有隨機生成的 Wi-Fi AP 識別（如 `WIFI_Nearby_*`）與虛擬基站。若定位區域無可信資料，則安全地回傳空資料，確保真實無線電訊號被完全阻斷而不洩露，實現「Fail-Closed」安全機制。
+> * **高斯隨機游走抖動邊緣化**：將隨機游走計算移至 Xposed 鉤子層邊緣，解決了先前因服務端重複累積導致的隨機行走無限發散問題。
+> * **單調時間戳修復**：引入單調遞增時間戳，解決了因時間倒流導致 Android 系統拒絕位置更新或提示定位訊號弱的問題。
 
 ---
 
-## ✨ 核心特性与技术内幕
+## ✨ 核心特性與技術內幕
 
-### 1. 🌐 地图引擎与自适应坐标系翻译器
-* **地图无缝切换**：国内设备自动初始化高德或者百度 3D 地图，海外设备自动切换至 Google Maps 进行路线规划与十字准星微调。
-* **独立应用坐标系适配**：微信、学习通、百度地图等不同应用对定位接口的期望坐标系不同。若直接传入 GCJ-02 会在百度地图上产生数百米偏移。LocationSpoofer 支持为每个目标 App 单独指定 `GCJ-02` (火星坐标)、`WGS-84` (GPS 原始坐标) 或 `BD-09` (百度坐标)。
-* **零延迟翻译**：在 Xposed 挂钩时，直接从主进程预先计算好的经纬度数据读取，规避高频 Hook 场景下的三角函数开销。
+### 1. 🌐 地圖引擎與自適應座標系翻譯器
+* **Google Maps 整合**：專案全面採用 Google Maps & Places SDK 作為地圖基礎，提供流暢的路線規劃與十字準星微調。
+* **獨立應用座標系適配**：不同的應用（如微信、學習通、地圖軟體等）對定位介面的期望座標系不同。若直接傳入座標，可能會在特定地圖上產生數百公尺偏移。LocationSpoofer 支援為每個目標 App 單獨指定 `GCJ-02` (火星座標)、`WGS-84` (GPS 原始座標) 或 `BD-09` (百度座標)。
+* **零延遲翻譯**：在 Xposed 進行 Hook 時，直接從主進程預先計算好的經緯度數據讀取，規避高頻 Hook 場景下的三角函數開銷。
 
-### 2. 🛰️ 高保真 GPS 物理引擎与随机游走抖动
-真实 GPS 芯片输出 of coordinates 因电离层闪烁、多径效应及接收机噪声，天然具有高斯分布的白噪声。若返回静态坐标或机械的直线坐标，极易被反作弊检测。
-* **Ornstein-Uhlenbeck 随机过程**：我们引入了高斯随机游走物理模型来生成自然位置抖动，其状态方程定义为：
+### 2. 🛰️ 高保真 GPS 物理引擎與隨機游走抖動
+真實 GPS 晶片輸出的座標因電離層閃爍、多徑效應及接收機雜訊，天然具有高斯分布的白雜訊。若回傳靜態座標或機械的直線座標，極易被反作弊檢測。
+* **Ornstein-Uhlenbeck 隨機過程**：我們引入了高斯隨機游走物理模型來生成自然位置抖動，其狀態方程定義為：
   $$\mathrm{d}X_t = -\alpha X_t \mathrm{d}t + \sigma \mathrm{d}W_t$$
-  其中 $\sigma$ 为漂移强度，$\alpha$ 为均值回归系数（本模块设定为 `0.05`，即每秒将当前漂移拉回 5%）。它既产生了符合物理规律的低频缓慢漂移，又使漂移量在 3-Sigma 原则下严格有界（硬性限制在 4 米内），防止漂移无限发散引起“位置瞬移”告警。
-* **步频横向抖动（Gait Jitter）**：当处于步行或跑步模式时，引擎自动沿当前移动方向的正交横向上，根据步频周期的统计概率施加 `0.15 * N(0,1)` 米的高斯横向位移，完美模拟真实人行时身体左右晃动的步态特征。
-* **海拔高度与精度（GDOP）慢漂移**：精度值（Accuracy）及海拔高度（Altitude）不再是死板的常量，而是在基准值附近进行布朗运动式的缓慢波动，模拟大气对流层延迟与卫星几何分布的自然变化。
+  其中 $\sigma$ 為漂移強度（使用者可在 UI 自訂 1m 至 80m，預設為 30m），$\alpha$ 為均值回歸係數。它既產生了符合物理規律的低頻緩慢漂移，又使漂移量在 3-Sigma 原則下嚴格有界，防止漂移無限發散引起「位置瞬移」告警。
+* **步頻橫向抖動（Gait Jitter）**：當處於步行或跑步模式時，引擎自動沿當前移動方向的正交橫向上，根據步頻週期的統計機率施加 `0.15 * N(0,1)` 公尺的高斯橫向位移，完美模擬真實人行時身體左右晃動的步態特徵。
+* **海拔高度與精度（GDOP）慢漂移**：精度值（Accuracy）及海拔高度（Altitude）不再是死板的常數，而是在基準值附近進行布朗運動式的緩慢波動，模擬大氣對流層延遲與衛星幾何分布的自然變化。
 
-### 3. 🛡️ 全方位反检测套件（Stealth & Anti-Detection）
-* **深度调用栈清洗（Stack Traces Scrubbing）**：动态拦截 `Throwable.getStackTrace` 和 `Thread.getStackTrace`，一旦发现调用栈中包含 `de.robv.android.xposed`、`io.github.libxposed`、`lsposed` 等敏感调用帧，自动抹除，让反作弊 SDK 无法在调用链回溯中发现 Xposed 框架。
-* **类加载隔离**：Hook `Class.forName` 和 `ClassLoader.loadClass`，对于上述敏感类名的查询直接拦截并抛出 `ClassNotFoundException`。
-* **Mock 属性彻底抹除**：
-  * 将 `Location.isFromMockProvider()` 和 `Location.isMock()` 的返回值永久强制覆写为 `false`。
-  * 针对 Android 12/13+ 系统，通过反射强制将 `Location` 内部私有字段 `mMock` 和 `mIsFromMockProvider` 重写为 `false`，并移除 Extra Bundle 中可能残留的 `mockLocation` 标记。
-  * 拦截 `AppOpsManager` 的 `OP_MOCK_LOCATION (58)` 权限查询，强制返回 `MODE_IGNORED (1)`，令目标 App 认为系统没有向任何软件授权模拟位置。
-  * 拦截 `Settings.Secure` 中 `mock_location` 及 `allow_mock_location` 的读取，返回 `0`（关闭状态）。
-  * 隐藏 `LocationManager` 中的虚拟 Test Provider，将其一律重命名并伪装为系统的原生 `gps` 提供者。
+### 3. 🛡️ 全方位反檢測套件（Stealth & Anti-Detection）
+* **深度呼叫棧清洗（Stack Traces Scrubbing）**：動態攔截 `Throwable.getStackTrace` 和 `Thread.getStackTrace`，一旦發現呼叫棧中包含 `de.robv.android.xposed`、`io.github.libxposed`、`lsposed` 等敏感呼叫影格，自動抹除，讓反作弊 SDK 無法在呼叫鏈回溯中發現 Xposed 框架。
+* **類別載入隔離**：Hook `Class.forName` 和 `ClassLoader.loadClass`，對於上述敏感類別名稱的查詢直接攔截並拋出 `ClassNotFoundException`。
+* **Mock 屬性徹底抹除**：
+  * 將 `Location.isFromMockProvider()` 和 `Location.isMock()` 的傳回值永久強制覆寫為 `false`。
+  * 針對 Android 12/13+ 系統，透過反射強制將 `Location` 內部私有欄位 `mMock` 和 `mIsFromMockProvider` 重寫為 `false`，並移除 Extra Bundle 中可能殘留的 `mockLocation` 標記。
+  * 攔截 `AppOpsManager` 的 `OP_MOCK_LOCATION (58)` 權限查詢，強制傳回 `MODE_IGNORED (1)`，令目標 App 認為系統沒有向任何軟體授權模擬位置。
+  * 攔截 `Settings.Secure` 中 `mock_location` 及 `allow_mock_location` 的讀取，傳回 `0`（關閉狀態）。
+  * 隱藏 `LocationManager` 中的虛擬 Test Provider，將其一律重命名並偽裝為系統的原生 `gps` 提供者。
 
-### 4. 📶 无线电环境克隆与空间热力插值引擎
-大多数反作弊 SDK 会采集周边的无线电指纹。如果你定位到北京，但手机扫出来的 Wi-Fi 列表全在你上海的家里，瞬间就会被标记异常。
-* **实地扫街扫描器（EnvironmentScanner）**：支持在背景运行扫描，以 10s 间隔自动保存你真实走过的物理世界中的 Wi-Fi 接入点（SSID/BSSID/RSSI/频率/信道/Wi-Fi标准）、基站小区信息（GSM, WCDMA, CDMA, LTE, 甚至是 5G NR 的完整蜂窝指纹 MCC/MNC/LAC/CID/TAC/PCI/NCI 及 dbm 信号强度）以及附近 BLE 蓝牙信标。
-* **空间反距离加权（IDW）插值**：当虚拟定位在地图上运动时，系统会在 Room 本地数据库中检索 50 米范围内的历史采集点。使用反距离平方比作为权重：
-  $$w_i = \frac{1}{d_i^2}$$
-  对周边所有 Wi-Fi RSSI 信号强度、蜂窝 dbm 级蓝牙 RSSI 进行动态差值计算。这使手机在虚拟移动时，Wi-Fi 信号会在后台平滑衰减和增强，模拟最真实的信号过渡，绝无指纹突变带来的安全隐患。
-* **Wi-Fi 扫描与连接态模拟**：Hook `WifiManager.getScanResults()`、`getConnectionInfo()`、`getConfiguredNetworks()`、`getDhcpInfo()` 等接口，按目标坐标返回伪造的 SSID/BSSID/RSSI/频率/信道/加密能力，同时同步 Wi-Fi 开关状态、连接网络、网关与 DHCP 信息。
-* **真实品牌 OUI 前缀匹配**：在无本地采集数据的空白区域，系统采用 TP-Link、Huawei、ZTE、Xiaomi、Cisco 等真实中国主流品牌路由器的合法 MAC 前缀（Organizationally Unique Identifier）生成虚拟 Wi-Fi BSSID，拒绝因随机生成非法 MAC 而被反作弊厂商识破。
-* **云端联合伪装 (WiGLE API)**：可配置 WiGLE API 密钥，实时在线拉取全球指定经纬度周围真实物理存在的 Wi-Fi 热点，并写入本地环境数据库，后续可离线复用。
-* **OpenCellID 基站数据导入**：可配置 OpenCellID API Key，按目标坐标查询附近真实蜂窝小区，自动完成 GCJ-02 到 WGS-84 坐标转换、bbox 扩展查询、字段归一化与本地缓存。
-* **移动基站与运营商接口模拟**：覆盖 `TelephonyManager.getAllCellInfo()`、`getCellLocation()`、`getNetworkOperator()`、`getServiceState()`、`getSignalStrength()`、`listen()`、`requestCellInfoUpdate()`、`registerTelephonyCallback()` 等读取路径，支持 GSM/WCDMA/LTE/NR 小区信息、MCC/MNC/LAC/CID/TAC/PCI/NCI、RSRP/dbm 信号强度与运营商名称模拟；当云端数据缺少 LTE/NR 时，会补充合成 LTE 主小区以兼容只读取 4G 的检测软件。
+### 4. 📶 無線電環境克隆與空間熱力插值引擎
+大多數反作弊 SDK 會採集周邊的無線電指紋。如果你定位到台北，但手機掃出來的 Wi-Fi 列表全在你高雄的家裡，瞬間就會被標記異常。
+* **實地掃街掃描器（EnvironmentScanner）**：支援在背景運行掃描，自動保存你真實走過的物理世界中的 Wi-Fi 接入點（SSID/BSSID/RSSI/頻率/信道/Wi-Fi標準）、基站小區資訊（GSM, WCDMA, CDMA, LTE, 甚至是 5G NR 的完整蜂窩指紋 MCC/MNC/LAC/CID/TAC/PCI/NCI 及 dbm 訊號強度）以及附近 BLE 藍牙信標。
+* **空間反距離加權（IDW）插值**：當虛擬定位在地圖上運動時，系統會在 Room 本地資料庫中檢索 50 公尺範圍內的歷史採集點。使用反距離平方比作為權重對周邊所有訊號強度進行動態差值計算，模擬最真實的訊號過渡。
+* **可信 Wi-Fi 來源保障**：僅接受本地實地掃街數據、Room 資料庫記錄以及透過 **WiGLE API** 線上查詢的真實 Wi-Fi 熱點。若該區域無可信資料，Hook 層會回傳空的模擬資料，完全屏蔽真實 Wi-Fi 訊號，防止風控 SDK 讀取到你真實的物理位置。
+* **可信基站來源保障**：僅接受實地掃街基站、Room 本地記錄以及透過 **OpenCellID API** 查詢的真實蜂窩小區。若無資料則回傳空/null，拒絕隨機合成虛假基站，防止被基站庫校驗識破。
+* **真實品牌 OUI 前綴匹配**：在空白區域產生虛擬 Wi-Fi BSSID 時，系統採用 TP-Link、Huawei、ZTE、Xiaomi、Cisco 等真實主流品牌路由器的合法 MAC 前綴（Organizationally Unique Identifier），拒絕因隨機產生非法 MAC 而被反作弊廠商識破。
 
-### 5. 🛰️ 卫星矩阵与 NMEA 协议生成器
-* **GNSS Status 劫持**：Hook 系统的 `GnssStatus` 类，模拟多达 20+ 颗包括 GPS、北斗、GLONASS 的卫星分布矩阵，注入真实的 PRN 标识、信噪比（CNR）、俯仰角、方位角等，并正确汇报 `usedInFix`（参与定位计算）状态。
-* **NMEA 语句流动态拼装**：劫持 `OnNmeaMessageListener`。根据当前的模拟位置、航向角、速度和模拟出的卫星，在内存中动态组装符合国家标准的原始 `\$GPGGA`, `\$GPRMC`, `\$GPGSA`, `\$GPGSV` 语句并计算校验和（Checksum）实时输出，满足对底层 NMEA 信号进行硬核校验的 App。
+### 5. 🛰️ 衛星矩陣與 NMEA 協定產生器
+* **GNSS Status 劫持**：Hook 系統的 `GnssStatus` 類別，模擬多達 20+ 顆包括 GPS、北斗、GLONASS 的衛星分布矩陣，注入真實的 PRN 識別、信噪比（CNR）、俯仰角、方位角等，並正確匯報 `usedInFix`（參與定位計算）狀態。
+* **NMEA 語句流動態拼裝**：劫持 `OnNmeaMessageListener`。根據目前的模擬位置、航向角、速度和模擬出的衛星，在記憶體中動態組裝符合國家標準的原始 `\$GPGGA`, `\$GPRMC`, `\$GPGSA`, `\$GPGSV` 語句並計算校驗和（Checksum）即時輸出，滿足對底層 NMEA 訊號進行硬核校驗的 App。
 
-### 6. 🔀 智能路线导航与红绿灯停候系统
-* **真实物理路网拟合**：支持点对点或多路点航线设计。开启“使用真实路线”后，系统将通过路径搜索算法拟合实际道路轮廓，防止轨迹穿墙或走直线。
-* **红绿灯智能识别**：路线规划成功后，引擎会自动解析路段中的红绿灯总数，并随机分发至折线拐角处。当模拟器运行到红绿灯点时，会**自动停驻 15 秒**再重新加速，完美模拟真实的车辆行车特征。
-* **悬浮窗摇杆**：提供悬浮窗虚拟摇杆，可在前台直接手动微调坐标。支持根据摇杆拉伸幅度在 0 ~ 10 m/s 之间平滑过渡，并在转向时应用航向角阻尼。
+### 6. 🔀 智慧路線導航與紅綠燈停候系統
+* **真實物理路網擬合**：支援多路點航線設計，透過路網搜尋演算法擬合實際道路輪廓，防止軌跡穿牆或走直線。
+* **紅綠燈智慧識別**：路線模擬運行到紅綠燈點時，會**自動停駐 15 秒**再重新加速，完美模擬真實的車輛行車特徵。
+* **懸浮窗搖杆**：提供 Compose 懸浮窗虛擬搖杆，可在前台直接手動微調座標。支援根據搖杆拉伸幅度在 0 ~ 10 m/s 之間平滑過渡。
 
 ---
 
-## 🏛️ 系统架构
+## 🏛️ 系統架構
 
-本项目采用 **MVVM** 架构，并利用 Root 权限规避了 Android 11+ 的沙盒可见性隔离，实现零权限跨进程配置传递：
+本專案採用 **MVVM** 架構，並利用 Root 權限規避了 Android 11+ 的沙盒可見性隔離，實現零權限跨進程配置傳遞：
 
 ```
 ┌─────────────────────────────────────────────┐
 │            LocationSpoofer (宿主 App)       │
 │  ┌──────────┐  ┌──────────────────────────┐ │
-│  │ Dual-Map │  │    RouteStateMachine     │ │
-│  │(高德/谷歌)│  │    (IDLE/READY/RUN...)   │ │
+│  │ Google   │  │    RouteStateMachine     │ │
+│  │ Maps SDK │  │    (IDLE/READY/RUN...)   │ │
 │  └────┬─────┘  └────────────┬─────────────┘ │
 │       │                     │               │
 │  ┌────▼─────────────────────▼─────────────┐ │
 │  │            ConfigManager                 │ │
-│  │  (将配置序列化，通过 Root 权限写入 Temp)   │ │
+│  │  (以臨時檔寫入後 mv，確保配置讀寫的原子性)   │ │
 │  └──────────────────┬───────────────────────┘ │
 │  ┌──────────────────▼─────────────────────┐ │
 │  │           SpoofingService               │ │
-│  │       (前台通知服务 & 轨迹计算引擎)       │ │
+│  │       (前台通知服務 & 軌跡計算引擎)       │ │
 │  └────────────────────────────────────────┘ │
 └─────────────────────┬───────────────────────┘
-                      │ (写入配置 JSON)
+                      │ (原子寫入配置 JSON)
                       ▼
         ┌───────────────────────────┐
         │ /data/local/tmp/ 配置文件  │
-        │    (chmod 777 + chcon)    │
+        │ /data/system/    配置文件  │
         └─────────────┬─────────────┘
-                      │ (读取配置，守护线程 1000ms 缓存)
+                      │ (異步讀取配置，緩存至 Volatile 內存)
                       ▼ LSPosed 注入
 ┌─────────────────────────────────────────────┐
-│              目标 App 进程                  │
+│              目標 App 進程                  │
 │  ┌────────────────────────────────────────┐  │
 │  │            LocationHooker              │  │
 │  │  • Location API / Baidu / Tencent SDK  │  │
-│  │  • WiFi & 蜂窝基站 (2G-5G NR) 环境注入    │  │
-│  │  • 蓝牙 BLE 扫描过滤                    │  │
-│  │  • Anti-Mock & Xposed 堆栈清洗反检测   │  │
-│  │  • GnssStatus 卫星 & NMEA 模拟          │  │
+│  │  • WiFi & 蜂窩基站 (2G-5G NR) 環境注入    │  │
+│  │  • 藍牙 BLE 掃描過濾                    │  │
+│  │  • Anti-Mock & Xposed 堆棧清洗反檢測   │  │
+│  │  • GnssStatus 衛星 & NMEA 模擬          │  │
+│  │  • 診斷面板：支援 ready/block only/off   │  │
 │  └────────────────────────────────────────┘  │
 └─────────────────────────────────────────────┘
 ```
 
 > [!NOTE]
-> **关于跨进程通信 (IPC) 的设计决策**：
-> 目标 App 进程在沙盒内运行时，由于 Android 11+ 包可见性及 SELinux 策略，若使用 `ContentProvider` 会导致主线程卡顿并产生 `Failed to find provider info` 错误。
-> 宿主 App 借助 Root 权限将配置以 JSON 格式写入 `/data/local/tmp/locationspoofer_config.json`，并赋予 `777` 权限及 `shell_data_file` SELinux 上下文。
-> 目标沙盒内的 `LocationHooker` 启动一个**后台守护线程**，每 1000ms 异步读取文件并存储在 Volatile 内存中。主线程的 Hook 方法读取配置时永远是 0-IO 延迟，彻底杜绝了因频繁读取配置导致的目标 App 界面丢帧与卡顿。
+> **關於跨進程通信 (IPC) 的設計決策**：
+> 宿主 App 藉由 Root 權限將配置以 JSON 格式原子地寫入 `/data/local/tmp/locationspoofer_config.json`，並賦予 `777` 權限。
+> 目標沙盒內的 `LocationHooker` 啟動一個**背景守護線程**，每 1000ms 異步讀取檔案並儲存在 Volatile 記憶體中。主線程的 Hook 方法讀取配置時永遠是 0-IO 延遲，徹底杜絕了因頻繁讀取配置導致的目標 App 畫面丟影格與卡頓。
 
 ---
 
-## 📋 环境要求
+## 📋 環境要求
 
-* **系统版本**：Android 8.0 (API 26) 及以上
-* **Root 管理器**：已获取 Root 权限，强烈推荐使用 [**KernelSU**](https://kernelsu.org) / APatch，亦支持 Magisk。
-* **Xposed 框架**：已安装并激活 [**LSPosed**](https://github.com/LSPosed/LSPosed)（或较新版本的 LSPosed 支线版本）。
+* **系統版本**：Android 8.0 (API 26) 及以上
+* **Root 管理器**：已獲取 Root 權限，強烈推薦使用 [**KernelSU**](https://kernelsu.org) / APatch，亦支援 Magisk。
+* **Xposed 框架**：已安裝並啟用 [**LSPosed**](https://github.com/LSPosed/LSPosed)。
 
 ---
 
-## 🚀 快速开始
+## 🚀 快速開始
 
-### 1. 编译与安装
+### 1. 編譯與安裝
 
 ```bash
-# 克隆本仓库到本地
+# 克隆本倉庫到本地
 git clone https://github.com/your-username/LocationSpoofer.git
 
-# 编译 Debug 版本并直接安装至设备
+# 編譯 Debug 版本並直接安裝至設備
 ./gradlew installDebug
 ```
 
-### 2. 权限与激活步骤
-1. 打开 **KernelSU / Magisk / APatch** 管理器，授予 LocationSpoofer **Root 权限**（用于在 `/data/local/tmp` 写入共享配置 JSON 文件）。
-2. 打开 **LSPosed** 管理器，找到 LocationSpoofer 模块，将其勾选**启用**。
-3. 在模块的作用域（Scope）中，**勾选需要进行定位伪装的目标应用**（如微信、钉钉、超星学习通等）。
-4. **强行停止**勾选的目标 App（或重启手机）以使其加载 Xposed 挂钩逻辑。
+### 2. 權限與啟用步驟
+1. 打開 **KernelSU / Magisk / APatch** 管理器，授予 LocationSpoofer **Root 權限**。
+2. 打開 **LSPosed** 管理器，啟用 LocationSpoofer 模組。
+3. 在模組的作用域（Scope）中，**勾選需要進行定位偽裝的目標應用**。
+4. **強行停止**勾選的目標 App（或重啟手機）以使其載入 Xposed 鉤子邏輯。
 
-### 3. 使用场景最佳实践
+### 3. 使用場景最佳實踐
 
-#### 💻 定点环境欺骗
-1. 启动 LocationSpoofer，在主页地图中长按或利用搜索栏搜寻指定地点。
-2. 在下方抽屉中选择开启需要伪装的项目：**伪造 Wi-Fi 数据**、**模拟基站数据**、**模拟蓝牙数据**、**开启轻微抖动**。
-3. 点击“启动模拟”即可接管系统 GPS。
+#### 💻 定點環境欺騙
+1. 啟動 LocationSpoofer，在地圖中長按或利用搜尋欄搜尋指定地點。
+2. 在下方抽屜中開啟需要偽裝的項目，點擊「啟動模擬」即可接管系統 GPS。
+3. **RF 訊號診斷**：在環境資料對話框中，你可以即時查看 Wi-Fi 與基站的模擬狀態（`ready` 代表有可信訊號偽裝，`block only` 代表已成功阻斷真實訊號並回傳空資料，確保安全）。
 
-#### 🚗 高仿真路线往返模拟
-1. 点击主页下方的“路线规划”进入选点阶段，在地图上依次点击标记多个路点。
-2. 设定控制模式为“循环（自动）”，并选择你的移动档位（步行、跑步、骑行、驾驶，或自定义速度值）。
-3. **启用“使用真实路线规划”**（在联网情况下，系统会自动拉取高德/谷歌路网进行精准曲线拟合，并配置红绿灯停留等待）。
-4. 点击“保存路线”以便于下次直接从“路线库”中一键加载。
-5. 点击“开始模拟”，此时可随时启动悬浮窗，使用“手动（摇杆）”通过悬浮窗摇杆在前台操控实时前行或后退。
-
-#### 🕵️‍♂️ 无线电信号采集（实地扫街）
-1. 在物理世界中活动前，进入 LocationSpoofer “设置” -> 开启 **“环境图谱与扫街”** 采集模式。
-2. 此时模块会自动在后台静默扫描并保存当前位置对应的 Wi-Fi/基站/蓝牙特征到本地 Room 数据库。
-3. 采集完成后，可以随时在“管理本地采集数据”中编辑采集点备注、剔除无效数据，或者以 **JSON 文件格式导出** 备份、共享给他人导入。
-4. 下次当你在虚拟定位中选择模拟该经纬度时，系统将通过 **IDW 插值算法** 完美重现采集到的物理信号场。
-
-#### 📍 解决特定 App 定位偏移
-* 如果你发现微信、学习通等应用定位产生了几百米的固定漂移：
-  * 进入 LocationSpoofer “设置” -> 点击 **“配置应用坐标系”**。
-  * 点击“添加应用包名”，找到产生偏移的目标 App。
-  * 将其底层的坐标标准修改为 `WGS-84` (原生 GPS 坐标) 或 `BD-09` (百度地图坐标)，系统将在 Hook 层自动转换，地图即可完美重合。
+#### 🕵️‍♂️ 無線電訊號採集（實地掃街）
+1. 在物理世界中活動前，進入 LocationSpoofer 「設置」 -> 開啟 **「環境圖譜與掃街」** 採集模式。
+2. 採集完成後，可以在「管理本地採集數據」中編輯、以 **JSON 檔案格式匯出** 備份或分享。
 
 ---
 
-## 🛠️ 技术栈与依赖库
+## 🛠️ 技術棧與依賴庫
 
-* **开发语言**：100% Kotlin
-* **界面框架**：Jetpack Compose & Material Design 3
-* **依赖注入**：Koin
-* **底层数据库**：Room Database (SQLite)
-* **网络请求**：OkHttp 3 & Kotlinx Serialization
-* **地图组件**：AMap 3DMap SDK (中国大陆设备) / Google Maps & Places SDK (海外设备)
-* **Xposed 框架**：LSPosed API 93 / libxposed (service 模式)
-
----
-
-## ⚠️ 免责声明
-
-本程序**仅供学习研究、技术交流以及个人合法合规测试（如开发者定位测试、设备兼容性调试）使用**。
-使用者请勿将本工具用于任何违法违规或违反相关平台服务协议的活动（包括但不限于虚假打卡、网络考试作弊、商业欺诈等）。
-使用本模块造成的任何账号封禁、数据丢失、法律纠纷或其他直接/间接损失，均由使用者自行承担，作者不对此承担任何责任。
+* **開發語言**：100% Kotlin
+* **主要包名**：`com.shiraka.locatiobprovid`
+* **介面框架**：Jetpack Compose & Material Design 3
+* **依賴注入**：Koin
+* **底層資料庫**：Room Database (SQLite)
+* **地圖組件**：Google Maps & Places SDK
+* **Xposed 框架**：LSPosed API 93 / libxposed (Service 模式)
 
 ---
 
-## 📜 开源协议
+## ⚠️ 免責聲明
 
-本项目基于 [GNU General Public License v3.0](LICENSE) 协议开源。
+本程序**僅供學習研究、技術交流以及個人合法合規測試（如開發者定位測試、設備相容性調試）使用**。
+使用者請勿將本工具用於任何違法違規或違反相關平台服務協議的活動。使用本模組造成的任何帳號封禁、數據丟失、法律糾紛或其他直接/間接損失，均由使用者自行承擔，作者不對此承擔任何責任。
+
+---
+
+## 📜 開源協議
+
+本項目基於 [GNU General Public License v3.0](LICENSE) 協議開源。
 
 ```
-Copyright (C) 2026 SuseOAA
+Copyright (C) 2026 SuseOAA / Shiraka
 ```
