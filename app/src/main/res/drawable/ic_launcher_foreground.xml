@@ -1,51 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Foreground Graphic Group centered inside the 72dp safe zone (coordinates 18 to 90) -->
-    <!-- Gradient for non-themed mode -->
     <path
-        android:pathData="M54,24 C41.85,24 32,33.85 32,46 C32,60.5 54,82 54,82 C54,82 76,60.5 76,46 C76,33.85 66.15,24 54,24 Z M54,58 C47.37,58 42,52.63 42,46 C42,39.37 47.37,34 54,34 C60.63,34 66,39.37 66,46 C66,52.63 60.63,58 54,58 Z"
-        android:fillType="nonZero">
-        <aapt:attr name="android:fillColor">
-            <gradient
-                android:endX="76"
-                android:endY="82"
-                android:startX="32"
-                android:startY="24"
-                android:type="linear">
-                <item
-                    android:color="#FF6750A4"
-                    android:offset="0.0" />
-                <item
-                    android:color="#FF00639B"
-                    android:offset="1.0" />
-            </gradient>
-        </aapt:attr>
-    </path>
-
-    <!-- Concentric wireless / radar spoofing wave lines surrounding the pin -->
-    <path
-        android:pathData="M38,76 A22,22 0,0,0 70,76"
-        android:strokeWidth="3.5"
-        android:strokeColor="#FF00639B"
+        android:fillColor="#00000000"
+        android:pathData="M54,21C41.85,21 32,30.85 32,43C32,57.35 54,81 54,81C54,81 76,57.35 76,43C76,30.85 66.15,21 54,21Z"
+        android:strokeColor="#FF5E545A"
         android:strokeLineCap="round"
-        android:fillColor="#00000000" />
+        android:strokeLineJoin="round"
+        android:strokeWidth="5.2" />
 
     <path
-        android:pathData="M30,84 A33,33 0,0,0 78,84"
-        android:strokeWidth="3.5"
-        android:strokeColor="#FF6750A4"
+        android:fillColor="#00000000"
+        android:pathData="M54,34.5A8.5,8.5 0,1 1,54,51.5A8.5,8.5 0,1 1,54,34.5"
+        android:strokeColor="#FF5E545A"
         android:strokeLineCap="round"
-        android:fillColor="#00000000" />
+        android:strokeLineJoin="round"
+        android:strokeWidth="4.6" />
 
     <path
-        android:pathData="M22,92 A44,44 0,0,0 86,92"
-        android:strokeWidth="3.5"
-        android:strokeColor="#FF00639B"
+        android:fillColor="#00000000"
+        android:pathData="M54,27.5V34.5M54,51.5V59M38.5,43H45.5M62.5,43H69.5"
+        android:strokeColor="#FF5E545A"
         android:strokeLineCap="round"
-        android:fillColor="#00000000" />
+        android:strokeWidth="4.2" />
+
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M38,84C42.4,87.2 48,89 54,89C60,89 65.6,87.2 70,84"
+        android:strokeColor="#FF5E545A"
+        android:strokeLineCap="round"
+        android:strokeWidth="4.8" />
 </vector>

@@ -126,6 +126,7 @@ The work in this phase focused on four threads:
 
 - During active fixed spoofing, dragging the home map and leaving it stable updates the active spoof location and shows `位置已更新`; the Wi-Fi payload list can now select which trusted AP is exposed as `connectedWifi`.
 - The search panel is a focusable top-level floating overlay; the Wi-Fi payload list is de-duplicated, short press expands details, and long press switches the connected AP.
+- 2026-07-03: The launcher icon was restyled to match themed launcher icons, and the public GitHub README was rewritten from the current AI technical notes.
 
 ## Current Technical Understanding Of The Data Path
 

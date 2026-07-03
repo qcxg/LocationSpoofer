@@ -1,29 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Background filled with a modern, subtle gradient (similar to Material 3 / Gmail clean styling) -->
     <path
-        android:pathData="M0,0h108v108h-108z"
-        android:fillType="nonZero">
-        <aapt:attr name="android:fillColor">
-            <gradient
-                android:endX="108"
-                android:endY="108"
-                android:startX="0"
-                android:startY="0"
-                android:type="linear">
-                <item
-                    android:color="#FFF3EDF7"
-                    android:offset="0.0" />
-                <item
-                    android:color="#FFFFFFFF"
-                    android:offset="1.0" />
-            </gradient>
-        </aapt:attr>
-    </path>
+        android:fillColor="#FFF2E8EE"
+        android:pathData="M0,0h108v108h-108z" />
+
+    <path
+        android:fillColor="#FFFFF7FA"
+        android:fillAlpha="0.58"
+        android:pathData="M16,18C31,8 55,7 72,18C89,29 97,48 91,66C85,84 66,95 47,91C28,87 13,72 10,53C7,38 7,24 16,18Z" />
 </vector>
