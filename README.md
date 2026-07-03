@@ -7,7 +7,7 @@
 [![Root](https://img.shields.io/badge/Root-KernelSU%20%7C%20Magisk%20%7C%20APatch-orange.svg)](https://kernelsu.org)
 [![Xposed](https://img.shields.io/badge/Framework-LSPosed-purple.svg)](https://github.com/LSPosed/LSPosed)
 
-> 本專案最初源自 [SuseOAA/LocationSpoofer](https://github.com/SuseOAA/LocationSpoofer)，目前已重構為獨立維護分支。當前包名為 `com.shiraka.locatiobprovid`。
+> 本專案最初源自 [HuangZhuoRui/LocationSpoofer](https://github.com/HuangZhuoRui/LocationSpoofer)，目前已重構為獨立維護分支。當前包名為 `com.shiraka.locatiobprovid`。
 
 ## 核心定位
 
