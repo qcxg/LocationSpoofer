@@ -443,16 +443,15 @@ fun SpoofingScreen(
             ActionButtons(viewModel, uiState, onExpandMap, onStartFixedSpoofing = { showStartSpoofingDialog = true })
             Spacer(Modifier.height(16.dp))
 
-            // 已保存的位置列表（显示在操作按钮下方）
-            if (uiState.savedLocations.isNotEmpty()) {
-                SectionHeader(Icons.Outlined.Bookmarks, stringResource(R.string.collection_list), isDark)
+            if (uiState.recentLocations.isNotEmpty()) {
+                SectionHeader(Icons.Outlined.History, stringResource(R.string.recent_locations), isDark)
                 Spacer(Modifier.height(8.dp))
                 SavedLocationsCard(
-                    savedLocations = uiState.savedLocations,
+                    savedLocations = uiState.recentLocations,
                     onSelect = { loc ->
                         viewModel.loadSavedLocation(loc)
                     },
-                    onDelete = { loc -> viewModel.removeSavedLocation(loc) }
+                    onDelete = { loc -> viewModel.removeRecentLocation(loc) }
                 )
                 Spacer(Modifier.height(16.dp))
             }

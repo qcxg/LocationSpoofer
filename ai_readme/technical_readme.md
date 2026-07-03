@@ -261,17 +261,7 @@ These hooks are used to keep the visible network state consistent with Wi-Fi/cel
 
 ## Compass And Magnetic Field
 
-The previous experimental magnetic-field hook used `android.hardware.GeomagneticField` to calculate an expected field strength for the spoofed coordinate and rescale physical magnetometer vectors.
-
-That path is now removed from the stable hook chain.
-
-Reason:
-
-- Android compass accuracy is strongly tied to physical sensor calibration, bias estimation, and motion history.
-- Rescaling the vector magnitude by coordinate can make the data less self-consistent.
-- It is hard for the user to verify and control.
-
-Future compass work should be treated as a separate experiment, behind an explicit setting, with logging and a clear rollback path.
+The previous experimental magnetic-field hook is removed from the stable hook chain. Compass calibration and magnetic-field behavior are left to the physical sensor stack.
 
 ## Data Quality Rules
 
@@ -280,7 +270,10 @@ Future compass work should be treated as a separate experiment, behind an explic
 - Do not silently convert “no data” into plausible-looking data.
 - Do not store fallback object-construction defaults as collected/API data.
 - Prefer local collected data first because it is auditable by the user.
-- Remote API imports must be labeled in metadata.
+- Remote API imports must be labeled as `由 WiGLE 導入` / `由 OpenCellID 導入`, not reused as place names.
+- The app UI groups environment records with the same coordinate into one visible location and shows RF source labels beside the Wi-Fi/cell counts.
+- Nearby place names resolve through Android `Geocoder` first and Google Geocoding second, with `LocationSpoofer_Debug` logs for success and failure.
+- Recent locations are separate from saved favorites: the home screen shows the latest seven used locations, while the top bookmark button opens the saved favorites list.
 - If Android object construction needs missing optional fields, use harmless structural defaults and keep identity fields from trusted data.
 
 ## Known Gaps

@@ -93,7 +93,15 @@ class SettingsManager(context: Context) {
         set(value) = prefs.edit().putString("satellite_count", value).apply()
 
     fun getSavedLocations(): List<SavedLocation> {
-        val jsonString = prefs.getString("saved_locations", "[]") ?: "[]"
+        return getLocationList("saved_locations")
+    }
+
+    fun getRecentLocations(): List<SavedLocation> {
+        return getLocationList("recent_locations")
+    }
+
+    private fun getLocationList(key: String): List<SavedLocation> {
+        val jsonString = prefs.getString(key, "[]") ?: "[]"
         val list = mutableListOf<SavedLocation>()
         try {
             val jsonArray = JSONArray(jsonString)
@@ -110,16 +118,30 @@ class SettingsManager(context: Context) {
     fun addSavedLocation(location: SavedLocation) {
         val list = getSavedLocations().toMutableList()
         list.add(location)
-        saveLocationList(list)
+        saveLocationList("saved_locations", list)
+    }
+
+    fun addRecentLocation(location: SavedLocation) {
+        val list = getRecentLocations()
+            .filterNot { it.lat == location.lat && it.lng == location.lng }
+            .toMutableList()
+        list.add(0, location)
+        saveLocationList("recent_locations", list.take(7))
     }
 
     fun removeSavedLocation(location: SavedLocation) {
         val list = getSavedLocations().toMutableList()
         list.removeAll { it.lat == location.lat && it.lng == location.lng }
-        saveLocationList(list)
+        saveLocationList("saved_locations", list)
     }
 
-    private fun saveLocationList(list: List<SavedLocation>) {
+    fun removeRecentLocation(location: SavedLocation) {
+        val list = getRecentLocations().toMutableList()
+        list.removeAll { it.lat == location.lat && it.lng == location.lng }
+        saveLocationList("recent_locations", list)
+    }
+
+    private fun saveLocationList(key: String, list: List<SavedLocation>) {
         val jsonArray = JSONArray()
         list.forEach {
             val obj = JSONObject()
@@ -128,7 +150,7 @@ class SettingsManager(context: Context) {
             obj.put("lng", it.lng)
             jsonArray.put(obj)
         }
-        prefs.edit().putString("saved_locations", jsonArray.toString()).apply()
+        prefs.edit().putString(key, jsonArray.toString()).apply()
     }
 
     fun getSavedRoutes(): List<SavedRoute> {

@@ -67,6 +67,7 @@ data class AppState(
     val wifiLoadStatus: WifiLoadStatus = WifiLoadStatus.IDLE,
     val wifiApCount: Int = 0,
     val savedLocations: List<SavedLocation> = emptyList(),
+    val recentLocations: List<SavedLocation> = emptyList(),
     val searchKeyword: String = "",
     val searchMode: SearchMode = SearchMode.NETWORK,
     val searchResults: List<SavedLocation> = emptyList(),
@@ -115,6 +116,7 @@ data class AppState(
     // Data Management
     val isManageDataScreen: Boolean = false,
     val manageDataList: List<com.shiraka.locatiobprovid.data.db.CompleteLocation> = emptyList(),
+    val nearbyPlaceNames: Map<String, String> = emptyMap(),
     val manageDataIsLoading: Boolean = false
 )
 

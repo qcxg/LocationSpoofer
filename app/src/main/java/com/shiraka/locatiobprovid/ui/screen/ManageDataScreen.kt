@@ -33,6 +33,21 @@ import com.shiraka.locatiobprovid.ui.components.AppMapView
 import com.shiraka.locatiobprovid.ui.components.AppMapController
 import com.shiraka.locatiobprovid.utils.MapCoverageHelper
 
+private data class ManagedLocationGroup(
+    val ids: List<Long>,
+    val first: CompleteLocation,
+    val lat: Double,
+    val lng: Double,
+    val timestamp: Long,
+    val nearbyName: String,
+    val wifiCount: Int,
+    val cellCount: Int,
+    val bluetoothCount: Int,
+    val wifiSources: List<String>,
+    val cellSources: List<String>,
+    val bluetoothSources: List<String>
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ManageDataScreen(
@@ -49,6 +64,12 @@ fun ManageDataScreen(
     var editingItem by remember { mutableStateOf<CompleteLocation?>(null) }
 
     val dataList = uiState.manageDataList
+    val groupedData = remember(dataList, uiState.nearbyPlaceNames) {
+        groupManagedLocations(dataList, uiState.nearbyPlaceNames)
+    }
+    LaunchedEffect(dataList) {
+        viewModel.refreshNearbyPlaceNames(dataList)
+    }
     
     LaunchedEffect(mapController, uiState.mapType) {
         mapController?.setMapType(uiState.mapType)
@@ -93,11 +114,12 @@ fun ManageDataScreen(
                 actions = {
                     if (isSelectionMode) {
                         IconButton(onClick = {
-                            if (selectedIds.size == dataList.size) {
+                            val allIds = groupedData.flatMap { it.ids }
+                            if (selectedIds.size == allIds.size) {
                                 selectedIds.clear()
                             } else {
                                 selectedIds.clear()
-                                selectedIds.addAll(dataList.map { it.location.id })
+                                selectedIds.addAll(allIds)
                             }
                         }) {
                             Icon(Icons.Rounded.SelectAll, contentDescription = stringResource(R.string.select_all))
@@ -162,35 +184,33 @@ fun ManageDataScreen(
                     contentPadding = PaddingValues(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    items(dataList, key = { it.location.id }) { item ->
-                        val isSelected = selectedIds.contains(item.location.id)
+                    items(groupedData, key = { it.ids.joinToString("-") }) { item ->
+                        val isSelected = item.ids.all { selectedIds.contains(it) }
                         DataListItem(
-                            item = item,
+                            group = item,
                             isDark = isDark,
                             isSelectionMode = isSelectionMode,
                             isSelected = isSelected,
                             onSelect = {
-                                if (isSelected) selectedIds.remove(item.location.id)
-                                else selectedIds.add(item.location.id)
+                                if (isSelected) selectedIds.removeAll(item.ids.toSet())
+                                else selectedIds.addAll(item.ids.filterNot { selectedIds.contains(it) })
                             },
                             onLongClick = {
                                 if (!isSelectionMode) {
                                     isSelectionMode = true
-                                    selectedIds.add(item.location.id)
+                                    selectedIds.addAll(item.ids)
                                 }
                             },
                             onClick = {
-                                viewModel.updateLatitude(String.format(Locale.US, "%.6f", item.location.lat))
-                                viewModel.updateLongitude(String.format(Locale.US, "%.6f", item.location.lng))
-                                mapController?.animateCamera(item.location.lat, item.location.lng, 17f)
-                                // Optionally close the screen to return to SpoofingScreen?
-                                // onClose() // Let's keep it open so they can see the map move
+                                viewModel.updateLatitude(String.format(Locale.US, "%.6f", item.lat))
+                                viewModel.updateLongitude(String.format(Locale.US, "%.6f", item.lng))
+                                mapController?.animateCamera(item.lat, item.lng, 17f)
                             },
                             onDeleteSingle = {
-                                viewModel.deleteManageDataSingle(item.location.id)
+                                viewModel.deleteManageData(item.ids)
                             },
                             onEdit = {
-                                editingItem = item
+                                editingItem = item.first
                             }
                         )
                     }
@@ -200,8 +220,16 @@ fun ManageDataScreen(
     }
 
     if (editingItem != null) {
-        var placeName by remember { mutableStateOf(editingItem!!.location.placeName) }
-        var remark by remember { mutableStateOf(editingItem!!.location.remark) }
+        val editingLocation = editingItem!!.location
+        val editingKey = placeKey(editingLocation.lat, editingLocation.lng)
+        val initialPlaceName = editingLocation.placeName
+            .takeIf { it.isNotBlank() && !isImportSourceText(it) }
+            ?: uiState.nearbyPlaceNames[editingKey].orEmpty()
+        val initialRemark = editingLocation.remark
+            .takeUnless { it.startsWith("经纬度") || it.startsWith("經緯度") }
+            .orEmpty()
+        var placeName by remember(editingItem, uiState.nearbyPlaceNames) { mutableStateOf(initialPlaceName) }
+        var remark by remember(editingItem) { mutableStateOf(initialRemark) }
         
         AlertDialog(
             onDismissRequest = { editingItem = null },
@@ -267,7 +295,7 @@ fun ManageDataScreen(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DataListItem(
-    item: CompleteLocation,
+    group: ManagedLocationGroup,
     isDark: Boolean,
     isSelectionMode: Boolean,
     isSelected: Boolean,
@@ -278,11 +306,7 @@ private fun DataListItem(
     onEdit: () -> Unit
 ) {
     val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()) }
-    val timeStr = remember(item.location.timestamp) { dateFormat.format(Date(item.location.timestamp)) }
-    
-    val wifiCount = item.wifis.size
-    val cellCount = item.cells.size
-    val btCount = item.bluetooths.size
+    val timeStr = remember(group.timestamp) { dateFormat.format(Date(group.timestamp)) }
 
     Surface(
         modifier = Modifier
@@ -319,7 +343,7 @@ private fun DataListItem(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Lat: ${String.format("%.5f", item.location.lat)}, Lng: ${String.format("%.5f", item.location.lng)}",
+                    text = "Lat: ${String.format("%.5f", group.lat)}, Lng: ${String.format("%.5f", group.lng)}",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
                 )
@@ -327,30 +351,20 @@ private fun DataListItem(
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    IconTextRow(Icons.Rounded.Wifi, "$wifiCount")
-                    IconTextRow(Icons.Rounded.CellTower, "$cellCount")
-                    IconTextRow(Icons.Rounded.Bluetooth, "$btCount")
+                    IconTextRow(Icons.Rounded.Wifi, sourceText(group.wifiCount, group.wifiSources))
+                    IconTextRow(Icons.Rounded.CellTower, sourceText(group.cellCount, group.cellSources))
+                    IconTextRow(Icons.Rounded.Bluetooth, sourceText(group.bluetoothCount, group.bluetoothSources))
                 }
                 
-                if (item.location.placeName.isNotBlank() || item.location.remark.isNotBlank()) {
+                if (group.nearbyName.isNotBlank()) {
                     Spacer(modifier = Modifier.height(8.dp))
                     HorizontalDivider(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f))
                     Spacer(modifier = Modifier.height(4.dp))
-                    if (item.location.placeName.isNotBlank()) {
-                        Text(
-                            text = "📍 ${item.location.placeName}",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Medium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    if (item.location.remark.isNotBlank()) {
-                        Text(
-                            text = "📝 ${item.location.remark}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
-                        )
-                    }
+                    Text(
+                        text = "此地點位於 ${group.nearbyName} 附近",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                    )
                 }
             }
 
@@ -392,4 +406,81 @@ private fun IconTextRow(icon: androidx.compose.ui.graphics.vector.ImageVector, t
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
         )
     }
+}
+
+private fun groupManagedLocations(
+    records: List<CompleteLocation>,
+    nearbyNames: Map<String, String>
+): List<ManagedLocationGroup> {
+    return records
+        .groupBy { placeKey(it.location.lat, it.location.lng) }
+        .values
+        .map { group ->
+            val first = group.minByOrNull { it.location.timestamp } ?: group.first()
+            val key = placeKey(first.location.lat, first.location.lng)
+            val placeName = nearbyNames[key]
+                ?: group.map { it.location.placeName }.firstOrNull { it.isNotBlank() && !isImportSourceText(it) }
+                ?: ""
+
+            ManagedLocationGroup(
+                ids = group.map { it.location.id },
+                first = first,
+                lat = first.location.lat,
+                lng = first.location.lng,
+                timestamp = group.maxOf { it.location.timestamp },
+                nearbyName = placeName,
+                wifiCount = group.sumOf { it.wifis.size },
+                cellCount = group.sumOf { it.cells.size },
+                bluetoothCount = group.sumOf { it.bluetooths.size },
+                wifiSources = sourceLabelsForGroup(group, "wifi"),
+                cellSources = sourceLabelsForGroup(group, "cell"),
+                bluetoothSources = sourceLabelsForGroup(group, "bluetooth")
+            )
+        }
+        .sortedByDescending { it.timestamp }
+}
+
+private fun sourceText(count: Int, sources: List<String>): String {
+    if (count <= 0) return "0"
+    return if (sources.isEmpty()) "$count" else "$count · ${sources.joinToString("/")}"
+}
+
+private fun placeKey(lat: Double, lng: Double): String {
+    return String.format(Locale.US, "%.6f,%.6f", lat, lng)
+}
+
+private fun sourceLabelsForGroup(group: List<CompleteLocation>, kind: String): List<String> {
+    val records = group.filter {
+        when (kind) {
+            "wifi" -> it.wifis.isNotEmpty()
+            "cell" -> it.cells.isNotEmpty()
+            "bluetooth" -> it.bluetooths.isNotEmpty()
+            else -> false
+        }
+    }
+    if (records.isEmpty()) return emptyList()
+
+    val groupText = group.joinToString(" ") { "${it.location.placeName} ${it.location.remark}" }
+    val labels = mutableListOf<String>()
+    if (kind == "wifi" && groupText.contains("WiGLE", ignoreCase = true)) {
+        labels += "由 WiGLE 導入"
+    }
+    if (kind == "cell" && groupText.contains("OpenCellID", ignoreCase = true)) {
+        labels += "由 OpenCellID 導入"
+    }
+    if (labels.isEmpty() && isImportSourceText(groupText)) {
+        labels += "由檔案匯入"
+    }
+    if (labels.isEmpty()) {
+        labels += "本地采集"
+    }
+    return labels.distinct()
+}
+
+private fun isImportSourceText(text: String): Boolean {
+    return text.contains("WiGLE", ignoreCase = true) ||
+        text.contains("OpenCellID", ignoreCase = true) ||
+        text.contains("导入") ||
+        text.contains("導入") ||
+        text.contains("Import", ignoreCase = true)
 }

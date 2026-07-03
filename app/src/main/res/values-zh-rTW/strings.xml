@@ -44,6 +44,7 @@
     <string name="name">名稱</string>
     <string name="save">保存</string>
     <string name="saved_locations">收藏列表</string>
+    <string name="recent_locations">最近位置</string>
     <string name="settings">設定</string>
     <string name="collection_list">收藏列表</string>
     <string name="fullscreen_selection">全螢幕選點</string>

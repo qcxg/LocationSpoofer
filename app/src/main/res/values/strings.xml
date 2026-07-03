@@ -38,6 +38,7 @@
     <string name="name">Name</string>
     <string name="save">Save</string>
     <string name="saved_locations">Collection List</string>
+    <string name="recent_locations">Recent Locations</string>
     <string name="settings">Settings</string>
     <string name="collection_list">Collection List</string>
     <string name="fullscreen_selection">Fullscreen Selection</string>

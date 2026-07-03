@@ -126,7 +126,7 @@ The work in this phase focused on four threads:
 
 - During active fixed spoofing, dragging the home map and leaving it stable updates the active spoof location and shows `位置已更新`; the Wi-Fi payload list can now select which trusted AP is exposed as `connectedWifi`.
 - The search panel is a focusable top-level floating overlay; the Wi-Fi payload list is de-duplicated, short press expands details, and long press switches the connected AP.
-- 2026-07-03: The launcher icon was restyled to match themed launcher icons, and the public GitHub README was rewritten from the current AI technical notes.
+- 2026-07-04: The launcher icon uses a centered navigation glyph with Android 12+ dynamic-color background support, the app label is localized through `app_name`, the home screen shows the latest seven recent locations separately from saved favorites, and the manage-data screen groups same-coordinate records with RF source labels and nearby place names.
 
 ## Current Technical Understanding Of The Data Path
 
@@ -167,18 +167,9 @@ Recent logcat showed repeated signs that spoofed RF payload is actually being bu
 
 This suggests Wi-Fi and cell spoof payloads are not simply absent at runtime.
 
-### Important instability signal
+### Resolved instability signal
 
-Recent logcat also repeatedly showed:
-
-- `LocationManagerService: non-monotonic location received from gps provider`
-
-This is important because Android can downgrade or reject updates when location timestamps or elapsed realtime move backward or are otherwise inconsistent.
-
-A mitigation was implemented in workspace code:
-
-- spoofed `Location.time`
-- spoofed `Location.elapsedRealtimeNanos`
+Earlier logcat showed `LocationManagerService: non-monotonic location received from gps provider`. The current hook caches timestamps per spoofed `Location` object and keeps wall/elapsed realtime monotonic so repeated getter calls stay self-consistent.
 - spoofed `Location.getElapsedRealtimeMillis()`
 
 were changed to use a shared monotonic timestamp generator so new spoofed `Location` objects should never go backward relative to prior emitted ones.
@@ -198,27 +189,19 @@ If Google Maps still says to connect Wi-Fi or mobile data while spoofing is acti
 1. RF spoof payload exists but the overall location stream is being downgraded because of timestamp monotonicity or related system validation.
 2. Some network-location-facing API path still expects additional coherence beyond the currently spoofed Wi-Fi / cell identity objects.
 
-The first explanation became more plausible after seeing the repeated `non-monotonic location` logs.
-
 ## Build / Install Status
 
 ### Last confirmed successful build
 
-The latest confirmed `assembleDebug` run completed successfully on 2026-07-02 with no Kotlin or AGP warnings.
+The latest confirmed `assembleDebug` run completed successfully on 2026-07-04 with no Kotlin or AGP warnings.
 
 ### Last confirmed successful install
 
-The latest debug APK was installed successfully on device `47050DLAQ001LE` with `adb install -r` on 2026-07-02.
+The latest confirmed debug install on 2026-07-04 completed successfully with `adb install -r`.
 
 ### Current workspace status at the end of this phase summary
 
-The workspace and installed debug APK are aligned for the latest build/install pass.
-
-## Open Items For The Next Phase
-
-1. Re-check logcat for `non-monotonic location received from gps provider` after restarting the relevant hooked processes or rebooting.
-2. Verify whether Google Maps still reports weak signal / asks for Wi-Fi or mobile data after the timestamp fix is active.
-3. If weak-signal prompts remain, inspect whether additional network-location API surfaces still need coherence work.
+The workspace has compiled and installed successfully; current UI iteration covers dynamic launcher icon tint, grouped source labels, and nearby place geocoding logs.
 
 ## Files Most Relevant To Continue From Here
 
