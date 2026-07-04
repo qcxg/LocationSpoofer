@@ -13,6 +13,8 @@ import com.shiraka.locatiobprovid.data.model.SavedLocation
 import com.shiraka.locatiobprovid.data.model.SimMode
 import com.shiraka.locatiobprovid.data.model.AppMapType
 import com.shiraka.locatiobprovid.data.model.JitterSpeed
+import com.shiraka.locatiobprovid.data.model.StartSpoofingPhase
+import com.shiraka.locatiobprovid.data.model.StartSpoofingProgress
 import com.shiraka.locatiobprovid.data.repository.LocationRepository
 import com.shiraka.locatiobprovid.data.repository.SettingsRepository
 import com.shiraka.locatiobprovid.provider.SpooferProvider
@@ -30,8 +32,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URLEncoder
 import java.util.Locale
 import kotlin.coroutines.resume
@@ -558,8 +562,11 @@ class MainViewModel(
     }
 
     private suspend fun hasLocalWifiWithin50m(lat: Double, lng: Double): Boolean {
-        val allRecords = withContext(Dispatchers.IO) { environmentDao.getAllCompleteLocations() }
-        for (record in allRecords) {
+        val bounds = nearbyBounds(lat, lng, 50.0)
+        val nearbyRecords = withContext(Dispatchers.IO) {
+            environmentDao.getCompleteLocationsInBounds(bounds.minLat, bounds.maxLat, bounds.minLng, bounds.maxLng)
+        }
+        for (record in nearbyRecords) {
             if (record.wifis.isEmpty()) continue
             val loc = record.location
             val dLat = Math.toRadians(lat - loc.lat)
@@ -577,8 +584,11 @@ class MainViewModel(
     }
 
     private suspend fun hasLocalCellsWithin50m(lat: Double, lng: Double): Boolean {
-        val allRecords = withContext(Dispatchers.IO) { environmentDao.getAllCompleteLocations() }
-        for (record in allRecords) {
+        val bounds = nearbyBounds(lat, lng, 50.0)
+        val nearbyRecords = withContext(Dispatchers.IO) {
+            environmentDao.getCompleteLocationsInBounds(bounds.minLat, bounds.maxLat, bounds.minLng, bounds.maxLng)
+        }
+        for (record in nearbyRecords) {
             if (record.cells.isEmpty()) continue
             val loc = record.location
             val dLat = Math.toRadians(lat - loc.lat)
@@ -589,19 +599,31 @@ class MainViewModel(
                     kotlin.math.sin(dLng / 2).let { it * it }
             val distance = 2 * 6378137.0 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
             if (distance <= 50.0) {
-                val cellCount = record.cells.size
-                val cellInfoStr = record.cells.map { cell ->
-                    "Type: ${cell.device.type}, MCC: ${cell.device.mcc}, MNC: ${cell.device.mnc}, LAC: ${cell.device.lac}, CID: ${cell.device.cid}, DBM: ${cell.locationCell.dbm}"
-                }.joinToString("; ")
-                android.util.Log.d("OpenCellID", "hasLocalCellsWithin50m: Found cached cells within 50m of ($lat, $lng) at location ID ${record.location.id}. Distance: ${String.format("%.2f", distance)}m, Cell Count: $cellCount. Bypassing network request. Cached cells: $cellInfoStr")
                 return true
             }
         }
-        android.util.Log.d("OpenCellID", "hasLocalCellsWithin50m: No cached cells within 50m of ($lat, $lng). Will perform network request.")
         return false
     }
 
-    private suspend fun fetchWifiFromWigleSync(lat: Double, lng: Double) {
+    private data class GeoBounds(
+        val minLat: Double,
+        val maxLat: Double,
+        val minLng: Double,
+        val maxLng: Double
+    )
+
+    private fun nearbyBounds(lat: Double, lng: Double, radiusMeters: Double): GeoBounds {
+        val latDelta = radiusMeters / 111_320.0
+        val lngDelta = radiusMeters / (111_320.0 * kotlin.math.cos(Math.toRadians(lat)).coerceAtLeast(0.01))
+        return GeoBounds(
+            minLat = (lat - latDelta).coerceAtLeast(-90.0),
+            maxLat = (lat + latDelta).coerceAtMost(90.0),
+            minLng = (lng - lngDelta).coerceAtLeast(-180.0),
+            maxLng = (lng + lngDelta).coerceAtMost(180.0)
+        )
+    }
+
+    private suspend fun fetchWifiFromWigleSync(lat: Double, lng: Double): Boolean {
         val settingsToken = settingsRepository.getWigleApiToken()
         if (settingsToken.isBlank()) {
             withContext(Dispatchers.Main) {
@@ -613,7 +635,7 @@ class MainViewModel(
                     )
                 }
             }
-            return
+            return false
         }
 
         withContext(Dispatchers.Main) {
@@ -693,6 +715,7 @@ class MainViewModel(
                         _uiState.update { it.copy(environmentRecordCount = count) }
                     }
                 }
+                return true
             } else {
                 withContext(Dispatchers.Main) {
                     _uiState.update {
@@ -703,6 +726,7 @@ class MainViewModel(
                         )
                     }
                 }
+                return false
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -715,14 +739,15 @@ class MainViewModel(
                     )
                 }
             }
+            return false
         }
     }
 
-    private suspend fun fetchCellFromOpenCellIdSync(lat: Double, lng: Double) {
+    private suspend fun fetchCellFromOpenCellIdSync(lat: Double, lng: Double): Boolean {
         val tokenToUse = settingsRepository.getOpencellidApiToken()
         if (tokenToUse.isBlank()) {
             android.util.Log.d("OpenCellID", "fetchCellFromOpenCellIdSync: Token is blank. Skipping request and database insertion.")
-            return
+            return false
         }
         android.util.Log.d("OpenCellID", "fetchCellFromOpenCellIdSync: Starting request for coordinates ($lat, $lng)")
         val wgs84 = com.shiraka.locatiobprovid.utils.CoordinateUtils.gcj02ToWgs84(lat, lng)
@@ -738,7 +763,7 @@ class MainViewModel(
                 val formattedCells = normalizeCellArrayForStorage(cellsArray)
                 if (formattedCells.length() == 0) {
                     android.util.Log.d("OpenCellID", "fetchCellFromOpenCellIdSync: No usable cells after normalization.")
-                    return
+                    return false
                 }
 
                 withContext(Dispatchers.IO) {
@@ -762,9 +787,12 @@ class MainViewModel(
                         _uiState.update { it.copy(environmentRecordCount = count) }
                     }
                 }
+                return true
             }
+            return false
         } catch (e: Exception) {
             e.printStackTrace()
+            return false
         }
     }
 
@@ -856,21 +884,80 @@ class MainViewModel(
         settingsRepository.isSpoofingActive = true
         settingsRepository.lastSpoofedLat = lat.toString()
         settingsRepository.lastSpoofedLng = lng.toString()
-        recordRecentLocation(lat, lng)
         
         viewModelScope.launch {
-            _uiState.update { it.copy(isSavingConfig = true) }
-            
-            if (state.mockWifi && !hasLocalWifiWithin50m(lat, lng)) {
-                fetchWifiFromWigleSync(lat, lng)
+            _uiState.update {
+                it.copy(
+                    isSavingConfig = true,
+                    startSpoofingProgress = StartSpoofingProgress(
+                        phase = StartSpoofingPhase.PREPARING,
+                        message = "正在檢查本地環境資料"
+                    )
+                )
             }
-            if (state.mockCell && !hasLocalCellsWithin50m(lat, lng)) {
-                fetchCellFromOpenCellIdSync(lat, lng)
+            
+            val needsWifiFetch = state.mockWifi && !hasLocalWifiWithin50m(lat, lng)
+            val needsCellFetch = state.mockCell && !hasLocalCellsWithin50m(lat, lng)
+            val fetchSources = buildList {
+                if (needsWifiFetch) add("WiGLE")
+                if (needsCellFetch) add("OpenCellID")
             }
 
+            if (fetchSources.isNotEmpty()) {
+                _uiState.update {
+                    it.copy(
+                        startSpoofingProgress = StartSpoofingProgress(
+                            phase = StartSpoofingPhase.FETCHING,
+                            message = "正在從 ${fetchSources.joinToString(" / ")} 拉取資料",
+                            sources = fetchSources
+                        )
+                    )
+                }
+
+                val failedSources = mutableListOf<String>()
+                if (needsWifiFetch && !fetchWifiFromWigleSync(lat, lng)) {
+                    failedSources += "WiGLE"
+                }
+                if (needsCellFetch && !fetchCellFromOpenCellIdSync(lat, lng)) {
+                    failedSources += "OpenCellID"
+                }
+                if (failedSources.isNotEmpty()) {
+                    _uiState.update {
+                        it.copy(
+                            isSavingConfig = false,
+                            startSpoofingProgress = StartSpoofingProgress(
+                                phase = StartSpoofingPhase.ERROR,
+                                message = "資料拉取未完成",
+                                sources = fetchSources,
+                                errors = failedSources.map { source -> "$source 來源未取得可用資料" }
+                            )
+                        )
+                    }
+                    return@launch
+                }
+            }
+
+            _uiState.update {
+                it.copy(
+                    startSpoofingProgress = StartSpoofingProgress(
+                        phase = StartSpoofingPhase.ENABLING,
+                        message = "正在寫入模擬配置",
+                        sources = fetchSources
+                    )
+                )
+            }
             evaluateMockCapabilitiesSuspend(lat, lng)
             
             val updatedState = _uiState.value
+            recordRecentLocation(
+                SavedLocation(
+                    String.format(java.util.Locale.US, "%.5f, %.5f", lat, lng),
+                    lat,
+                    lng,
+                    updatedState.collectedWifiJson,
+                    updatedState.collectedCellJson
+                )
+            )
             val now = System.currentTimeMillis()
             locationRepository.startSpoofing(
                 context, lat, lng,
@@ -892,9 +979,22 @@ class MainViewModel(
             kotlinx.coroutines.delay(200)
 
             _uiState.update {
-                it.copy(isSpoofingActive = true, isSavingConfig = false)
+                it.copy(
+                    isSpoofingActive = true,
+                    isSavingConfig = false,
+                    startSpoofingProgress = StartSpoofingProgress(
+                        phase = StartSpoofingPhase.SUCCESS,
+                        message = "虛擬位置已啟用",
+                        sources = fetchSources,
+                        usedLocalCache = fetchSources.isEmpty()
+                    )
+                )
             }
         }
+    }
+
+    fun resetStartSpoofingProgress() {
+        _uiState.update { it.copy(startSpoofingProgress = StartSpoofingProgress()) }
     }
 
     fun stopSpoofing() {
@@ -1210,6 +1310,9 @@ class MainViewModel(
                 wifiLoadStatus = if (wifiCount > 0) com.shiraka.locatiobprovid.data.model.WifiLoadStatus.DONE else com.shiraka.locatiobprovid.data.model.WifiLoadStatus.IDLE
             ) 
         }
+        viewModelScope.launch {
+            evaluateMockCapabilitiesSuspend(loc.lat, loc.lng)
+        }
     }
 
     fun removeSavedLocation(location: SavedLocation) {
@@ -1225,11 +1328,6 @@ class MainViewModel(
     private fun recordRecentLocation(location: SavedLocation) {
         settingsRepository.addRecentLocation(location)
         _uiState.update { it.copy(recentLocations = settingsRepository.getRecentLocations()) }
-    }
-
-    private fun recordRecentLocation(lat: Double, lng: Double, name: String? = null) {
-        val title = name?.takeIf { it.isNotBlank() } ?: String.format(java.util.Locale.US, "%.5f, %.5f", lat, lng)
-        recordRecentLocation(SavedLocation(title, lat, lng, _uiState.value.collectedWifiJson, _uiState.value.collectedCellJson))
     }
 
     fun addSavedRoute(name: String) {
@@ -1619,7 +1717,23 @@ class MainViewModel(
     }
 
     suspend fun getAllLocations(): List<com.shiraka.locatiobprovid.data.db.LocationRecord> {
-        return environmentDao.getAllLocations()
+        return withContext(Dispatchers.IO) { environmentDao.getAllLocations() }
+    }
+
+    suspend fun getLocationsInBounds(
+        minLat: Double,
+        maxLat: Double,
+        minLng: Double,
+        maxLng: Double,
+        limit: Int = 1000
+    ): List<com.shiraka.locatiobprovid.data.db.LocationRecord> {
+        return withContext(Dispatchers.IO) {
+            environmentDao.getLocationsInBounds(minLat, maxLat, minLng, maxLng, limit)
+        }
+    }
+
+    suspend fun getLatestLocation(): com.shiraka.locatiobprovid.data.db.LocationRecord? {
+        return withContext(Dispatchers.IO) { environmentDao.getLatestLocation() }
     }
 
     fun loadManageData() {
@@ -1640,7 +1754,8 @@ class MainViewModel(
             records.forEach { record ->
                 val key = nearbyPlaceKey(record.location.lat, record.location.lng)
                 if (_uiState.value.nearbyPlaceNames.containsKey(key)) return@forEach
-                val existing = record.location.placeName.takeIf { it.isNotBlank() && !isSourceLabel(it) }
+                val existing = record.location.placeName
+                    .takeIf { it.isNotBlank() && !isSourceLabel(it) && isReadablePlaceName(it) }
                 val name = existing ?: resolveNearbyPlaceName(record.location.lat, record.location.lng)
                 if (name.isNotBlank()) {
                     updates[key] = name
@@ -1668,16 +1783,80 @@ class MainViewModel(
     private fun resolveNearbyPlaceName(lat: Double, lng: Double): String {
         val key = nearbyPlaceKey(lat, lng)
         nearbyNameMemory[key]?.let { return it }
+        val apiKey = settingsRepository.getGoogleApiKey()
+        if (apiKey.isNotBlank()) {
+            resolveNearbyPlaceNameFromPlaces(lat, lng, apiKey)?.let {
+                nearbyNameMemory[key] = it
+                return it
+            }
+            resolveNearbyPlaceNameFromGoogleGeocoding(lat, lng, apiKey)?.let {
+                nearbyNameMemory[key] = it
+                return it
+            }
+        } else {
+            android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: no Google API key, using system geocoder only lat=$lat lng=$lng")
+        }
         resolveNearbyPlaceNameFromSystem(lat, lng)?.let {
             android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: system geocoder success lat=$lat lng=$lng name=$it")
             nearbyNameMemory[key] = it
             return it
         }
-        val apiKey = settingsRepository.getGoogleApiKey()
-        if (apiKey.isBlank()) {
-            android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: no Google API key and system geocoder empty lat=$lat lng=$lng")
-            return ""
+        return ""
+    }
+
+    private fun resolveNearbyPlaceNameFromPlaces(lat: Double, lng: Double, apiKey: String): String? {
+        return try {
+            val language = if (isDomesticEnvironment()) "zh-TW" else "en"
+            val requestJson = org.json.JSONObject().apply {
+                put("maxResultCount", 5)
+                put("rankPreference", "DISTANCE")
+                put("languageCode", language)
+                put("locationRestriction", org.json.JSONObject().apply {
+                    put("circle", org.json.JSONObject().apply {
+                        put("center", org.json.JSONObject().apply {
+                            put("latitude", lat)
+                            put("longitude", lng)
+                        })
+                        put("radius", 120.0)
+                    })
+                })
+            }
+            val request = Request.Builder()
+                .url("https://places.googleapis.com/v1/places:searchNearby")
+                .addHeader("Content-Type", "application/json")
+                .addHeader("X-Goog-Api-Key", apiKey)
+                .addHeader("X-Goog-FieldMask", "places.displayName,places.types")
+                .post(requestJson.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+            geocodeClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Places Nearby HTTP ${response.code} lat=$lat lng=$lng")
+                    return null
+                }
+                val body = response.body?.string().orEmpty()
+                val places = org.json.JSONObject(body).optJSONArray("places")
+                if (places == null || places.length() == 0) {
+                    android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Places Nearby empty lat=$lat lng=$lng")
+                    return null
+                }
+                for (i in 0 until places.length()) {
+                    val place = places.optJSONObject(i) ?: continue
+                    val name = place.optJSONObject("displayName")?.optString("text").orEmpty().trim()
+                    if (isReadablePlaceName(name)) {
+                        android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Places Nearby success lat=$lat lng=$lng name=$name")
+                        return name
+                    }
+                }
+                android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Places Nearby only unreadable names lat=$lat lng=$lng")
+                null
+            }
+        } catch (e: Exception) {
+            android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Places Nearby failed lat=$lat lng=$lng error=${e.javaClass.simpleName}: ${e.message}")
+            null
         }
+    }
+
+    private fun resolveNearbyPlaceNameFromGoogleGeocoding(lat: Double, lng: Double, apiKey: String): String? {
         return try {
             val language = if (isDomesticEnvironment()) "zh-TW" else "en"
             val url = "https://maps.googleapis.com/maps/api/geocode/json?latlng=$lat,$lng&language=$language&key=${
@@ -1687,52 +1866,83 @@ class MainViewModel(
             geocodeClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Google Geocoding HTTP ${response.code} lat=$lat lng=$lng")
-                    return ""
+                    return null
                 }
                 val body = response.body?.string().orEmpty()
                 val json = org.json.JSONObject(body)
                 val status = json.optString("status")
                 if (status != "OK") {
                     android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Google Geocoding status=$status error=${json.optString("error_message")} lat=$lat lng=$lng")
-                    return ""
+                    return null
                 }
-                val results = json.optJSONArray("results") ?: return ""
+                val results = json.optJSONArray("results") ?: return null
                 if (results.length() == 0) {
                     android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Google Geocoding empty results lat=$lat lng=$lng")
-                    return ""
+                    return null
                 }
-                val result = results.optJSONObject(0) ?: return ""
-                val components = result.optJSONArray("address_components")
-                if (components != null) {
-                    for (i in 0 until components.length()) {
-                        val component = components.optJSONObject(i) ?: continue
-                        val types = component.optJSONArray("types")?.toString().orEmpty()
-                        if (types.contains("point_of_interest") ||
-                            types.contains("premise") ||
-                            types.contains("sublocality") ||
-                            types.contains("neighborhood") ||
-                            types.contains("locality")
-                        ) {
-                            val name = component.optString("long_name")
-                            if (name.isNotBlank()) {
-                                android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Google component success lat=$lat lng=$lng name=$name")
-                                nearbyNameMemory[key] = name
-                                return name
-                            }
+                val preferredTypes = listOf(
+                    "point_of_interest",
+                    "premise",
+                    "park",
+                    "airport",
+                    "neighborhood",
+                    "sublocality",
+                    "locality",
+                    "administrative_area_level_3",
+                    "administrative_area_level_2"
+                )
+                for (type in preferredTypes) {
+                    for (i in 0 until results.length()) {
+                        val result = results.optJSONObject(i) ?: continue
+                        val resultTypes = result.optJSONArray("types")?.toString().orEmpty()
+                        if (!resultTypes.contains(type)) continue
+                        val name = nameFromAddressComponents(result, type)
+                        if (isReadablePlaceName(name)) {
+                            android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Google Geocoding type=$type success lat=$lat lng=$lng name=$name")
+                            return name
                         }
                     }
                 }
-                val formatted = result.optString("formatted_address").split(",").firstOrNull()?.trim().orEmpty()
-                if (formatted.isNotBlank()) {
-                    android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Google formatted success lat=$lat lng=$lng name=$formatted")
-                    nearbyNameMemory[key] = formatted
+                for (i in 0 until results.length()) {
+                    val result = results.optJSONObject(i) ?: continue
+                    val fallback = result.optString("formatted_address")
+                        .split(",")
+                        .firstOrNull()
+                        ?.trim()
+                        .orEmpty()
+                    if (isReadablePlaceName(fallback)) {
+                        android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Google Geocoding formatted success lat=$lat lng=$lng name=$fallback")
+                        return fallback
+                    }
                 }
-                formatted
+                android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Google Geocoding only unreadable names lat=$lat lng=$lng")
+                null
             }
         } catch (e: Exception) {
-            android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: failed lat=$lat lng=$lng error=${e.javaClass.simpleName}: ${e.message}")
-            ""
+            android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: Google Geocoding failed lat=$lat lng=$lng error=${e.javaClass.simpleName}: ${e.message}")
+            null
         }
+    }
+
+    private fun nameFromAddressComponents(result: org.json.JSONObject, preferredType: String): String {
+        val components = result.optJSONArray("address_components") ?: return ""
+        for (i in 0 until components.length()) {
+            val component = components.optJSONObject(i) ?: continue
+            val types = component.optJSONArray("types")?.toString().orEmpty()
+            if (types.contains(preferredType)) {
+                return component.optString("long_name").trim()
+            }
+        }
+        return ""
+    }
+
+    private fun isReadablePlaceName(value: String): Boolean {
+        val name = value.trim()
+        if (name.isBlank()) return false
+        if (name.equals("Unnamed Road", ignoreCase = true)) return false
+        if (name.contains("+")) return false
+        if (name.matches(Regex("[0-9０-９\\-－ー丁目番地号之の\\s]+"))) return false
+        return true
     }
 
     @Suppress("DEPRECATION")
@@ -1741,13 +1951,13 @@ class MainViewModel(
             val locale = if (isDomesticEnvironment()) Locale.TRADITIONAL_CHINESE else Locale.getDefault()
             val address = Geocoder(context, locale).getFromLocation(lat, lng, 1)?.firstOrNull() ?: return null
             listOf(
-                address.featureName,
-                address.thoroughfare,
                 address.subLocality,
                 address.locality,
                 address.adminArea,
+                address.thoroughfare,
+                address.featureName,
                 address.getAddressLine(0)?.split(",")?.firstOrNull()
-            ).firstOrNull { !it.isNullOrBlank() && it != "Unnamed Road" }?.trim()
+            ).firstOrNull { !it.isNullOrBlank() && isReadablePlaceName(it) }?.trim()
         } catch (e: Exception) {
             android.util.Log.d("LocationSpoofer_Debug", "resolveNearbyPlaceName: system geocoder failed lat=$lat lng=$lng error=${e.javaClass.simpleName}: ${e.message}")
             null

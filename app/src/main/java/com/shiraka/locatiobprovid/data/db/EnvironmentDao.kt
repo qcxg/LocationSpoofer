@@ -39,9 +39,43 @@ interface EnvironmentDao {
     @Query("SELECT * FROM location_records")
     suspend fun getAllLocations(): List<LocationRecord>
 
+    @Query("""
+        SELECT * FROM location_records
+        WHERE lat BETWEEN :minLat AND :maxLat
+          AND lng BETWEEN :minLng AND :maxLng
+        ORDER BY timestamp DESC
+        LIMIT :limit
+    """)
+    suspend fun getLocationsInBounds(
+        minLat: Double,
+        maxLat: Double,
+        minLng: Double,
+        maxLng: Double,
+        limit: Int = 1000
+    ): List<LocationRecord>
+
+    @Query("SELECT * FROM location_records ORDER BY timestamp DESC LIMIT 1")
+    suspend fun getLatestLocation(): LocationRecord?
+
     @Transaction
     @Query("SELECT * FROM location_records")
     suspend fun getAllCompleteLocations(): List<CompleteLocation>
+
+    @Transaction
+    @Query("""
+        SELECT * FROM location_records
+        WHERE lat BETWEEN :minLat AND :maxLat
+          AND lng BETWEEN :minLng AND :maxLng
+        ORDER BY timestamp DESC
+        LIMIT :limit
+    """)
+    suspend fun getCompleteLocationsInBounds(
+        minLat: Double,
+        maxLat: Double,
+        minLng: Double,
+        maxLng: Double,
+        limit: Int = 200
+    ): List<CompleteLocation>
 
     @Query("SELECT COUNT(*) FROM location_records")
     suspend fun getRecordCount(): Int

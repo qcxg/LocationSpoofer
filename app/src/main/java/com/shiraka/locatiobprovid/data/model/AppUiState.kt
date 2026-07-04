@@ -25,6 +25,23 @@ enum class JitterSpeed(@StringRes val labelResId: Int) {
     FAST(R.string.jitter_speed_fast)
 }
 
+enum class StartSpoofingPhase {
+    IDLE,
+    PREPARING,
+    FETCHING,
+    ENABLING,
+    SUCCESS,
+    ERROR
+}
+
+data class StartSpoofingProgress(
+    val phase: StartSpoofingPhase = StartSpoofingPhase.IDLE,
+    val message: String = "",
+    val sources: List<String> = emptyList(),
+    val errors: List<String> = emptyList(),
+    val usedLocalCache: Boolean = false
+)
+
 /** 路线规划阶段 */
 enum class RoutePlanStage {
     /** 未开始，默认状态 */
@@ -63,6 +80,7 @@ data class AppState(
     val latitudeInput: String = "",
     val showCoordinateError: Boolean = false,
     val isSavingConfig: Boolean = false,
+    val startSpoofingProgress: StartSpoofingProgress = StartSpoofingProgress(),
     val isSpoofingActive: Boolean = false,
     val wifiLoadStatus: WifiLoadStatus = WifiLoadStatus.IDLE,
     val wifiApCount: Int = 0,

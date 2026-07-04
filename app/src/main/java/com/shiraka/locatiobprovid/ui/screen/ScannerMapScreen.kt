@@ -22,6 +22,8 @@ import com.shiraka.locatiobprovid.ui.components.MapTypeDialog
 import com.shiraka.locatiobprovid.ui.theme.AccentGreen
 import com.shiraka.locatiobprovid.ui.theme.AppColors
 import com.shiraka.locatiobprovid.viewmodel.MainViewModel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 
 @Composable
 fun ScannerMapScreen(
@@ -32,26 +34,38 @@ fun ScannerMapScreen(
 ) {
     var mapController by remember { mutableStateOf<AppMapController?>(null) }
     var showMapTypeDialog by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    var redrawJob by remember { mutableStateOf<Job?>(null) }
+
+    fun redrawCoverage(controller: AppMapController, moveToLatest: Boolean) {
+        redrawJob?.cancel()
+        redrawJob = scope.launch {
+            val bounds = controller.visibleBounds()
+            val locations = if (bounds != null) {
+                viewModel.getLocationsInBounds(bounds.minLat, bounds.maxLat, bounds.minLng, bounds.maxLng)
+            } else {
+                viewModel.getAllLocations()
+            }
+            controller.clear()
+            com.shiraka.locatiobprovid.utils.MapCoverageHelper.drawCoverage(controller, locations)
+
+            if (moveToLatest) {
+                val latest = viewModel.getLatestLocation()
+                if (latest != null) {
+                    controller.animateCamera(latest.lat, latest.lng, 17f)
+                }
+            }
+        }
+    }
     
     // 同步地图类型
     LaunchedEffect(mapController, uiState.mapType) {
         mapController?.setMapType(uiState.mapType)
     }
     
-    // Draw heat map circles when map is ready and records count changes
     LaunchedEffect(mapController, uiState.environmentRecordCount) {
         val controller = mapController ?: return@LaunchedEffect
-        val locations = viewModel.getAllLocations()
-        controller.clear()
-        
-        // Draw circles for coverage
-        com.shiraka.locatiobprovid.utils.MapCoverageHelper.drawCoverage(controller, locations)
-        
-        // Move camera to latest record if exists
-        if (locations.isNotEmpty()) {
-            val last = locations.last()
-            controller.animateCamera(last.lat, last.lng, 17f)
-        }
+        redrawCoverage(controller, moveToLatest = true)
     }
 
     Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
@@ -62,6 +76,9 @@ fun ScannerMapScreen(
             onMapReady = { controller ->
                 mapController = controller
                 controller.disableUiControls()
+                controller.setOnCameraChangeListener { _, _ ->
+                    redrawCoverage(controller, moveToLatest = false)
+                }
             }
         )
         

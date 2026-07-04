@@ -7,20 +7,20 @@
 
     <path
         android:fillColor="#00000000"
-        android:pathData="M66.2,39C62.1,36.4 57,35.5 52,36.5C41.8,38.7 35.3,48.7 37.5,58.9C39.7,69.1 49.7,75.6 59.9,73.4C63.5,72.6 66.7,70.9 69.2,68.5"
+        android:pathData="M63.5,39.7C60,37.5 55.6,36.8 51.4,37.8C42.8,39.7 37.4,48.2 39.3,56.8C41.2,65.4 49.7,70.8 58.3,68.9C61.2,68.3 63.8,66.9 65.8,64.9"
         android:strokeColor="#FF445157"
         android:strokeLineCap="round"
         android:strokeLineJoin="round"
-        android:strokeWidth="4.8" />
+        android:strokeWidth="3.6" />
 
     <path
         android:fillColor="#00000000"
-        android:pathData="M72.5,43.9C75,48.2 75.6,53.6 74.1,58.6"
+        android:pathData="M69.2,43.9C71.1,47.3 71.5,51.4 70.4,55.1"
         android:strokeColor="#FF445157"
         android:strokeLineCap="round"
-        android:strokeWidth="4.8" />
+        android:strokeWidth="3.6" />
 
     <path
         android:fillColor="#FF445157"
-        android:pathData="M64.4,44.8C65.7,44.1 67,45.4 66.3,46.7L58.6,64.2C58,65.7 55.8,65.5 55.4,64L53.4,56.7L46.1,54.7C44.6,54.3 44.4,52.1 45.9,51.5L64.4,44.8Z" />
+        android:pathData="M61.9,46.7C63,46.2 64.1,47.3 63.6,48.4L57.5,62.5C56.9,63.8 55.1,63.6 54.8,62.3L53.2,56.6L47.5,55C46.2,54.7 46,52.9 47.3,52.3L61.9,46.7Z" />
 </vector>

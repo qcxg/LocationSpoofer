@@ -223,7 +223,7 @@ fun ManageDataScreen(
         val editingLocation = editingItem!!.location
         val editingKey = placeKey(editingLocation.lat, editingLocation.lng)
         val initialPlaceName = editingLocation.placeName
-            .takeIf { it.isNotBlank() && !isImportSourceText(it) }
+            .takeIf { it.isNotBlank() && !isImportSourceText(it) && isReadablePlaceNameForUi(it) }
             ?: uiState.nearbyPlaceNames[editingKey].orEmpty()
         val initialRemark = editingLocation.remark
             .takeUnless { it.startsWith("经纬度") || it.startsWith("經緯度") }
@@ -348,12 +348,14 @@ private fun DataListItem(
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
                 )
                 Spacer(modifier = Modifier.height(8.dp))
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     IconTextRow(Icons.Rounded.Wifi, sourceText(group.wifiCount, group.wifiSources))
                     IconTextRow(Icons.Rounded.CellTower, sourceText(group.cellCount, group.cellSources))
-                    IconTextRow(Icons.Rounded.Bluetooth, sourceText(group.bluetoothCount, group.bluetoothSources))
+                    if (group.bluetoothCount > 0) {
+                        IconTextRow(Icons.Rounded.Bluetooth, sourceText(group.bluetoothCount, group.bluetoothSources))
+                    }
                 }
                 
                 if (group.nearbyName.isNotBlank()) {
@@ -419,7 +421,7 @@ private fun groupManagedLocations(
             val first = group.minByOrNull { it.location.timestamp } ?: group.first()
             val key = placeKey(first.location.lat, first.location.lng)
             val placeName = nearbyNames[key]
-                ?: group.map { it.location.placeName }.firstOrNull { it.isNotBlank() && !isImportSourceText(it) }
+                ?: group.map { it.location.placeName }.firstOrNull { it.isNotBlank() && !isImportSourceText(it) && isReadablePlaceNameForUi(it) }
                 ?: ""
 
             ManagedLocationGroup(
@@ -469,7 +471,7 @@ private fun sourceLabelsForGroup(group: List<CompleteLocation>, kind: String): L
         labels += "由 OpenCellID 導入"
     }
     if (labels.isEmpty() && isImportSourceText(groupText)) {
-        labels += "由檔案匯入"
+        labels += if (kind == "cell") "由 OpenCellID 導入" else "由 WiGLE 導入"
     }
     if (labels.isEmpty()) {
         labels += "本地采集"
@@ -483,4 +485,12 @@ private fun isImportSourceText(text: String): Boolean {
         text.contains("导入") ||
         text.contains("導入") ||
         text.contains("Import", ignoreCase = true)
+}
+
+private fun isReadablePlaceNameForUi(text: String): Boolean {
+    val name = text.trim()
+    if (name.isBlank()) return false
+    if (name.equals("Unnamed Road", ignoreCase = true)) return false
+    if (name.contains("+")) return false
+    return !name.matches(Regex("[0-9０-９\\-－ー丁目番地号之の\\s]+"))
 }

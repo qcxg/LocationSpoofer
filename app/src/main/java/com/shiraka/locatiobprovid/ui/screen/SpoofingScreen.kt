@@ -71,6 +71,7 @@ import com.shiraka.locatiobprovid.data.model.AppState
 import com.shiraka.locatiobprovid.data.model.JitterSpeed
 import com.shiraka.locatiobprovid.data.model.SearchMode
 import com.shiraka.locatiobprovid.data.model.SavedLocation
+import com.shiraka.locatiobprovid.data.model.StartSpoofingPhase
 import com.shiraka.locatiobprovid.data.model.WifiLoadStatus
 import com.shiraka.locatiobprovid.ui.components.AppMapView
 import com.shiraka.locatiobprovid.ui.components.AppMapController
@@ -440,7 +441,15 @@ fun SpoofingScreen(
             )
             Spacer(Modifier.height(12.dp))
 
-            ActionButtons(viewModel, uiState, onExpandMap, onStartFixedSpoofing = { showStartSpoofingDialog = true })
+            ActionButtons(
+                viewModel,
+                uiState,
+                onExpandMap,
+                onStartFixedSpoofing = {
+                    viewModel.resetStartSpoofingProgress()
+                    showStartSpoofingDialog = true
+                }
+            )
             Spacer(Modifier.height(16.dp))
 
             if (uiState.recentLocations.isNotEmpty()) {
@@ -704,15 +713,31 @@ fun SpoofingScreen(
     }
 
 
+    LaunchedEffect(showStartSpoofingDialog, uiState.startSpoofingProgress.phase) {
+        if (showStartSpoofingDialog && uiState.startSpoofingProgress.phase == StartSpoofingPhase.SUCCESS) {
+            if (!uiState.startSpoofingProgress.usedLocalCache) {
+                delay(1000)
+            }
+            Toast.makeText(context, "虛擬位置已啟用", Toast.LENGTH_SHORT).show()
+            showStartSpoofingDialog = false
+            viewModel.resetStartSpoofingProgress()
+        }
+    }
+
     if (showStartSpoofingDialog) {
         StartSpoofingDialog(
             uiState = uiState,
             isDark = isDark,
-            onDismiss = { showStartSpoofingDialog = false },
+            onDismiss = {
+                if (!uiState.isSavingConfig) {
+                    viewModel.resetStartSpoofingProgress()
+                    showStartSpoofingDialog = false
+                }
+            },
             onConfirm = {
                 viewModel.startSpoofing()
-                showStartSpoofingDialog = false
             },
+            onRetry = { viewModel.startSpoofing() },
             onToggleWifi = { viewModel.toggleMockWifi() },
             onToggleCell = { viewModel.toggleMockCell() },
             onToggleBluetooth = { viewModel.toggleMockBluetooth() },
@@ -1816,6 +1841,7 @@ fun StartSpoofingDialog(
     isDark: Boolean,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
+    onRetry: () -> Unit,
     onToggleWifi: () -> Unit,
     onToggleCell: () -> Unit,
     onToggleBluetooth: () -> Unit,
@@ -1826,8 +1852,9 @@ fun StartSpoofingDialog(
     var pendingEnableJitter by remember(uiState.enableJitter) { mutableStateOf(uiState.enableJitter) }
     var pendingJitterRadius by remember(uiState.jitterRadiusMeters) { mutableStateOf(uiState.jitterRadiusMeters.coerceIn(1, 80).toFloat()) }
     var pendingJitterSpeed by remember(uiState.jitterSpeed) { mutableStateOf(uiState.jitterSpeed) }
+    val progress = uiState.startSpoofingProgress
 
-    LocalizedDialog(onDismissRequest = onDismiss) {
+    LocalizedDialog(onDismissRequest = { if (!uiState.isSavingConfig) onDismiss() }) {
         Surface(
             shape = RoundedCornerShape(16.dp),
             color = AppColors.cardBackground(isDark)
@@ -1837,6 +1864,16 @@ fun StartSpoofingDialog(
                     .padding(20.dp)
                     .fillMaxWidth()
             ) {
+                if (progress.phase != StartSpoofingPhase.IDLE) {
+                    StartSpoofingProgressContent(
+                        phase = progress.phase,
+                        message = progress.message,
+                        sources = progress.sources,
+                        errors = progress.errors,
+                        onDismiss = onDismiss,
+                        onRetry = onRetry
+                    )
+                } else {
                 Text(
                     text = stringResource(R.string.spoofing_options_title),
                     fontSize = 18.sp,
@@ -1993,6 +2030,116 @@ fun StartSpoofingDialog(
                     ) {
                         Text(stringResource(R.string.start_simulation))
                     }
+                }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StartSpoofingProgressContent(
+    phase: StartSpoofingPhase,
+    message: String,
+    sources: List<String>,
+    errors: List<String>,
+    onDismiss: () -> Unit,
+    onRetry: () -> Unit
+) {
+    val isError = phase == StartSpoofingPhase.ERROR
+    val isSuccess = phase == StartSpoofingPhase.SUCCESS
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                imageVector = when {
+                    isError -> Icons.Rounded.ErrorOutline
+                    isSuccess -> Icons.Rounded.CheckCircle
+                    else -> Icons.Rounded.Refresh
+                },
+                contentDescription = null,
+                tint = when {
+                    isError -> MaterialTheme.colorScheme.error
+                    isSuccess -> AccentGreen
+                    else -> AccentBlue
+                },
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = when {
+                    isError -> "資料獲取需要重試"
+                    isSuccess -> "虛擬位置已啟用"
+                    else -> "正在啟用虛擬位置"
+                },
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+        }
+
+        Text(
+            text = message.ifBlank {
+                when (phase) {
+                    StartSpoofingPhase.PREPARING -> "正在檢查本地資料"
+                    StartSpoofingPhase.FETCHING -> "正在拉取 API 資料"
+                    StartSpoofingPhase.ENABLING -> "正在寫入模擬配置"
+                    StartSpoofingPhase.SUCCESS -> "虛擬位置已啟用"
+                    StartSpoofingPhase.ERROR -> "資料拉取未完成"
+                    else -> ""
+                }
+            },
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.72f)
+        )
+
+        if (!isError && !isSuccess) {
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(99.dp)),
+                color = AccentBlue,
+                trackColor = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.08f)
+            )
+        }
+
+        if (sources.isNotEmpty()) {
+            Text(
+                text = "資料源：${sources.joinToString(" / ")}",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.56f)
+            )
+        }
+
+        if (errors.isNotEmpty()) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                errors.forEach { error ->
+                    Text(
+                        text = error,
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+        }
+
+        if (isError) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                TextButton(onClick = onDismiss) {
+                    Text(stringResource(R.string.cancel))
+                }
+                Spacer(Modifier.width(8.dp))
+                Button(
+                    onClick = onRetry,
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = AccentBlue)
+                ) {
+                    Icon(Icons.Rounded.Refresh, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("重試獲取")
                 }
             }
         }

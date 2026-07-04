@@ -61,7 +61,9 @@
 - 支援本地資料查看、編輯、匯入與匯出。
 - 首頁顯示最近使用的 7 個位置；收藏列表保留為頂部書籤入口。
 - 管理頁會把相同經緯度的環境記錄合併成一條，並在 Wi-Fi / 基站數量後標出「由 WiGLE / OpenCellID 導入」或本地采集來源。
-- 本地搜尋與管理頁會優先用系統地理編碼、再用 Google Geocoding 顯示「某地附近」。
+- 采集資料使用 Room/SQLite 保存，查詢按經緯度與時間索引優化，小地圖按可視範圍與縮放級別聚合展示。
+- 開始模擬時會先檢查本地 RF 快取；需要 API 補采時保留小型進度窗，明確提示 WiGLE / OpenCellID 成功或需重試。
+- 本地搜尋與管理頁會優先用 Google Places Nearby Search 取附近 POI 名稱，再用 Geocoding / 系統 Geocoder 後備顯示「某地附近」。
 - Wi-Fi payload 對話框提供去重列表：短按展開詳情，長按切換要暴露為 `connectedWifi` 的 AP。
 - RF 診斷面板顯示 `ready`、`block only`、`off`、`loading` 等狀態，便於確認目前是模擬、阻斷還是關閉。
 

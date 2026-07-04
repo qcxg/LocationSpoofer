@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 @Database(
     entities = [
         LocationRecord::class,
@@ -13,7 +15,7 @@ import androidx.room.RoomDatabase
         CellDevice::class, LocationCell::class,
         SavedRouteEntity::class
     ],
-    version = 6,
+    version = 7,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -24,10 +26,17 @@ abstract class AppDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: AppDatabase? = null
 
-        private val MIGRATION_3_4 = object : androidx.room.migration.Migration(3, 4) {
-            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE location_records ADD COLUMN placeName TEXT NOT NULL DEFAULT ''")
                 db.execSQL("ALTER TABLE location_records ADD COLUMN remark TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
+        private val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_location_records_lat_lng ON location_records(lat, lng)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_location_records_timestamp ON location_records(timestamp)")
             }
         }
 
@@ -38,7 +47,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "environment_database"
                 )
-                .addMigrations(MIGRATION_3_4)
+                .addMigrations(MIGRATION_3_4, MIGRATION_6_7)
                 .fallbackToDestructiveMigration()
                 .build()
                 INSTANCE = instance

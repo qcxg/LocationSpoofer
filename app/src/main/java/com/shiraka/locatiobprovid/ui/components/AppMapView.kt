@@ -24,6 +24,13 @@ interface AppMapMarker {
 
 enum class MarkerType { GREEN, RED, ORANGE, DEFAULT }
 
+data class MapVisibleBounds(
+    val minLat: Double,
+    val maxLat: Double,
+    val minLng: Double,
+    val maxLng: Double
+)
+
 interface AppMapController {
     fun clear()
     fun addPolyline(points: List<Pair<Double, Double>>, colorInt: Int, width: Float)
@@ -34,6 +41,8 @@ interface AppMapController {
     fun moveCamera(lat: Double, lng: Double, zoom: Float? = null)
     val cameraTargetLat: Double?
     val cameraTargetLng: Double?
+    val cameraZoom: Float?
+    fun visibleBounds(): MapVisibleBounds?
     fun setOnCameraChangeListener(onFinish: (lat: Double, lng: Double) -> Unit)
     fun disableUiControls()
     fun setMapType(type: AppMapType)
@@ -111,15 +120,23 @@ class GMapControllerImpl(private val map: GoogleMap) : AppMapController {
         if (zoom != null) map.moveCamera(GCameraUpdateFactory.newLatLngZoom(GLatLng(lat, lng), zoom))
         else map.moveCamera(GCameraUpdateFactory.newLatLng(GLatLng(lat, lng)))
     }
-    override val cameraTargetLat: Double? get() = map.cameraPosition?.target?.latitude
-    override val cameraTargetLng: Double? get() = map.cameraPosition?.target?.longitude
+    override val cameraTargetLat: Double? get() = map.cameraPosition.target.latitude
+    override val cameraTargetLng: Double? get() = map.cameraPosition.target.longitude
+    override val cameraZoom: Float? get() = map.cameraPosition.zoom
+    override fun visibleBounds(): MapVisibleBounds? {
+        val bounds = map.projection.visibleRegion.latLngBounds
+        return MapVisibleBounds(
+            minLat = bounds.southwest.latitude,
+            maxLat = bounds.northeast.latitude,
+            minLng = bounds.southwest.longitude,
+            maxLng = bounds.northeast.longitude
+        )
+    }
     
     override fun setOnCameraChangeListener(onFinish: (lat: Double, lng: Double) -> Unit) {
         map.setOnCameraIdleListener {
-            val target = map.cameraPosition?.target
-            if (target != null) {
-                onFinish(target.latitude, target.longitude)
-            }
+            val target = map.cameraPosition.target
+            onFinish(target.latitude, target.longitude)
         }
     }
     override fun disableUiControls() {
@@ -171,6 +188,7 @@ class GMapControllerImpl(private val map: GoogleMap) : AppMapController {
 }
 
 @Composable
+@Suppress("UNUSED_PARAMETER")
 fun AppMapView(mapEngine: com.shiraka.locatiobprovid.data.model.MapEngine, isDomestic: Boolean, modifier: Modifier = Modifier, onMapReady: (AppMapController) -> Unit) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle

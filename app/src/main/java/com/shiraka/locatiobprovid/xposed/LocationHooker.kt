@@ -249,10 +249,19 @@ object XposedHelpers {
 
 object XposedBridge {
     private val openCellLogLastTimes = ConcurrentHashMap<String, Long>()
+    private val generalLogLastTimes = ConcurrentHashMap<String, Long>()
 
     fun log(msg: String) {
         android.util.Log.i("LocationSpoofer_Xposed", msg)
         try { XposedHelpers.module.log(android.util.Log.INFO, "LocationSpoofer", msg) } catch (e: Throwable) {}
+    }
+    fun logEvery(key: String, msg: String, intervalMs: Long = 30_000L) {
+        val now = System.currentTimeMillis()
+        val last = generalLogLastTimes[key]
+        if (last == null || now - last >= intervalMs) {
+            generalLogLastTimes[key] = now
+            log(msg)
+        }
     }
     fun logOpenCellId(msg: String) {
         val text = "[XposedCell] $msg"
@@ -2922,12 +2931,18 @@ class LocationHooker : XposedModule() {
                                     } catch (e2: Throwable) {}
                                 }
                                 
-                                XposedBridge.log("[LocationSpoofer] fakeWifiInfo build result: " + fakeWifiInfo.toString())
+                                XposedBridge.logEvery(
+                                    "fakeWifiInfo:${wifiBssid(firstWifi)}",
+                                    "[LocationSpoofer] fakeWifiInfo active ssid=${wifiSsid(firstWifi)} bssid=${wifiBssid(firstWifi)} rssi=${wifiRssi(firstWifi)} freq=${firstWifi.optInt("frequency", 2412)}"
+                                )
                                 XposedHelpers.setObjectField(nc, "mTransportInfo", fakeWifiInfo)
                             } else {
                                 // 库中无 Wi-Fi 数据，移除 TransportInfo 以伪造非 Wi-Fi 环境
                                 try { XposedHelpers.setObjectField(nc, "mTransportInfo", null) } catch (e: Throwable) {}
-                                XposedBridge.log("[LocationSpoofer] fakeWifiInfo: No wifi data, removed TransportInfo")
+                                XposedBridge.logEvery(
+                                    "fakeWifiInfo:none",
+                                    "[LocationSpoofer] fakeWifiInfo: no wifi data, removed TransportInfo"
+                                )
                             }
                         } catch (e: Throwable) {
                             XposedBridge.log("[LocationSpoofer] fakeWifiInfo error: " + e.message)
@@ -3604,7 +3619,10 @@ class LocationHooker : XposedModule() {
                     try { XposedHelpers.setObjectField(obj, "mBands", IntArray(0)) } catch (_: Throwable) {}
                 }
             }
-            XposedBridge.log("[LocationSpoofer][CellMock] Unsafe.allocateInstance succeeded for $type: CI=$ciOrCid, TAC=$tacOrLac")
+            XposedBridge.logEvery(
+                "cellMockUnsafe:$type",
+                "[LocationSpoofer][CellMock] Unsafe.allocateInstance active for $type"
+            )
             return obj
         } catch (e: Throwable) {
             XposedBridge.log("[LocationSpoofer][CellMock] Unsafe failed for $type: $e")
@@ -3656,7 +3674,10 @@ class LocationHooker : XposedModule() {
                 try { XposedHelpers.setIntField(fallbackObj, "mPci", pci) } catch (_: Throwable) {}
             }
         }
-        XposedBridge.log("[LocationSpoofer][CellMock] MinCtor fallback used for $type identity")
+        XposedBridge.logEvery(
+            "cellMockMinCtor:$type",
+            "[LocationSpoofer][CellMock] MinCtor fallback used for $type identity"
+        )
         return fallbackObj
     }
 
@@ -3954,6 +3975,7 @@ class LocationHooker : XposedModule() {
     private var lastOpenCellConfigLogKey: String? = null
     @Volatile
     private var lastOpenCellConfigReadFailureLogTime = 0L
+    private val providerConfigDebugLastTimes = ConcurrentHashMap<String, Long>()
     @Volatile
     private var isConfigPollingStarted = false
     @Volatile
@@ -3991,6 +4013,22 @@ class LocationHooker : XposedModule() {
             arrayOf(systemConfigPath, localConfigPath)
         } else {
             arrayOf(localConfigPath, systemConfigPath)
+        }
+    }
+
+    private fun shouldPreferProviderConfig(): Boolean {
+        val uid = android.os.Process.myUid()
+        return uid == 1001 ||
+            currentPackageName == "com.android.ons" ||
+            currentPackageName == "com.android.phone"
+    }
+
+    private fun logConfigDebugEvery(key: String, msg: String, intervalMs: Long = 30_000L) {
+        val now = System.currentTimeMillis()
+        val last = providerConfigDebugLastTimes[key]
+        if (last == null || now - last >= intervalMs) {
+            providerConfigDebugLastTimes[key] = now
+            android.util.Log.d("LocationSpoofer_Debug", msg)
         }
     }
 
@@ -4068,6 +4106,18 @@ class LocationHooker : XposedModule() {
     }
 
     private fun loadConfigFromDisk(source: String): JSONObject? {
+        if (shouldPreferProviderConfig()) {
+            loadConfigFromContentProvider()?.let { return it }
+            lastConfig?.let { cached ->
+                if (cached.optBoolean("active", false)) {
+                    return normalizeConfig(cached)
+                }
+            }
+            loadConfigFromXSharedPreferences()?.let { return it }
+            loadConfigFromProperties()?.let { return it }
+            return null
+        }
+
         val errors = ArrayList<String>()
         for (path in configReadPaths()) {
             try {
@@ -4183,15 +4233,24 @@ class LocationHooker : XposedModule() {
         try {
             val clazz = findXSharedPreferencesClass()
             if (clazz == null) {
-                android.util.Log.d("LocationSpoofer_Debug", "XSharedPreferences class not found anywhere in $currentPackageName")
+                logConfigDebugEvery(
+                    "xshared-missing:$currentPackageName",
+                    "XSharedPreferences class not found anywhere in $currentPackageName"
+                )
                 return
             }
             xsharedPrefs = clazz.getConstructor(String::class.java, String::class.java)
                 .newInstance("com.shiraka.locatiobprovid", "locationspoofer_prefs")
             XposedHelpers.callMethod(xsharedPrefs!!, "makeWorldReadable")
-            android.util.Log.d("LocationSpoofer_Debug", "XSharedPreferences initialized successfully in $currentPackageName")
+            logConfigDebugEvery(
+                "xshared-ready:$currentPackageName",
+                "XSharedPreferences initialized successfully in $currentPackageName"
+            )
         } catch (e: Throwable) {
-            android.util.Log.d("LocationSpoofer_Debug", "XSharedPreferences init failed in $currentPackageName: " + e.message, e)
+            logConfigDebugEvery(
+                "xshared-failed:$currentPackageName:${e.javaClass.simpleName}",
+                "XSharedPreferences init failed in $currentPackageName: " + e.message
+            )
         }
     }
 
@@ -4200,7 +4259,10 @@ class LocationHooker : XposedModule() {
         return try {
             XposedHelpers.callMethod(prefs, "reload")
             val active = XposedHelpers.callMethod(prefs, "getBoolean", "active", false) as Boolean
-            android.util.Log.d("LocationSpoofer_Debug", "loadConfigFromXSharedPreferences in $currentPackageName: active=$active")
+            logConfigDebugEvery(
+                "xshared-load:$currentPackageName:$active",
+                "loadConfigFromXSharedPreferences in $currentPackageName: active=$active"
+            )
             if (!active) {
                 return null
             }
@@ -4297,7 +4359,14 @@ class LocationHooker : XposedModule() {
                     val normConfig = normalizeConfig(config)
                     lastConfig = normConfig
                     configPollIntervalMs = 1000L
-                    android.util.Log.d("LocationSpoofer_Debug", "loadConfigFromContentProvider in $currentPackageName: SUCCESS active=true lat=$lat lng=$lng")
+                    val wifiCount = normConfig.optJSONObject("wifi_json")
+                        ?.optJSONArray("nearbyWifi")
+                        ?.length() ?: 0
+                    val cellCount = normConfig.optJSONArray("cell_json")?.length() ?: 0
+                    logConfigDebugEvery(
+                        "provider:$currentPackageName:$lat:$lng:$wifiCount:$cellCount",
+                        "loadConfigFromContentProvider in $currentPackageName: active=true lat=$lat lng=$lng wifi=$wifiCount cell=$cellCount"
+                    )
                     normConfig
                 } else {
                     null
@@ -4311,7 +4380,10 @@ class LocationHooker : XposedModule() {
 
     private fun loadConfigFromProperties(): JSONObject? {
         val activeStr = getSystemProperty("gsm.locsp.active", "false")
-        android.util.Log.d("LocationSpoofer_Debug", "loadConfigFromProperties in $currentPackageName: activeStr=$activeStr")
+        logConfigDebugEvery(
+            "properties:$currentPackageName:$activeStr",
+            "loadConfigFromProperties in $currentPackageName: activeStr=$activeStr"
+        )
         if (activeStr != "true") {
             return null
         }

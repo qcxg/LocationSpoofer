@@ -39,7 +39,7 @@ Active spoofing state is written to:
 
 JSON config files are written through a `.tmp` file followed by `mv` to the final path. This is intentional: hooked system/GMS processes poll these files every second, and non-atomic rewrites can expose a truncated empty JSON file that makes the hook temporarily lose active state.
 
-`LocationHooker.readConfig()` prefers JSON config, then tries ContentProvider, XSharedPreferences, and system properties as fallbacks. The JSON config carries the rich data fields; system properties are only a minimal fallback for active coordinates, heartbeat, and basic MCC/MNC.
+`LocationHooker.readConfig()` prefers JSON config in normal app/system processes, but radio/phone-facing restricted processes prefer the exported ContentProvider first to avoid SELinux audit noise from inaccessible `/data/local/tmp` or `/data/system` config paths. XSharedPreferences and system properties remain fallbacks; system properties are only a minimal fallback for active coordinates, heartbeat, and basic MCC/MNC.
 
 Important config fields:
 
@@ -55,6 +55,12 @@ Important config fields:
 - `jitter_radius_meters`
 - `heartbeat_at`
 - `boot_id`
+
+Routine success logs in the hook layer are throttled; repeated ContentProvider, Wi-Fi transport, and cell-construction status should no longer dominate logcat during stable operation.
+
+Collected environment records remain in Room/SQLite. Location rows are indexed by coordinate and timestamp, and map coverage views query the visible bounds before drawing zoom-aware aggregate coverage.
+
+The start-spoofing dialog stays visible after confirmation as a compact progress surface. Local RF cache hits enable immediately; API misses identify WiGLE/OpenCellID as separate sources and keep a retry action when either source returns no usable payload.
 
 The hook layer checks heartbeat and boot ID. A stale active config in the same boot becomes fail-closed. A stale or mismatched boot config must not revive spoofing after reboot.
 
@@ -125,6 +131,8 @@ Local lookup in `locationToJson()` interpolates RSSI from nearby stored records 
 ### API Wi-Fi Import
 
 `fetchWifiFromWigleSync()` queries WiGLE using WGS-84 coordinates converted from the app coordinate. It stores WiGLE APs as environment data when returned.
+
+On start spoofing, WiGLE is queried only when no trusted local Wi-Fi payload exists within the target neighborhood; once imported, later runs read the Room/SQLite cache.
 
 Important distinction:
 
@@ -202,6 +210,8 @@ If `cell_json` is empty while active, the hook returns empty or null cell struct
 
 `locationToJson()` interpolates signal strength from nearby stored records and emits `cell_json`.
 
+OpenCellID follows the same one-time supplement rule as Wi-Fi: the API is queried only when no trusted local cell payload exists around the target coordinate, then the hook continuously serves the cached `cell_json` to Telephony reads.
+
 ### Hook Path
 
 `LocationHooker.kt` hooks:
@@ -272,8 +282,9 @@ The previous experimental magnetic-field hook is removed from the stable hook ch
 - Prefer local collected data first because it is auditable by the user.
 - Remote API imports must be labeled as `由 WiGLE 導入` / `由 OpenCellID 導入`, not reused as place names.
 - The app UI groups environment records with the same coordinate into one visible location and shows RF source labels beside the Wi-Fi/cell counts.
-- Nearby place names resolve through Android `Geocoder` first and Google Geocoding second, with `LocationSpoofer_Debug` logs for success and failure.
+- Nearby place names resolve through Google Places Nearby Search first, then Google Geocoding and Android `Geocoder`, with `LocationSpoofer_Debug` logs for success and failure.
 - Recent locations are separate from saved favorites: the home screen shows the latest seven used locations, while the top bookmark button opens the saved favorites list.
+- Recent locations must be written only after the current coordinate's Wi-Fi/cell payload has been resolved; loading a saved/recent point re-evaluates local RF data for that coordinate.
 - If Android object construction needs missing optional fields, use harmless structural defaults and keep identity fields from trusted data.
 
 ## Known Gaps

@@ -201,7 +201,7 @@ The latest confirmed debug install on 2026-07-04 completed successfully with `ad
 
 ### Current workspace status at the end of this phase summary
 
-The workspace has compiled and installed successfully; current UI iteration covers dynamic launcher icon tint, grouped source labels, and nearby place geocoding logs.
+The workspace has compiled and installed successfully; current UI iteration covers dynamic launcher icon tint, grouped source labels, nearby POI/geocoding, recent-location RF payload ordering, compact start-spoofing API progress, and restricted-process config-read logcat cleanup.
 
 ## Files Most Relevant To Continue From Here
 
