@@ -786,16 +786,29 @@ class LocationHooker : XposedModule() {
     private var lastLoggedJitterSpeed = ""
     private val systemLocationHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
     private val systemProviderManagers = ConcurrentHashMap<String, Any>()
+    private val lastRealSystemProviderReportAtMs = ConcurrentHashMap<String, Long>()
+    private val lastSystemProviderElapsedRealtimeNanos = ConcurrentHashMap<String, Long>()
+    private val lastSyntheticSystemProviderElapsedRealtimeNanos = ConcurrentHashMap<String, Long>()
+    private val systemProviderTimestampLock = Any()
+    private val cadenceReportProvider = ThreadLocal<String?>()
     private val systemInjectorLock = Any()
     @Volatile
     private var systemInjectorStarted = false
     @Volatile
     private var systemInjectorTick: Runnable? = null
+    @Volatile
+    private var systemInjectorStartedAtElapsedMs = 0L
     private var systemInjectedReportCount = 0L
+    private val systemInjectorInitialGraceMs = 1_500L
+    private val systemProviderQuietWindowMs = 2_500L
+    private val syntheticProviderTimestampLagNanos = 750_000_000L
+    private val systemProviderFallbackOrder = arrayOf(
+        android.location.LocationManager.GPS_PROVIDER,
+        android.location.LocationManager.NETWORK_PROVIDER,
+        "fused"
+    )
     // Active GnssStatus injector timers keyed by callback identity hash
     private val gnssStatusInjectors = ConcurrentHashMap<Int, java.util.Timer>()
-    private var lastSpoofedWallTimeMs = 0L
-    private var lastSpoofedElapsedRealtimeNanos = 0L
     @Volatile
     private var lastSystemLocationCheckAt = 0L
     @Volatile
@@ -820,17 +833,37 @@ class LocationHooker : XposedModule() {
         val bearing: Float
     )
 
-    private fun nextSpoofedTimestamps(): SpoofedTimestamps {
-        synchronized(this) {
-            val rawWall = System.currentTimeMillis()
-            val rawElapsed = android.os.SystemClock.elapsedRealtimeNanos()
-            // Never manufacture a timestamp in the future. Equal timestamps are valid for
-            // different providers reported in the same system tick.
-            val wall = maxOf(rawWall, lastSpoofedWallTimeMs)
-            val elapsed = maxOf(rawElapsed, lastSpoofedElapsedRealtimeNanos)
-            lastSpoofedWallTimeMs = wall
-            lastSpoofedElapsedRealtimeNanos = elapsed
-            return SpoofedTimestamps(wall, elapsed)
+    private fun rememberSystemProviderTimestamp(provider: String, timestamps: SpoofedTimestamps) {
+        if (timestamps.elapsedRealtimeNanos <= 0L) return
+        synchronized(systemProviderTimestampLock) {
+            val previous = lastSystemProviderElapsedRealtimeNanos[provider] ?: 0L
+            if (timestamps.elapsedRealtimeNanos > previous) {
+                lastSystemProviderElapsedRealtimeNanos[provider] = timestamps.elapsedRealtimeNanos
+            }
+        }
+    }
+
+    /**
+     * Reserve a provider-local fallback timestamp behind the current clock. Keeping the
+     * synthetic sample slightly old leaves room for a freshly recovered GNSS/GMS measurement,
+     * whose sensor timestamp normally predates its arrival in system_server.
+     */
+    private fun nextSyntheticSystemProviderTimestamps(provider: String): SpoofedTimestamps? {
+        val nowElapsed = android.os.SystemClock.elapsedRealtimeNanos()
+        val nowWall = System.currentTimeMillis()
+        synchronized(systemProviderTimestampLock) {
+            val previous = lastSystemProviderElapsedRealtimeNanos[provider] ?: 0L
+            // A future timestamp can only come from a broken provider. Do not make the
+            // framework ordering worse by publishing another fallback ahead of the clock.
+            if (previous >= nowElapsed) return null
+            val laggedElapsed = (nowElapsed - syntheticProviderTimestampLagNanos).coerceAtLeast(1L)
+            val elapsed = maxOf(laggedElapsed, previous + 1L)
+            lastSystemProviderElapsedRealtimeNanos[provider] = elapsed
+            val ageMs = ((nowElapsed - elapsed) / 1_000_000L).coerceAtLeast(0L)
+            return SpoofedTimestamps(
+                wallTimeMs = nowWall - ageMs,
+                elapsedRealtimeNanos = elapsed
+            )
         }
     }
 
@@ -2769,8 +2802,9 @@ class LocationHooker : XposedModule() {
                         )
                         continue
                     }
-                    val rsrq = signalRsrq(obj, i)
-                    val sinr = signalSinr(obj, i)
+                    val rssi = signalRssi(obj, i, type, dbm)
+                    val rsrq = resolvedSignalRsrq(obj, i, type, dbm)
+                    val sinr = resolvedSignalSinr(obj, i, type, dbm)
                     if (firstSummary == null) {
                         firstSummary = "$type/$mcc-$mnc area=$tacOrLac identity=$ciOrCid dbm=$dbm registered=$isRegistered"
                     }
@@ -2870,15 +2904,19 @@ class LocationHooker : XposedModule() {
                                 try { XposedHelpers.setIntField(css, "mSsRsrq", rsrq) } catch (e: Throwable) {}
                             }
                             if (sinr != null) {
-                                try { XposedHelpers.setIntField(css, "mCsiSinr", (sinr / 10).coerceIn(-10, 35)) } catch (e: Throwable) {}
-                                try { XposedHelpers.setIntField(css, "mSsSinr", (sinr / 10).coerceIn(-10, 35)) } catch (e: Throwable) {}
+                                try { XposedHelpers.setIntField(css, "mCsiSinr", sinr.coerceIn(-10, 35)) } catch (e: Throwable) {}
+                                try { XposedHelpers.setIntField(css, "mSsSinr", sinr.coerceIn(-10, 35)) } catch (e: Throwable) {}
                             }
                         }
                         else -> { // LTE
+                            if (rssi != null) try { XposedHelpers.setIntField(css, "mRssi", rssi) } catch (_: Throwable) {}
                             try { XposedHelpers.setIntField(css, "mRsrp", dbm) } catch (e: Throwable) {}
                             if (rsrq != null) try { XposedHelpers.setIntField(css, "mRsrq", rsrq) } catch (e: Throwable) {}
                             if (sinr != null) try { XposedHelpers.setIntField(css, "mRssnr", sinr) } catch (e: Throwable) {}
-                            try { XposedHelpers.setIntField(css, "mSignalStrength", dbm + 113) } catch (e: Throwable) {}
+                            if (rssi != null) {
+                                val rssiAsu = ((rssi + 113) / 2).coerceIn(0, 31)
+                                try { XposedHelpers.setIntField(css, "mSignalStrength", rssiAsu) } catch (_: Throwable) {}
+                            }
                         }
                     }
 
@@ -2972,11 +3010,64 @@ class LocationHooker : XposedModule() {
     private fun signalSinr(cell: org.json.JSONObject, index: Int): Int? {
         val direct = cell.optInt("sinr", Int.MIN_VALUE)
         val normalized = when {
-            direct in -20..40 -> direct * 10
-            direct in -200..300 -> direct
+            direct in -20..40 -> direct
+            direct in -200..300 -> direct / 10
             else -> return null
         }
-        return (normalized + signalJitterDelta(index, 2, 30)).coerceIn(-50, 180)
+        return (normalized + signalJitterDelta(index, 2, 3)).coerceIn(-20, 30)
+    }
+
+    /**
+     * OpenCellID commonly supplies only RSRP (`dbm`). Android's LTE model keeps
+     * RSSI, RSRP, RSRQ and RSSNR as independent fields; leaving the other fields
+     * at their constructor defaults makes callers treat them as unavailable (or
+     * occasionally render a bogus -1 dB SINR). Keep an explicit source value
+     * when one exists, otherwise derive a conservative, correlated RF tuple from
+     * the measured RSRP. This does not invent a tower identity and remains bound
+     * to the source cell's real signal measurement.
+     */
+    private fun signalRssi(
+        cell: org.json.JSONObject,
+        index: Int,
+        type: String,
+        referenceDbm: Int
+    ): Int? {
+        val direct = jsonIntValue(cell, "rssi")?.takeIf { it in -113..-51 }
+        if (direct != null) {
+            return (direct + signalJitterDelta(index, 3, 3)).coerceIn(-113, -51)
+        }
+        if (type != "LTE") return null
+        // A 25-27 dB LTE RSSI/RSRP separation is representative of a loaded
+        // 10-20 MHz carrier and matches Android's valid RSSI range.
+        val offset = 26 + signalJitterDelta(index, 3, 2)
+        return (referenceDbm + offset).coerceIn(-113, -51)
+    }
+
+    private fun resolvedSignalRsrq(
+        cell: org.json.JSONObject,
+        index: Int,
+        type: String,
+        referenceDbm: Int
+    ): Int? {
+        signalRsrq(cell, index)?.let { return it }
+        if (type != "LTE" && type != "NR") return null
+        val degradation = ((-referenceDbm - 75).coerceAtLeast(0) / 6)
+        val estimate = -5 - degradation + signalJitterDelta(index, 4, 2)
+        return estimate.coerceIn(-18, -3)
+    }
+
+    /** Returns the integer dB value exposed by CellSignalStrengthLte.getRssnr(). */
+    private fun resolvedSignalSinr(
+        cell: org.json.JSONObject,
+        index: Int,
+        type: String,
+        referenceDbm: Int
+    ): Int? {
+        signalSinr(cell, index)?.let { return it }
+        if (type != "LTE" && type != "NR") return null
+        val degradation = ((-referenceDbm - 70).coerceAtLeast(0) * 3) / 5
+        val estimateDb = (18 - degradation).coerceIn(-10, 30)
+        return (estimateDb + signalJitterDelta(index, 5, 2)).coerceIn(-20, 30)
     }
 
     private fun signalJitterDelta(index: Int, salt: Int, maxAmplitude: Int): Int {
@@ -3283,8 +3374,9 @@ class LocationHooker : XposedModule() {
         val first = firstSignalCell(cellArray) ?: return null
         val type = explicitCellType(first) ?: return null
         val dbm = signalDbm(first, 0) ?: return null
-        val rsrq = signalRsrq(first, 0)
-        val sinr = signalSinr(first, 0)
+        val rssi = signalRssi(first, 0, type, dbm)
+        val rsrq = resolvedSignalRsrq(first, 0, type, dbm)
+        val sinr = resolvedSignalSinr(first, 0, type, dbm)
         val cellCount = cellArray?.length() ?: 0
         XposedBridge.logOpenCellIdEvery(
             "buildFakeSignalStrength:called:$type:$cellCount",
@@ -3323,16 +3415,20 @@ class LocationHooker : XposedModule() {
                         try { XposedHelpers.setIntField(component, "mSsRsrq", rsrq) } catch (_: Throwable) {}
                     }
                     if (sinr != null) {
-                        val nrSinr = (sinr / 10).coerceIn(-10, 35)
+                        val nrSinr = sinr.coerceIn(-10, 35)
                         try { XposedHelpers.setIntField(component, "mCsiSinr", nrSinr) } catch (_: Throwable) {}
                         try { XposedHelpers.setIntField(component, "mSsSinr", nrSinr) } catch (_: Throwable) {}
                     }
                 }
                 else -> {
+                    if (rssi != null) try { XposedHelpers.setIntField(component, "mRssi", rssi) } catch (_: Throwable) {}
                     try { XposedHelpers.setIntField(component, "mRsrp", dbm) } catch (_: Throwable) {}
                     if (rsrq != null) try { XposedHelpers.setIntField(component, "mRsrq", rsrq) } catch (_: Throwable) {}
                     if (sinr != null) try { XposedHelpers.setIntField(component, "mRssnr", sinr) } catch (_: Throwable) {}
-                    try { XposedHelpers.setIntField(component, "mSignalStrength", dbm + 113) } catch (_: Throwable) {}
+                    if (rssi != null) {
+                        val rssiAsu = ((rssi + 113) / 2).coerceIn(0, 31)
+                        try { XposedHelpers.setIntField(component, "mSignalStrength", rssiAsu) } catch (_: Throwable) {}
+                    }
                 }
             }
             val signalField = when (type) {
@@ -3354,7 +3450,7 @@ class LocationHooker : XposedModule() {
             if (!attached) return null
             XposedBridge.logOpenCellIdEvery(
                 "buildFakeSignalStrength:success:$type",
-                "buildFakeSignalStrength success type=$type dbm=$dbm"
+                "buildFakeSignalStrength success type=$type rssi=$rssi dbm=$dbm rsrq=$rsrq sinrDb=$sinr"
             )
             signalStrength
         } catch (e: Throwable) {
@@ -5581,13 +5677,66 @@ class LocationHooker : XposedModule() {
         return cachedGpsSatellitesList ?: ArrayList()
     }
 
-    private fun buildSpoofedAndroidLocation(
+    private fun frameworkResultLocations(result: Any?): List<android.location.Location> {
+        if (result == null) return emptyList()
+        val listed = runCatching {
+            @Suppress("UNCHECKED_CAST")
+            (XposedHelpers.callMethod(result, "asList") as? List<*>)
+                ?.filterIsInstance<android.location.Location>()
+        }.getOrNull()
+        if (!listed.isNullOrEmpty()) return listed
+
+        val size = runCatching {
+            (XposedHelpers.callMethod(result, "size") as? Number)?.toInt()
+        }.getOrNull() ?: return emptyList()
+        if (size <= 0) return emptyList()
+        return ArrayList<android.location.Location>(size).also { locations ->
+            for (index in 0 until size) {
+                val location = runCatching {
+                    XposedHelpers.callMethod(result, "get", index) as? android.location.Location
+                }.getOrNull() ?: continue
+                locations.add(location)
+            }
+        }
+    }
+
+    /**
+     * Rewrite only location contents at the post-validation framework boundary. The provider's
+     * original wall/elapsed timestamps stay intact, so LocationProviderManager's last-location
+     * cache cannot be advanced beyond the next real sensor measurement.
+     */
+    private fun rewriteFrameworkLocationResultInPlace(
+        result: Any?,
         config: JSONObject,
         provider: String
-    ): android.location.Location {
-        return android.location.Location(provider).also {
-            applySpoofedLocationToObject(it, config, provider)
+    ): Boolean {
+        val locations = frameworkResultLocations(result)
+        if (locations.isEmpty()) return false
+        var rewritten = false
+        for (location in locations) {
+            val timestamps = SpoofedTimestamps(
+                wallTimeMs = location.time,
+                elapsedRealtimeNanos = location.elapsedRealtimeNanos
+            )
+            if (timestamps.wallTimeMs <= 0L || timestamps.elapsedRealtimeNanos <= 0L) continue
+            rememberSystemProviderTimestamp(provider, timestamps)
+            applySpoofedLocationToObject(location, config, provider, timestamps)
+            rewritten = true
         }
+        return rewritten
+    }
+
+    private fun isSyntheticSystemProviderFallback(result: Any?, provider: String): Boolean {
+        if (cadenceReportProvider.get() == provider) return true
+        val expectedTimestamp =
+            lastSyntheticSystemProviderElapsedRealtimeNanos[provider] ?: return false
+        val matched = frameworkResultLocations(result).any {
+            it.elapsedRealtimeNanos == expectedTimestamp
+        }
+        if (matched) {
+            lastSyntheticSystemProviderElapsedRealtimeNanos.remove(provider, expectedTimestamp)
+        }
+        return matched
     }
 
     private fun hookSystemLocationProviderPipeline(classLoader: ClassLoader, pkg: String) {
@@ -5604,16 +5753,19 @@ class LocationHooker : XposedModule() {
                 XposedBridge.hookAllMethods(managerClass, "processReportedLocation", object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         if (param.result == null) return
-                        val config = readConfig() ?: return
-                        if (!shouldDeliverLocation(config)) return
                         val manager = param.thisObject ?: return
                         val provider = systemProviderName(manager) ?: return
                         if (!isSyntheticSystemProvider(provider)) return
-                        val replacement = buildCanonicalFrameworkLocationResult(classLoader, config, provider) ?: return
-                        param.result = replacement
+                        val config = readConfig() ?: return
+                        if (!shouldDeliverLocation(config)) return
+                        if (!isSyntheticSystemProviderFallback(param.result, provider)) {
+                            lastRealSystemProviderReportAtMs[provider] =
+                                android.os.SystemClock.elapsedRealtime()
+                        }
+                        if (!rewriteFrameworkLocationResultInPlace(param.result, config, provider)) return
                         XposedBridge.logEvery(
                             "systemCanonicalFix:$provider",
-                            "[LocationSpoofer] canonical $provider fix created after provider validation and before framework cache/filter",
+                            "[LocationSpoofer] canonical $provider fix rewritten with provider timestamp after validation",
                             10_000L
                         )
                     }
@@ -5627,8 +5779,12 @@ class LocationHooker : XposedModule() {
                         val manager = param.thisObject ?: return
                         val provider = systemProviderName(manager) ?: return
                         if (!isSyntheticSystemProvider(provider)) return
-                        val replacement = buildCanonicalFrameworkLocationResult(classLoader, config, provider) ?: return
-                        if (param.args.isNotEmpty()) param.args[0] = replacement
+                        val result = param.args.getOrNull(0) ?: return
+                        if (!isSyntheticSystemProviderFallback(result, provider)) {
+                            lastRealSystemProviderReportAtMs[provider] =
+                                android.os.SystemClock.elapsedRealtime()
+                        }
+                        rewriteFrameworkLocationResultInPlace(result, config, provider)
                     }
                 })
             }
@@ -5696,6 +5852,7 @@ class LocationHooker : XposedModule() {
             if (!shouldSpoofLocation(lastConfig)) return
             if (systemInjectorStarted) return
             systemInjectorStarted = true
+            systemInjectorStartedAtElapsedMs = android.os.SystemClock.elapsedRealtime()
             lateinit var tick: Runnable
             tick = Runnable {
                 try {
@@ -5713,6 +5870,7 @@ class LocationHooker : XposedModule() {
                         } else if (systemInjectorTick === tick) {
                             systemInjectorStarted = false
                             systemInjectorTick = null
+                            systemInjectorStartedAtElapsedMs = 0L
                         }
                         Unit
                     }
@@ -5732,42 +5890,66 @@ class LocationHooker : XposedModule() {
             systemInjectorTick?.let(systemLocationHandler::removeCallbacks)
             systemInjectorTick = null
             systemInjectorStarted = false
+            systemInjectorStartedAtElapsedMs = 0L
         }
+    }
+
+    private fun shouldInjectSystemProviderFallback(provider: String, nowElapsedMs: Long): Boolean {
+        val startedAt = systemInjectorStartedAtElapsedMs
+        if (startedAt <= 0L || nowElapsedMs - startedAt < systemInjectorInitialGraceMs) return false
+        val lastRealReport = lastRealSystemProviderReportAtMs[provider] ?: return true
+        return nowElapsedMs - lastRealReport >= systemProviderQuietWindowMs
     }
 
     private fun injectSystemProviderFixes() {
         val config = readConfig() ?: return
         if (!shouldDeliverLocation(config)) return
 
+        val nowElapsedMs = android.os.SystemClock.elapsedRealtime()
         var delivered = 0
-        for ((provider, manager) in systemProviderManagers) {
-            val rawLocation = buildCompleteRawLocation(config, provider)
+        var upstreamFallbackDelivered = false
+        for (provider in systemProviderFallbackOrder) {
+            val manager = systemProviderManagers[provider] ?: continue
+            if (!shouldInjectSystemProviderFallback(provider, nowElapsedMs)) continue
+            // GPS/network normally feed GMS fused. Give that derived stream one tick to arrive
+            // before directly falling back on fused as well, avoiding duplicate provider flows.
+            if (provider == "fused" && upstreamFallbackDelivered) continue
+            val rawLocation = buildCompleteRawLocation(config, provider) ?: continue
             val managerClassLoader = manager.javaClass.classLoader ?: ClassLoader.getSystemClassLoader()
             val result = createFrameworkLocationResult(managerClassLoader, rawLocation) ?: continue
-            if (reportThroughRealProvider(manager, result)) delivered++
+            if (reportThroughRealProvider(manager, result, provider)) {
+                delivered++
+                if (provider != "fused") upstreamFallbackDelivered = true
+            }
         }
         if (delivered > 0) {
             systemInjectedReportCount += delivered.toLong()
             XposedBridge.logEvery(
                 "systemProviderCadence",
-                "[LocationSpoofer] framework cadence delivered $delivered provider reports (total=$systemInjectedReportCount)",
+                "[LocationSpoofer] silent-provider fallback delivered $delivered reports (total=$systemInjectedReportCount)",
                 10_000L
             )
         }
     }
 
-    private fun buildCompleteRawLocation(config: JSONObject, provider: String): android.location.Location {
+    private fun buildCompleteRawLocation(
+        config: JSONObject,
+        provider: String
+    ): android.location.Location? {
+        val timestamps = nextSyntheticSystemProviderTimestamps(provider) ?: return null
+        lastSyntheticSystemProviderElapsedRealtimeNanos[provider] =
+            timestamps.elapsedRealtimeNanos
         val base = standardLocationCoordinates(config)
         return android.location.Location(provider).also { location ->
             location.latitude = base.first
             location.longitude = base.second
             location.accuracy = 20f
-            location.time = System.currentTimeMillis()
-            location.elapsedRealtimeNanos = android.os.SystemClock.elapsedRealtimeNanos()
+            location.time = timestamps.wallTimeMs
+            location.elapsedRealtimeNanos = timestamps.elapsedRealtimeNanos
         }
     }
 
-    private fun reportThroughRealProvider(manager: Any, result: Any): Boolean {
+    private fun reportThroughRealProvider(manager: Any, result: Any, providerName: String): Boolean {
         return try {
             val mockable = XposedHelpers.getObjectField(manager, "mProvider") ?: return false
             val realProvider = try {
@@ -5779,7 +5961,17 @@ class LocationHooker : XposedModule() {
             // Never route through Android's MockLocationProvider. The real provider abstraction
             // owns the listener/lock that enters LocationProviderManager normally.
             if (provider.javaClass.name.endsWith(".MockLocationProvider")) return false
-            XposedHelpers.callMethod(provider, "reportLocation", result)
+            val previousProvider = cadenceReportProvider.get()
+            cadenceReportProvider.set(providerName)
+            try {
+                XposedHelpers.callMethod(provider, "reportLocation", result)
+            } finally {
+                if (previousProvider == null) {
+                    cadenceReportProvider.remove()
+                } else {
+                    cadenceReportProvider.set(previousProvider)
+                }
+            }
             true
         } catch (e: Throwable) {
             XposedBridge.logEvery(
@@ -5789,14 +5981,6 @@ class LocationHooker : XposedModule() {
             )
             false
         }
-    }
-
-    private fun buildCanonicalFrameworkLocationResult(
-        classLoader: ClassLoader,
-        config: JSONObject,
-        provider: String
-    ): Any? {
-        return createFrameworkLocationResult(classLoader, buildSpoofedAndroidLocation(config, provider))
     }
 
     private fun createFrameworkLocationResult(
@@ -5852,12 +6036,13 @@ class LocationHooker : XposedModule() {
     private fun applySpoofedLocationToObject(
         loc: Any,
         config: JSONObject,
-        provider: String
+        provider: String,
+        timestamps: SpoofedTimestamps
     ) {
         val sample = createLocationSample(
             config = config,
             provider = provider,
-            timestamps = nextSpoofedTimestamps()
+            timestamps = timestamps
         )
 
         try { XposedHelpers.callMethod(loc, "setLatitude", sample.latitude) } catch (_: Throwable) {
