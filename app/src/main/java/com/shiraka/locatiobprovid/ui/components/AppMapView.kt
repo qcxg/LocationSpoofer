@@ -33,7 +33,9 @@ data class MapVisibleBounds(
 
 interface AppMapController {
     fun clear()
+    fun clearCoverage()
     fun addPolyline(points: List<Pair<Double, Double>>, colorInt: Int, width: Float)
+    fun addCoveragePolygon(points: List<Pair<Double, Double>>, fillColorInt: Int, strokeColorInt: Int, strokeWidth: Float)
     fun addCircle(lat: Double, lng: Double, radius: Double, fillColorInt: Int, strokeColorInt: Int, strokeWidth: Float)
     fun addMarker(lat: Double, lng: Double, title: String, type: MarkerType): AppMapMarker
     fun animateCamera(lat: Double, lng: Double, zoom: Float? = null)
@@ -52,6 +54,7 @@ interface AppMapController {
 class GMapControllerImpl(private val map: GoogleMap) : AppMapController {
     private var isDarkMode: Boolean = false
     private var currentMapType: AppMapType = AppMapType.NORMAL
+    private val coveragePolygons = mutableListOf<com.google.android.gms.maps.model.Polygon>()
 
     override fun setDarkMode(isDark: Boolean, context: android.content.Context) {
         isDarkMode = isDark
@@ -67,13 +70,30 @@ class GMapControllerImpl(private val map: GoogleMap) : AppMapController {
         setMapType(currentMapType)
     }
 
-    override fun clear() { map.clear() }
+    override fun clear() {
+        map.clear()
+        coveragePolygons.clear()
+    }
+    override fun clearCoverage() {
+        coveragePolygons.forEach { polygon -> polygon.remove() }
+        coveragePolygons.clear()
+    }
     override fun addPolyline(points: List<Pair<Double, Double>>, colorInt: Int, width: Float) {
         map.addPolyline(
             GPolylineOptions().color(colorInt).width(width).apply {
                 points.forEach { add(GLatLng(it.first, it.second)) }
             }
         )
+    }
+    override fun addCoveragePolygon(points: List<Pair<Double, Double>>, fillColorInt: Int, strokeColorInt: Int, strokeWidth: Float) {
+        val polygon = map.addPolygon(
+            com.google.android.gms.maps.model.PolygonOptions()
+                .fillColor(fillColorInt)
+                .strokeColor(strokeColorInt)
+                .strokeWidth(strokeWidth)
+                .apply { points.forEach { add(GLatLng(it.first, it.second)) } }
+        )
+        coveragePolygons += polygon
     }
     override fun addCircle(lat: Double, lng: Double, radius: Double, fillColorInt: Int, strokeColorInt: Int, strokeWidth: Float) {
         map.addCircle(
@@ -199,17 +219,20 @@ fun AppMapView(mapEngine: com.shiraka.locatiobprovid.data.model.MapEngine, isDom
         mapController?.setDarkMode(isDark, context)
     }
 
-    val gmapView = remember { 
-        GMapView(context).apply {
-            onCreate(Bundle())
-        }
-    }
+    val gmapView = remember(context) { GMapView(context) }
     DisposableEffect(lifecycle, gmapView) {
+        var destroyed = false
+        fun destroyOnce() {
+            if (!destroyed) {
+                destroyed = true
+                gmapView.onDestroy()
+            }
+        }
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_RESUME  -> gmapView.onResume()
                 Lifecycle.Event.ON_PAUSE   -> gmapView.onPause()
-                Lifecycle.Event.ON_DESTROY -> gmapView.onDestroy()
+                Lifecycle.Event.ON_DESTROY -> destroyOnce()
                 else -> {}
             }
         }
@@ -217,13 +240,14 @@ fun AppMapView(mapEngine: com.shiraka.locatiobprovid.data.model.MapEngine, isDom
         if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) gmapView.onResume()
         onDispose {
             lifecycle.removeObserver(observer)
-            gmapView.onPause()
-            gmapView.onDestroy()
+            if (!destroyed) gmapView.onPause()
+            destroyOnce()
         }
     }
     AndroidView(
         factory = {
             gmapView.apply {
+                onCreate(Bundle())
                 setOnTouchListener { v, _ -> v.parent?.requestDisallowInterceptTouchEvent(true); false }
                 getMapAsync { map -> 
                     val controller = GMapControllerImpl(map)

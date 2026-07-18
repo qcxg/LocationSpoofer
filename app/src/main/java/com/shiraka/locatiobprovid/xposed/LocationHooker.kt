@@ -6,15 +6,15 @@ import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface
 import org.json.JSONObject
 import java.io.File
-import java.util.Collections
 import java.util.Random
-import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 import java.lang.reflect.Member
+import com.shiraka.locatiobprovid.utils.EnvironmentCoveragePolicy
 
 // --- Legacy Compatibility Layer ---
 abstract class XC_MethodHook {
@@ -220,10 +220,22 @@ object XposedHelpers {
                     this.args = chain.args.toTypedArray()
                 }
 
+                val beforeArgs = param.args.copyOf()
+                val beforeResult = param.result
+                val beforeThrowable = param.throwable
+                val beforeReturnEarly = param.returnEarly
                 try {
                     callback.beforeHookedMethod(param)
                 } catch (e: Throwable) {
-                    param.throwable = e
+                    // A compatibility callback is module code, not part of the hooked method.
+                    // Never turn a callback bug into an exception in the host process (and, in
+                    // particular, never let it crash system_server). Restore the complete state
+                    // from before the callback and continue with the original method.
+                    param.args = beforeArgs
+                    param.result = beforeResult
+                    param.throwable = beforeThrowable
+                    param.returnEarly = beforeReturnEarly
+                    logCallbackFailure("before", executable, e)
                 }
 
                 if (!param.returnEarly) {
@@ -234,10 +246,20 @@ object XposedHelpers {
                     }
                 }
 
+                val afterArgs = param.args.copyOf()
+                val afterResult = param.result
+                val afterThrowable = param.throwable
+                val afterReturnEarly = param.returnEarly
                 try {
                     callback.afterHookedMethod(param)
                 } catch (e: Throwable) {
-                    param.throwable = e
+                    // Preserve the original method's result/throwable when an after callback
+                    // fails. This matches the isolation expected from Xposed callbacks.
+                    param.args = afterArgs
+                    param.result = afterResult
+                    param.throwable = afterThrowable
+                    param.returnEarly = afterReturnEarly
+                    logCallbackFailure("after", executable, e)
                 }
 
                 if (param.throwable != null) throw param.throwable!!
@@ -245,49 +267,80 @@ object XposedHelpers {
             }
         })
     }
+
+    private fun logCallbackFailure(
+        phase: String,
+        executable: java.lang.reflect.Executable,
+        error: Throwable
+    ) {
+        try {
+            val message = "Hook $phase callback failed for ${executable.declaringClass.name}.${executable.name}"
+            XposedBridge.logEvery(
+                "callback-failure:$phase:${executable.declaringClass.name}.${executable.name}:${error.javaClass.name}",
+                "$message: ${error.javaClass.simpleName}: ${error.message}",
+                60_000L
+            )
+        } catch (_: Throwable) {
+            // Logging must never become another host-process failure path.
+        }
+    }
 }
 
 object XposedBridge {
     private val openCellLogLastTimes = ConcurrentHashMap<String, Long>()
     private val generalLogLastTimes = ConcurrentHashMap<String, Long>()
+    private val dynamicLogToken = Regex("-?\\d+(?:\\.\\d+)?")
+    private const val MAX_LOG_KEYS = 256
 
     fun log(msg: String) {
         android.util.Log.i("LocationSpoofer_Xposed", msg)
-        try { XposedHelpers.module.log(android.util.Log.INFO, "LocationSpoofer", msg) } catch (e: Throwable) {}
     }
-    fun logEvery(key: String, msg: String, intervalMs: Long = 30_000L) {
-        val now = System.currentTimeMillis()
+    fun logEvery(key: String, msg: String, intervalMs: Long = 60_000L) {
+        val now = android.os.SystemClock.elapsedRealtime()
         val last = generalLogLastTimes[key]
         if (last == null || now - last >= intervalMs) {
+            if (generalLogLastTimes.size >= MAX_LOG_KEYS && last == null) {
+                generalLogLastTimes.clear()
+            }
             generalLogLastTimes[key] = now
             log(msg)
         }
     }
     fun logOpenCellId(msg: String) {
-        val text = "[XposedCell] $msg"
-        android.util.Log.d("OpenCellID", text)
-        try { XposedHelpers.module.log(android.util.Log.DEBUG, "OpenCellID", text) } catch (e: Throwable) {}
+        val key = dynamicLogToken.replace(msg, "#").take(160)
+        logOpenCellIdEvery("auto:$key", msg, 60_000L)
     }
     fun logOpenCellId(msg: String, t: Throwable) {
-        val text = "[XposedCell] $msg"
-        android.util.Log.e("OpenCellID", text, t)
-        try { XposedHelpers.module.log(android.util.Log.ERROR, "OpenCellID", text, t) } catch (e: Throwable) {}
+        val key = dynamicLogToken.replace(msg, "#").take(120)
+        logOpenCellIdEvery(
+            "error:$key:${t.javaClass.name}",
+            "$msg: ${t.javaClass.simpleName}: ${t.message}",
+            60_000L
+        )
     }
-    fun logOpenCellIdEvery(key: String, msg: String, intervalMs: Long = 10_000L) {
-        val now = System.currentTimeMillis()
+    fun logOpenCellIdEvery(key: String, msg: String, intervalMs: Long = 60_000L) {
+        val now = android.os.SystemClock.elapsedRealtime()
         val last = openCellLogLastTimes[key]
         if (last == null || now - last >= intervalMs) {
+            if (openCellLogLastTimes.size >= MAX_LOG_KEYS && last == null) {
+                openCellLogLastTimes.clear()
+            }
             openCellLogLastTimes[key] = now
-            logOpenCellId(msg)
+            android.util.Log.d("OpenCellID", "[XposedCell] $msg")
         }
     }
     fun log(t: Throwable) {
-        android.util.Log.e("LocationSpoofer_Xposed", "Error", t)
-        try { XposedHelpers.module.log(android.util.Log.ERROR, "LocationSpoofer", "Error", t) } catch (e: Throwable) {}
+        val site = t.stackTrace.firstOrNull()?.let { "${it.className}.${it.methodName}" } ?: "unknown"
+        logEvery(
+            "throwable:${t.javaClass.name}:$site",
+            "[LocationSpoofer] ${t.javaClass.simpleName}: ${t.message}",
+            60_000L
+        )
     }
     fun hookAllMethods(clazz: Class<*>, methodName: String, callback: XC_MethodHook) {
         for (m in clazz.declaredMethods) {
             if (m.name == methodName) {
+                if (java.lang.reflect.Modifier.isAbstract(m.modifiers)) continue
                 XposedHelpers.hookMethod(m, callback)
             }
         }
@@ -295,17 +348,82 @@ object XposedBridge {
 }
 
 class LocationHooker : XposedModule() {
+    private val allowedHookPackages = setOf(
+        "android",
+        "system",
+        "com.google.android.gms",
+        "com.android.location.fused",
+        "com.android.gpstest",
+        "make.more.r2d2.cellular_z.play"
+    )
+    private val allowedGmsProcesses = setOf(
+        "com.google.android.gms",
+        "com.google.android.gms.persistent"
+    )
+
     init {
         XposedHelpers.module = this
     }
 
     @Volatile
     private var xsharedPrefs: Any? = null
+    @Volatile
+    private var xsharedPreferencesInitializationAttempted = false
 
     private val nmeaTimers = ConcurrentHashMap<Any, java.util.Timer>()
+    private val nmeaListenerProxies = ConcurrentHashMap<Any, Any>()
     private val hookedCallbackClasses = ConcurrentHashMap<Class<*>, Boolean>()
+    private val dynamicallyHookedMethods = ConcurrentHashMap<java.lang.reflect.Executable, Boolean>()
     @Volatile
     private var currentPackageName: String = ""
+    private val processHookLock = Any()
+    @Volatile
+    private var processHooksInstalled = false
+
+    private fun hookDynamicMethodOnce(
+        clazz: Class<*>,
+        methodName: String,
+        parameterMatcher: (java.lang.reflect.Method) -> Boolean,
+        callback: XC_MethodHook
+    ) {
+        val candidates = ArrayList<java.lang.reflect.Method>()
+        var cursor: Class<*>? = clazz
+        while (cursor != null && cursor != Any::class.java) {
+            val current = cursor
+            if (current.name == "android.telephony.PhoneStateListener" ||
+                current.name == "android.telephony.TelephonyCallback"
+            ) break
+            val currentMatches = runCatching { current.declaredMethods }
+                .getOrDefault(emptyArray())
+                .filter { method ->
+                    method.name == methodName &&
+                        !java.lang.reflect.Modifier.isAbstract(method.modifiers) &&
+                        runCatching { parameterMatcher(method) }.getOrDefault(false)
+                }
+            if (currentMatches.isNotEmpty()) {
+                // Virtual dispatch enters the nearest concrete override. Hooking every parent
+                // implementation as well only broadens the interception surface and can apply
+                // the same rewrite twice when an override calls super.
+                candidates += currentMatches
+                break
+            }
+            cursor = current.superclass
+        }
+        for (method in candidates) {
+            if (dynamicallyHookedMethods.putIfAbsent(method, true) == null) {
+                try {
+                    XposedHelpers.hookMethod(method, callback)
+                } catch (error: Throwable) {
+                    dynamicallyHookedMethods.remove(method, true)
+                    XposedBridge.logOpenCellIdEvery(
+                        "dynamic-hook:${method.declaringClass.name}.${method.name}:${error.javaClass.name}",
+                        "Dynamic callback hook failed for ${method.declaringClass.name}.${method.name}: ${error.javaClass.simpleName}: ${error.message}",
+                        60_000L
+                    )
+                }
+            }
+        }
+    }
 
     override fun onPackageLoaded(param: XposedModuleInterface.PackageLoadedParam) {
         // Nothing here for now
@@ -316,14 +434,18 @@ class LocationHooker : XposedModule() {
         val classLoader = param.classLoader
         handleLoadPackage(pkg, classLoader)
     }
+
+    override fun onSystemServerStarting(param: XposedModuleInterface.SystemServerStartingParam) {
+        if (!claimProcessHookInstallation("android")) return
+        XposedBridge.log("[LocationSpoofer] Hooking system_server")
+        installProcessHooks(param.classLoader, "android")
+    }
     
     // --- Original Logic ---
 
 
     companion object {
 
-        // 系统进程同样需要覆盖（android进程持有LocationManagerService）
-        val SYSTEM_PACKAGES = setOf("android", "system", "com.android.phone")
         private const val VERBOSE_CELL_BUILD_LOGS = false
         private const val EARTH_RADIUS_METERS = 6378137.0
         private const val DEFAULT_JITTER_RADIUS_METERS = 30.0
@@ -332,36 +454,74 @@ class LocationHooker : XposedModule() {
     }
 
     fun handleLoadPackage(pkg: String, classLoader: ClassLoader) {
-        currentPackageName = pkg
-        
-
         // 宿主App自报平安
         if (pkg == "com.shiraka.locatiobprovid") {
             return // 宿主App不需要注入定位Hook
         }
-
-        // 系统进程：允许执行所有的环境数据Hook，实现系统原生界面的完美覆盖
-        // if (SYSTEM_PACKAGES.contains(pkg)) {
-        //     hookLocationAPIs(classLoader, pkg)
-        //     return
-        // }
-
-
+        // LSPosed keeps a user's previous scope selection across module updates.
+        // Enforce the stable scope in code so an old broad selection cannot keep
+        // injecting radio hooks into unrelated applications.
+        if (pkg !in allowedHookPackages) return
+        if (!claimProcessHookInstallation(pkg)) return
         XposedBridge.log("[LocationSpoofer] Hooking package: $pkg")
         XposedBridge.logOpenCellId("handleLoadPackage pkg=$pkg classLoader=$classLoader")
+        installProcessHooks(classLoader, pkg)
+    }
 
-        // ★ 反检测: 必须在其他Hook之前安装,隐藏Xposed环境
-        hookAntiDetection(classLoader)
+    private fun claimProcessHookInstallation(pkg: String): Boolean {
+        synchronized(processHookLock) {
+            if (processHooksInstalled) {
+                XposedBridge.logEvery(
+                    "processHooksAlreadyInstalled:${android.os.Process.myPid()}",
+                    "[LocationSpoofer] skipping duplicate hook installation for $pkg in pid=${android.os.Process.myPid()} (owner=$currentPackageName)"
+                )
+                return false
+            }
+            processHooksInstalled = true
+            currentPackageName = pkg
+            return true
+        }
+    }
+
+    private fun installProcessHooks(
+        classLoader: ClassLoader,
+        pkg: String
+    ) {
+        // Framework/infrastructure processes must never receive client-side radio or
+        // connectivity hooks. Those hooks cannot rewrite Binder results for unscoped apps,
+        // but they can corrupt the framework's own Wi-Fi/telephony/network decisions.
+        if (pkg == "android" || pkg == "system") {
+            hookSystemLocationProviderPipeline(classLoader, pkg)
+            return
+        }
+
+        // Telephony and NetworkStack are infrastructure rather than consumers. Client-side
+        // TelephonyManager/WifiManager hooks belong in GMS, fused, and explicitly scoped
+        // diagnostic/consumer processes only.
+        if (pkg == "com.android.phone" || pkg == "com.android.networkstack") return
+        if (pkg == "com.google.android.gms" && currentProcessName() !in allowedGmsProcesses) return
 
         hookLocationAPIs(classLoader, pkg)
         hookWifiEnvironment(classLoader)
         hookCellEnvironment(classLoader)
-        hookConnectivityLayer(classLoader)
-        hookBluetoothLE(classLoader)
         hookGnssStatus(classLoader)
         // Magnetic-field sensor rewriting is intentionally not part of the stable pipeline.
         // It can lower compass confidence when the physical sensor calibration disagrees with
         // the calculated geomagnetic model, so keep compass data untouched by default.
+    }
+
+    private fun currentProcessName(): String {
+        return runCatching {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                android.app.Application.getProcessName()
+            } else {
+                Class.forName("android.app.ActivityThread")
+                    .getMethod("currentProcessName")
+                    .invoke(null) as? String
+            }
+        }
+            .getOrNull()
+            .orEmpty()
     }
 
     /**
@@ -482,20 +642,19 @@ class LocationHooker : XposedModule() {
         try {
             val appOpsHook = object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
-                    val config = readConfig() ?: return
-                    if (!config.optBoolean("active", false)) return
-                    
-                    val opArg = param.args[0]
+                    // AppOps is a broad hot API. Reject every unrelated operation before
+                    // consulting even the in-memory spoofing state.
+                    val opArg = param.args.getOrNull(0)
                     val isMockOp = if (opArg is Int) {
                         opArg == 58 // OP_MOCK_LOCATION
                     } else if (opArg is String) {
                         opArg == "android:mock_location"
                     } else false
-
-                    if (isMockOp) {
-                        // MODE_IGNORED = 1, MODE_ERRORED = 2
-                        param.result = 1 // MODE_IGNORED，让对方以为我们没有被授权模拟位置
-                    }
+                    if (!isMockOp) return
+                    val config = readConfig() ?: return
+                    if (!shouldSpoofLocation(config)) return
+                    // MODE_IGNORED = 1, MODE_ERRORED = 2
+                    param.result = 1 // MODE_IGNORED，让对方以为我们没有被授权模拟位置
                 }
             }
             
@@ -510,16 +669,16 @@ class LocationHooker : XposedModule() {
         try {
             val secureHook = object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
+                    // Settings.Secure serves many unrelated settings. Only the two legacy
+                    // mock-location keys are relevant to this anti-detection hook.
+                    val name = param.args.getOrNull(1) as? String ?: return
+                    if (name != "mock_location" && name != "allow_mock_location") return
                     val config = readConfig() ?: return
-                    if (!config.optBoolean("active", false)) return
-                    
-                    val name = param.args[1] as? String
-                    if (name == "mock_location") {
-                        if (param.method?.name == "getInt") {
-                            param.result = 0
-                        } else if (param.method?.name == "getString") {
-                            param.result = "0"
-                        }
+                    if (!shouldSpoofLocation(config)) return
+                    if (param.method?.name == "getInt") {
+                        param.result = 0
+                    } else if (param.method?.name == "getString") {
+                        param.result = "0"
                     }
                 }
             }
@@ -617,101 +776,178 @@ class LocationHooker : XposedModule() {
     private var hookDriftEastMeters = 0.0
     private var hookAccuracyDrift = 0.0
     private var hookLastCallTime = 0L
-    private var cachedJitterAt = 0L
+    private var cachedJitterAtElapsedMs = 0L
     private var cachedJitterBaseLat = Double.NaN
     private var cachedJitterBaseLng = Double.NaN
     private var cachedJitterRadius = DEFAULT_JITTER_RADIUS_METERS
     private var cachedJitterSpeed = "MEDIUM"
+    private var cachedJitterRfCellEnforced = true
     private var cachedJitteredLocation = Pair(0.0, 0.0)
-    private val locationUpdateHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
-    private val activeLocationUpdateRunnables = ConcurrentHashMap<Int, Runnable>()
+    private var lastLoggedJitterSpeed = ""
+    private val systemLocationHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
+    private val systemProviderManagers = ConcurrentHashMap<String, Any>()
+    private val systemInjectorLock = Any()
+    @Volatile
+    private var systemInjectorStarted = false
+    @Volatile
+    private var systemInjectorTick: Runnable? = null
+    private var systemInjectedReportCount = 0L
+    // Active GnssStatus injector timers keyed by callback identity hash
+    private val gnssStatusInjectors = ConcurrentHashMap<Int, java.util.Timer>()
     private var lastSpoofedWallTimeMs = 0L
     private var lastSpoofedElapsedRealtimeNanos = 0L
-    private val locationTimestampCache: MutableMap<Any, SpoofedTimestamps> =
-        Collections.synchronizedMap(WeakHashMap())
-
+    @Volatile
+    private var lastSystemLocationCheckAt = 0L
+    @Volatile
+    private var lastSystemLocationEnabled = false
+    @Volatile
+    private var cachedProcessContext: android.content.Context? = null
     private data class SpoofedTimestamps(
         val wallTimeMs: Long,
         val elapsedRealtimeNanos: Long
+    )
+
+    /** One complete fix. It is created once at the framework pre-filter boundary. */
+    private data class SpoofedLocationSample(
+        val latitude: Double,
+        val longitude: Double,
+        val accuracy: Float,
+        val altitude: Double,
+        val timestamps: SpoofedTimestamps,
+        val provider: String,
+        val hasMotion: Boolean,
+        val speed: Float,
+        val bearing: Float
     )
 
     private fun nextSpoofedTimestamps(): SpoofedTimestamps {
         synchronized(this) {
             val rawWall = System.currentTimeMillis()
             val rawElapsed = android.os.SystemClock.elapsedRealtimeNanos()
-            val wall = if (rawWall > lastSpoofedWallTimeMs) rawWall else lastSpoofedWallTimeMs + 1L
-            val elapsed = if (rawElapsed > lastSpoofedElapsedRealtimeNanos) {
-                rawElapsed
-            } else {
-                lastSpoofedElapsedRealtimeNanos + 1_000_000L
-            }
+            // Never manufacture a timestamp in the future. Equal timestamps are valid for
+            // different providers reported in the same system tick.
+            val wall = maxOf(rawWall, lastSpoofedWallTimeMs)
+            val elapsed = maxOf(rawElapsed, lastSpoofedElapsedRealtimeNanos)
             lastSpoofedWallTimeMs = wall
             lastSpoofedElapsedRealtimeNanos = elapsed
             return SpoofedTimestamps(wall, elapsed)
         }
     }
 
-    private fun timestampsForLocation(loc: Any?): SpoofedTimestamps {
-        if (loc == null) return nextSpoofedTimestamps()
-        locationTimestampCache[loc]?.let { return it }
+    private fun isInfrastructurePackage(pkg: String = currentPackageName): Boolean {
+        return pkg == "android" ||
+            pkg == "system" ||
+            pkg == "com.android.phone" ||
+            pkg == "com.android.location.fused" ||
+            pkg == "com.android.networkstack" ||
+            pkg == "com.android.ons" ||
+            pkg.startsWith("com.google.android.gms")
+    }
 
-        val raw = readRawLocationTimestamps(loc)
-        if (raw != null) {
-            locationTimestampCache[loc] = raw
-            return raw
+    private fun isGnssDiagnosticPackage(pkg: String = currentPackageName): Boolean {
+        return pkg == "make.more.r2d2.cellular_z.play" ||
+            pkg == "com.android.gpstest"
+    }
+
+    private fun shouldActivelyInjectClientGnss(pkg: String = currentPackageName): Boolean {
+        return !isInfrastructurePackage(pkg)
+    }
+
+    @Suppress("UNUSED_PARAMETER")
+    private fun shouldInstallLegacyMapSdkHooks(pkg: String = currentPackageName): Boolean {
+        return false
+    }
+
+    private fun standardLocationCoordinates(config: JSONObject): Pair<Double, Double> {
+        // Android LocationManager, GNSS and GMS all use WGS-84. Per-app GCJ/BD conversion is
+        // only valid at an explicit map-SDK boundary and must never enter system_server.
+        return Pair(
+            config.optDouble("wgs84_lat", config.optDouble("lat", 0.0)),
+            config.optDouble("wgs84_lng", config.optDouble("lng", 0.0))
+        )
+    }
+
+    private fun createLocationSample(
+        config: JSONObject,
+        provider: String,
+        timestamps: SpoofedTimestamps
+    ): SpoofedLocationSample {
+        val enableJitter = config.optBoolean("enable_jitter", true)
+        // Resolve/jitter in the app's stored coordinate domain first, because
+        // EnvironmentCoveragePolicy and the RF database use that same domain.
+        // Only then convert the complete sample to Android's WGS-84 contract.
+        val appBase = Pair(
+            config.optDouble("lat", 0.0),
+            config.optDouble("lng", 0.0)
+        )
+        val jitteredApp = getJitteredLocation(appBase.first, appBase.second)
+        val jittered = gcj02ToWgs84(jitteredApp.first, jitteredApp.second)
+        val baseAltitude = config.optDouble("altitude", 0.0)
+        val altitude = if (enableJitter && baseAltitude > 0.0) {
+            baseAltitude + (rng.nextDouble() - 0.5)
+        } else {
+            baseAltitude
         }
-
-        val generated = nextSpoofedTimestamps()
-        locationTimestampCache[loc] = generated
-        return generated
-    }
-
-    private fun rememberLocationTimestamps(loc: Any, timestamps: SpoofedTimestamps) {
-        locationTimestampCache[loc] = timestamps
-    }
-
-    private fun readRawLocationTimestamps(loc: Any): SpoofedTimestamps? {
-        val elapsed = readLongFieldOrNull(loc, "mElapsedRealtimeNs")
-            ?: readLongFieldOrNull(loc, "mElapsedRealtimeNanos")
-            ?: readLongFieldOrNull(loc, "elapsedRealtimeNanos")
-        if (elapsed == null || elapsed <= 0L) return null
-
-        val wall = readLongFieldOrNull(loc, "mTimeMs")
-            ?: readLongFieldOrNull(loc, "mTime")
-            ?: readLongFieldOrNull(loc, "time")
-            ?: System.currentTimeMillis()
-        return SpoofedTimestamps(wall, elapsed)
-    }
-
-    private fun readLongFieldOrNull(obj: Any, fieldName: String): Long? {
-        return try {
-            (XposedHelpers.getObjectField(obj, fieldName) as? Number)?.toLong()
-        } catch (_: Throwable) {
-            null
-        }
+        val hasMotion = hasSpoofedMotion(config)
+        return SpoofedLocationSample(
+            latitude = jittered.first,
+            longitude = jittered.second,
+            accuracy = if (enableJitter) getJitteredAccuracy() else 8f,
+            altitude = altitude,
+            timestamps = timestamps,
+            provider = provider,
+            hasMotion = hasMotion,
+            speed = if (hasMotion) spoofedSpeed(config) else 0f,
+            bearing = if (hasMotion) spoofedBearing(config) else 0f
+        )
     }
 
     private fun getJitteredLocation(baseLat: Double, baseLng: Double): Pair<Double, Double> {
         val enableJitter = lastConfig?.optBoolean("enable_jitter", true) ?: true
-        if (!enableJitter) return Pair(baseLat, baseLng)
+        if (!enableJitter) {
+            // Park every OU component while jitter is disabled. Keeping the old drift would
+            // make the first fix after re-enabling jump back toward a previous random point.
+            hookDriftNorthMeters = 0.0
+            hookDriftEastMeters = 0.0
+            hookAccuracyDrift = 0.0
+            hookLastCallTime = 0L
+            cachedJitterAtElapsedMs = 0L
+            cachedJitterBaseLat = baseLat
+            cachedJitterBaseLng = baseLng
+            cachedJitterRfCellEnforced = shouldConstrainJitterToRfCell()
+            cachedJitteredLocation = Pair(baseLat, baseLng)
+            return cachedJitteredLocation
+        }
         val jitterRadius = jitterRadiusMeters()
         val profile = jitterProfile()
+        val enforceRfCell = shouldConstrainJitterToRfCell()
+        if (lastLoggedJitterSpeed != profile.speedName) {
+            lastLoggedJitterSpeed = profile.speedName
+            XposedBridge.log(
+                "[LocationSpoofer] jitter profile=${profile.speedName} " +
+                    "hold=${profile.sampleIntervalMs}ms timeScale=${profile.timeScale}"
+            )
+        }
 
-        val now = System.currentTimeMillis()
+        val now = android.os.SystemClock.elapsedRealtime()
         if (
-            now - cachedJitterAt < profile.sampleIntervalMs &&
+            now - cachedJitterAtElapsedMs < profile.sampleIntervalMs &&
             cachedJitterBaseLat == baseLat &&
             cachedJitterBaseLng == baseLng &&
             cachedJitterRadius == jitterRadius &&
-            cachedJitterSpeed == profile.speedName
+            cachedJitterSpeed == profile.speedName &&
+            cachedJitterRfCellEnforced == enforceRfCell
         ) {
             return cachedJitteredLocation
         }
 
-        val dt = if (hookLastCallTime > 0) {
+        val realDt = if (hookLastCallTime > 0) {
             ((now - hookLastCallTime) / 1000.0).coerceIn(0.01, 5.0)
         } else 1.0
         hookLastCallTime = now
+        // Scaling both diffusion and mean reversion changes travel speed while preserving the
+        // same long-run spatial envelope for every speed profile.
+        val dt = (realDt * profile.timeScale).coerceIn(0.01, 5.0)
 
         val sigma = jitterRadius / profile.sigmaDivisor
         val alpha = profile.pullback
@@ -728,17 +964,67 @@ class LocationHooker : XposedModule() {
 
         val latRad = Math.toRadians(baseLat)
         val lngCos = cos(latRad).let { if (abs(it) < 1e-6) 1e-6 else it }
-        val jittered = Pair(
-            baseLat + Math.toDegrees(hookDriftNorthMeters / EARTH_RADIUS_METERS),
-            baseLng + Math.toDegrees(hookDriftEastMeters / (EARTH_RADIUS_METERS * lngCos))
-        )
-        cachedJitterAt = now
+        val jittered = constrainJitterToCoverageCell(baseLat, baseLng, lngCos, enforceRfCell)
+        cachedJitterAtElapsedMs = now
         cachedJitterBaseLat = baseLat
         cachedJitterBaseLng = baseLng
         cachedJitterRadius = jitterRadius
         cachedJitterSpeed = profile.speedName
+        cachedJitterRfCellEnforced = enforceRfCell
         cachedJitteredLocation = jittered
         return jittered
+    }
+
+    /**
+     * RF payloads are tagged to the base coordinate's fixed hex. When any RF
+     * switch is enabled, keep the final OU sample inside that exact cell so a
+     * delivered coordinate can never be paired with a neighbouring-cell payload.
+     */
+    private fun constrainJitterToCoverageCell(
+        baseLat: Double,
+        baseLng: Double,
+        longitudeCosine: Double,
+        enforceCell: Boolean
+    ): Pair<Double, Double> {
+        fun pointAt(scale: Double): Pair<Double, Double> = Pair(
+            baseLat + Math.toDegrees(hookDriftNorthMeters * scale / EARTH_RADIUS_METERS),
+            EnvironmentCoveragePolicy.normalizeLongitude(
+                baseLng + Math.toDegrees(
+                    hookDriftEastMeters * scale / (EARTH_RADIUS_METERS * longitudeCosine)
+                )
+            )
+        )
+
+        val candidate = pointAt(1.0)
+        if (!enforceCell) return candidate
+        val baseCell = EnvironmentCoveragePolicy.cellFor(baseLat, baseLng) ?: return candidate
+        if (EnvironmentCoveragePolicy.cellFor(candidate.first, candidate.second) == baseCell) {
+            return candidate
+        }
+
+        var inside = 0.0
+        var outside = 1.0
+        repeat(28) {
+            val middle = (inside + outside) / 2.0
+            val point = pointAt(middle)
+            if (EnvironmentCoveragePolicy.cellFor(point.first, point.second) == baseCell) {
+                inside = middle
+            } else {
+                outside = middle
+            }
+        }
+        // Stay a tiny distance inside the edge to avoid alternating cells from
+        // floating-point rounding, then feed the bounded state back into the OU process.
+        val safeScale = (inside * 0.999_999).coerceIn(0.0, 1.0)
+        hookDriftNorthMeters *= safeScale
+        hookDriftEastMeters *= safeScale
+        return pointAt(1.0)
+    }
+
+    private fun shouldConstrainJitterToRfCell(): Boolean {
+        val config = lastConfig
+        return config?.optBoolean("mock_wifi", false) == true ||
+            config?.optBoolean("mock_cell", false) == true
     }
 
     private fun getJitteredAccuracy(): Float {
@@ -757,241 +1043,33 @@ class LocationHooker : XposedModule() {
         val speedName: String,
         val sampleIntervalMs: Long,
         val sigmaDivisor: Double,
-        val pullback: Double
+        val pullback: Double,
+        val timeScale: Double
     )
 
     private fun jitterProfile(): JitterProfile {
         val speed = lastConfig?.optString("jitter_speed", "MEDIUM")?.uppercase() ?: "MEDIUM"
         return when (speed) {
-            "SLOW" -> JitterProfile("SLOW", 2_500L, 55.0, 0.08)
-            "FAST" -> JitterProfile("FAST", 800L, 30.0, 0.12)
-            else -> JitterProfile("MEDIUM", 1_500L, 42.0, 0.10)
+            // Framework reports stay fresh at 1 Hz. The profile controls how often the
+            // coordinate sample advances and how far its OU clock advances, so the three
+            // choices remain visibly distinct without changing timestamps/provider cadence.
+            "SLOW" -> JitterProfile("SLOW", 2_800L, 6.7, 0.10, 0.12)
+            "FAST" -> JitterProfile("FAST", 800L, 6.7, 0.10, 2.50)
+            else -> JitterProfile("MEDIUM", 1_500L, 6.7, 0.10, 0.65)
         }
     }
 
 
     private fun hookLocationAPIs(classLoader: ClassLoader, currentPkg: String) {
         try {
-            // android.location.Location 标准接口: 返回GCJ-02坐标
-            //
-            // 关键决策 -- 为何不返回WGS-84:
-            // 在中国大陆,系统GPS HAL层已内置GCJ-02强制加偏(国家测绘法规要求)。
-            // 因此android.location.Location.getLatitude()在中国设备上实际返回的是GCJ-02坐标,
-            // 而非API文档声称的WGS-84。所有中国地图App(高德/腾讯/百度)都基于这一事实编写:
-            // 它们从Location拿到坐标后不会再做WGS-84到GCJ-02的转换,而是直接使用。
-            //
-            // 如果我们返回真正的WGS-84,App会把它当GCJ-02直接传给地图SDK渲染,
-            // 由于WGS-84与GCJ-02之间存在约300-500米的非线性偏移,地图上会出现固定偏移。
-            // 这正是之前微信和学习通出现定位偏移的根本原因。
-            val getLatHook = object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
-                        val appSystems = config.optJSONObject("app_coordinate_systems")
-                        val basePkg = currentPkg.substringBefore(":")
-                        // optString 在 key 不存在时返回 ""（空字符串），不是 null！
-                        // 必须用 has() 先检查，否则会错误匹配到空字符串分支
-                        val targetSys = if (appSystems?.has(basePkg) == true) {
-                            appSystems.optString(basePkg, "GCJ-02")
-                        } else {
-                            "GCJ-02"
-                        }
-                        val baseLat = when (targetSys) {
-                            "WGS-84" -> config.optDouble("wgs84_lat", param.result as Double)
-                            "BD-09" -> config.optDouble("bd09_lat", param.result as Double)
-                            else -> config.optDouble("lat", param.result as Double)
-                        }
-                        val baseLng = when (targetSys) {
-                            "WGS-84" -> config.optDouble("wgs84_lng", 0.0)
-                            "BD-09" -> config.optDouble("bd09_lng", 0.0)
-                            else -> config.optDouble("lng", 0.0)
-                        }
-                        param.result = getJitteredLocation(baseLat, baseLng).first
-                    }
-                }
-            }
-
-            val getLngHook = object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
-                        val appSystems = config.optJSONObject("app_coordinate_systems")
-                        val basePkg = currentPkg.substringBefore(":")
-                        // optString 在 key 不存在时返回 ""（空字符串），不是 null！
-                        val targetSys = if (appSystems?.has(basePkg) == true) {
-                            appSystems.optString(basePkg, "GCJ-02")
-                        } else {
-                            "GCJ-02"
-                        }
-                        val baseLat = when (targetSys) {
-                            "WGS-84" -> config.optDouble("wgs84_lat", 0.0)
-                            "BD-09" -> config.optDouble("bd09_lat", 0.0)
-                            else -> config.optDouble("lat", 0.0)
-                        }
-                        val baseLng = when (targetSys) {
-                            "WGS-84" -> config.optDouble("wgs84_lng", param.result as Double)
-                            "BD-09" -> config.optDouble("bd09_lng", param.result as Double)
-                            else -> config.optDouble("lng", param.result as Double)
-                        }
-                        param.result = getJitteredLocation(baseLat, baseLng).second
-                    }
-                }
-            }
-
-            val getAccHook = object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
-                        param.result = getJitteredAccuracy()
-                    }
-                }
-            }
-
-            val getAltHook = object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
-                        val baseAlt = config.optDouble("altitude", 0.0)
-                        val enableJitter = config.optBoolean("enable_jitter", true)
-                        param.result = if (enableJitter && baseAlt > 0.0) {
-                            // 稍微抖动海拔，真实气压计存在起伏，±0.5米
-                            baseAlt + (rng.nextDouble() - 0.5)
-                        } else {
-                            baseAlt
-                        }
-                    }
-                }
-            }
-
-            val freshWallTimeHook = object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
-                        param.result = timestampsForLocation(param.thisObject).wallTimeMs
-                    }
-                }
-            }
-
-            val freshElapsedRealtimeNanosHook = object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
-                        param.result = timestampsForLocation(param.thisObject).elapsedRealtimeNanos
-                    }
-                }
-            }
-
-            val freshElapsedRealtimeMillisHook = object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
-                        param.result = timestampsForLocation(param.thisObject).elapsedRealtimeNanos / 1_000_000L
-                    }
-                }
-            }
-
-            val freshElapsedRealtimeAgeHook = object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
-                        param.result = 0L
-                    }
-                }
-            }
-
-            val outboundParcelHook = object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val loc = param.thisObject ?: return
-                    val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
-                        applySpoofedLocationToObject(loc, config)
-                    }
-                }
-            }
-
-            XposedHelpers.findAndHookMethod(
-                "android.location.Location",
-                classLoader,
-                "getLatitude",
-                getLatHook
-            )
-            XposedHelpers.findAndHookMethod(
-                "android.location.Location",
-                classLoader,
-                "getLongitude",
-                getLngHook
-            )
-            XposedHelpers.findAndHookMethod(
-                "android.location.Location",
-                classLoader,
-                "getAccuracy",
-                getAccHook
-            )
-            XposedHelpers.findAndHookMethod(
-                "android.location.Location",
-                classLoader,
-                "getAltitude",
-                getAltHook
-            )
-            XposedHelpers.findAndHookMethod(
-                "android.location.Location",
-                classLoader,
-                "getTime",
-                freshWallTimeHook
-            )
-            XposedHelpers.findAndHookMethod(
-                "android.location.Location",
-                classLoader,
-                "getElapsedRealtimeNanos",
-                freshElapsedRealtimeNanosHook
-            )
-            try {
-                XposedHelpers.findAndHookMethod(
-                    "android.location.Location",
-                    classLoader,
-                    "getElapsedRealtimeMillis",
-                    freshElapsedRealtimeMillisHook
-                )
-            } catch (_: Throwable) {
-            }
-            try {
-                XposedHelpers.findAndHookMethod(
-                    "android.location.Location",
-                    classLoader,
-                    "getElapsedRealtimeAgeMillis",
-                    freshElapsedRealtimeAgeHook
-                )
-            } catch (_: Throwable) {
-            }
-            try {
-                XposedHelpers.findAndHookMethod(
-                    "android.location.Location",
-                    classLoader,
-                    "writeToParcel",
-                    android.os.Parcel::class.java,
-                    Int::class.javaPrimitiveType!!,
-                    outboundParcelHook
-                )
-                XposedBridge.log("[LocationSpoofer] Location.writeToParcel outbound hook installed")
-            } catch (e: Throwable) {
-                XposedBridge.log("[LocationSpoofer] Location.writeToParcel hook failed: $e")
-            }
-            try {
-                XposedHelpers.findAndHookMethod(
-                    "android.location.Location",
-                    classLoader,
-                    "getElapsedRealtimeAgeMillis",
-                    Long::class.javaPrimitiveType,
-                    freshElapsedRealtimeAgeHook
-                )
-            } catch (_: Throwable) {
-            }
-
+            hookSystemLocationProviderPipeline(classLoader, currentPkg)
+            // Standard Location values are written once in system_server before framework
+            // cache/filter/delivery. Public getters and Parcel are deliberately left untouched.
             // ★ 核心反检测：抹除 isFromMockProvider 标志位（strategy:100 的根本来源）
             val antiMockHook = object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
+                    if (shouldSpoofLocation(config)) {
                         param.result = false
                     }
                 }
@@ -1014,75 +1092,50 @@ class LocationHooker : XposedModule() {
             } catch (e: Throwable) { /* API < 31 没有此方法 */
             }
 
-            // ★ Android 13 专项：直接对 Location 对象的 mMock / mIsFromMockProvider 字段写 false
-            // (Android 12+ 字段名改为 mMock，Android 6-11 为 mIsFromMockProvider)
-            val fieldCleanHook = object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
-                        val loc = param.thisObject ?: return
-                        try {
-                            XposedHelpers.setBooleanField(loc, "mMock", false)
-                        } catch (e: Throwable) {
-                        }
-                        try {
-                            XposedHelpers.setBooleanField(loc, "mIsFromMockProvider", false)
-                        } catch (e: Throwable) {
-                        }
-                        // 清理 extras bundle 中可能残留的 mock 标记
-                        try {
-                            val extras =
-                                XposedHelpers.callMethod(loc, "getExtras") as? android.os.Bundle
-                            extras?.remove("mockLocation")
-                            extras?.remove("isMock")
-                            // ★ Add fake satellites count to bundle
-                            val satCount = config.optInt("satellite_count", 10)
-                            if (extras == null) {
-                                val newBundle = android.os.Bundle()
-                                newBundle.putInt("satellites", satCount)
-                                XposedHelpers.setObjectField(loc, "mExtras", newBundle)
-                            } else {
-                                extras.putInt("satellites", satCount)
-                            }
-                        } catch (e: Throwable) {
-                        }
+            // Some clients inspect the legacy secure setting directly. Keep this narrow:
+            // unrelated Settings.Secure traffic must never touch the config cache.
+            try {
+                val mockLocationSettingHook = object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val key = param.args.getOrNull(1) as? String ?: return
+                        if (key != "mock_location" && key != "allow_mock_location") return
+                        val config = readConfig() ?: return
+                        if (!shouldSpoofLocation(config)) return
+                        param.result = if (param.method?.name == "getString") "0" else 0
                     }
                 }
-            }
-            // 在 getLatitude/getLongitude/getAccuracy 时同步清字段，确保在实际读值前已抹除
-            XposedHelpers.findAndHookMethod(
-                "android.location.Location",
-                classLoader,
-                "getLatitude",
-                fieldCleanHook
-            )
-            XposedHelpers.findAndHookMethod(
-                "android.location.Location",
-                classLoader,
-                "getLongitude",
-                fieldCleanHook
-            )
-
-            // ★ 拦截 Settings.Secure.getInt("mock_location") — 部分ROM通过这个判断是否开了开发者模式模拟位置
-            try {
-                XposedHelpers.findAndHookMethod(
+                val secureClass = XposedHelpers.findClass(
                     "android.provider.Settings\$Secure",
-                    classLoader,
-                    "getInt",
-                    android.content.ContentResolver::class.java,
-                    String::class.java,
-                    object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            val config = readConfig()
-                            if (config != null && config.optBoolean("active", false)) {
-                                val key = param.args[1] as? String ?: return
-                                if (key == "mock_location" || key == "allow_mock_location") {
-                                    param.result = 0 // 0 = 关闭模拟位置（欺骗系统认为我们没开）
-                                }
-                            }
-                        }
-                    }
+                    classLoader
                 )
+                runCatching {
+                    XposedHelpers.findAndHookMethod(
+                        secureClass,
+                        "getInt",
+                        android.content.ContentResolver::class.java,
+                        String::class.java,
+                        mockLocationSettingHook
+                    )
+                }
+                runCatching {
+                    XposedHelpers.findAndHookMethod(
+                        secureClass,
+                        "getInt",
+                        android.content.ContentResolver::class.java,
+                        String::class.java,
+                        Int::class.javaPrimitiveType,
+                        mockLocationSettingHook
+                    )
+                }
+                runCatching {
+                    XposedHelpers.findAndHookMethod(
+                        secureClass,
+                        "getString",
+                        android.content.ContentResolver::class.java,
+                        String::class.java,
+                        mockLocationSettingHook
+                    )
+                }
             } catch (e: Throwable) {
                 XposedBridge.log(e)
             }
@@ -1093,7 +1146,7 @@ class LocationHooker : XposedModule() {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val config = readConfig()
-                        if (config != null && config.optBoolean("active", false)) {
+                        if (shouldDeliverLocation(config)) {
                             val provider = param.result as? String ?: return
                             if (provider.contains("mock", ignoreCase = true) ||
                                 provider.contains("test", ignoreCase = true) ||
@@ -1109,7 +1162,7 @@ class LocationHooker : XposedModule() {
             val providerListHook = object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
+                    if (shouldSpoofLocation(config)) {
                         @Suppress("UNCHECKED_CAST")
                         val list = param.result as? MutableList<String> ?: return
                         val cleaned = list.filterNot {
@@ -1136,91 +1189,20 @@ class LocationHooker : XposedModule() {
                 XposedBridge.log(e)
             }
 
-            try {
-                val locationManagerClass = XposedHelpers.findClass("android.location.LocationManager", classLoader)
-                XposedHelpers.findAndHookMethod(
-                    locationManagerClass,
-                    "isLocationEnabled",
-                    object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            val config = readConfig()
-                            if (config != null && config.optBoolean("active", false)) {
-                                param.result = true
-                            }
-                        }
-                    }
-                )
-                XposedHelpers.findAndHookMethod(
-                    locationManagerClass,
-                    "isProviderEnabled",
-                    String::class.java,
-                    object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            val config = readConfig()
-                            if (config != null && config.optBoolean("active", false)) {
-                                val provider = param.args.getOrNull(0) as? String
-                                if (provider == android.location.LocationManager.GPS_PROVIDER ||
-                                    provider == android.location.LocationManager.NETWORK_PROVIDER ||
-                                    provider == "fused"
-                                ) {
-                                    param.result = true
-                                }
-                            }
-                        }
-                    }
-                )
-                XposedHelpers.findAndHookMethod(
-                    locationManagerClass,
-                    "getLastKnownLocation",
-                    String::class.java,
-                    object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            val config = readConfig()
-                            if (config != null && config.optBoolean("active", false)) {
-                                param.result = buildSpoofedAndroidLocation(config)
-                            }
-                        }
-                    }
-                )
-
-                val singleLocationHook = object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig()
-                        if (config == null || !config.optBoolean("active", false)) return
-                        deliverLocationOnce(param.args, config)
-                        param.result = null
-                    }
-                }
-                val continuousLocationHook = object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig()
-                        if (config == null || !config.optBoolean("active", false)) return
-                        deliverLocationOnce(param.args, config)
-                        startContinuousLocationUpdates(param.args)
-                        param.result = null
-                    }
-                }
-                val removeUpdatesHook = object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        stopContinuousLocationUpdates(param.args)
-                        param.result = null
-                    }
-                }
-                XposedBridge.hookAllMethods(locationManagerClass, "requestLocationUpdates", continuousLocationHook)
-                XposedBridge.hookAllMethods(locationManagerClass, "requestSingleUpdate", singleLocationHook)
-                XposedBridge.hookAllMethods(locationManagerClass, "getCurrentLocation", singleLocationHook)
-                XposedBridge.hookAllMethods(locationManagerClass, "removeUpdates", removeUpdatesHook)
-            } catch (e: Throwable) {
-                XposedBridge.log("[LocationSpoofer] LocationManager active provider hook failed: $e")
-            }
+            // Never intercept or fulfil LocationManager requests in a client process. The
+            // original registration must reach system_server so provider demand, permissions,
+            // cancellation and normal Binder delivery all remain authoritative.
 
             // ★ NMEA-0183 报文劫持
             try {
                 val addNmeaListenerHook = object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        // 强制启动代理注入，无论当前active是true还是false。
-                        // 真正的状态校验在代理注入器的Timer中进行。
-                        
+                        // An inactive/off registration must reach Android byte-for-byte. A
+                        // listener registered before a later start remains real until the app
+                        // registers it again; this avoids a permanent per-sentence proxy cost
+                        // while simulation is idle.
+                        if (!shouldDeliverLocation(readConfig())) return
+
                         val args = param.args
                         for (i in args.indices) {
                             val arg = args[i] ?: continue
@@ -1240,12 +1222,20 @@ class LocationHooker : XposedModule() {
                             } catch (e: Exception) {
                                 false
                             }
-                            
+
                             if (isOnNmea) {
-                                XposedBridge.log("[GPS_Spoofer] Detected addNmeaListener(OnNmeaMessageListener)! Starting active injector.")
+                                XposedBridge.logEvery(
+                                    "nmea-listener-proxy:on-message",
+                                    "[GPS_Spoofer] active OnNmeaMessageListener proxy installed",
+                                    60_000L
+                                )
                                 args[i] = createOnNmeaMessageListenerProxy(arg, classLoader)
                             } else if (isGpsNmea) {
-                                XposedBridge.log("[GPS_Spoofer] Detected addNmeaListener(GpsStatus.NmeaListener)! Starting active injector.")
+                                XposedBridge.logEvery(
+                                    "nmea-listener-proxy:legacy",
+                                    "[GPS_Spoofer] active legacy NMEA listener proxy installed",
+                                    60_000L
+                                )
                                 args[i] = createGpsStatusNmeaListenerProxy(arg, classLoader)
                             }
                         }
@@ -1257,16 +1247,36 @@ class LocationHooker : XposedModule() {
                 // Hook removeNmeaListener
                 XposedBridge.hookAllMethods(locationManagerClazz, "removeNmeaListener", object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        for (arg in param.args) {
+                        for (i in param.args.indices) {
+                            val arg = param.args[i]
                             if (arg != null) {
-                                nmeaTimers.remove(arg)?.cancel()
-                                XposedBridge.log("[GPS_Spoofer] removeNmeaListener called, canceled timer.")
+                                val timer = nmeaTimers.remove(arg)
+                                timer?.cancel()
+                                val proxy = nmeaListenerProxies.remove(arg)
+                                if (proxy != null) {
+                                    param.args[i] = proxy
+                                }
+                                if (timer != null || proxy != null) {
+                                    XposedBridge.logEvery(
+                                        "nmea-listener-proxy:removed",
+                                        "[GPS_Spoofer] NMEA listener proxy removed",
+                                        60_000L
+                                    )
+                                }
                             }
                         }
                     }
                 })
             } catch (e: Throwable) {
                 XposedBridge.log(e)
+            }
+
+            if (!shouldInstallLegacyMapSdkHooks(currentPkg)) {
+                XposedBridge.logEvery(
+                    "legacyMapSdkHooksSkipped:$currentPkg",
+                    "[LocationSpoofer] legacy AMap/Tencent/Baidu SDK hooks disabled for $currentPkg; using system/GMS location pipeline"
+                )
+                return
             }
 
             // ── 高德SDK专属Hook(含抖动,与原生Location保持同步) ──
@@ -1284,8 +1294,8 @@ class LocationHooker : XposedModule() {
                 // AMap SDK 专属 Hook（含抖动，与原生Location保持同步）
                 val amapHook = object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        val config = readConfig()
-                        if (config != null && config.optBoolean("active", false)) {
+                        val config = readConfig() ?: return
+                        if (shouldDeliverLocation(config)) {
                             val baseLat = config.optDouble("lat", 0.0)
                             val baseLng = config.optDouble("lng", 0.0)
                             val jittered = getJitteredLocation(baseLat, baseLng)
@@ -1306,7 +1316,7 @@ class LocationHooker : XposedModule() {
                 val amapNullHook = object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val config = readConfig()
-                        if (config != null && config.optBoolean("active", false)) {
+                        if (shouldSpoofLocation(config)) {
                             param.result = null
                         }
                     }
@@ -1314,7 +1324,7 @@ class LocationHooker : XposedModule() {
                 val amapFalseHook = object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val config = readConfig()
-                        if (config != null && config.optBoolean("active", false)) {
+                        if (shouldSpoofLocation(config)) {
                             param.result = false
                         }
                     }
@@ -1322,7 +1332,7 @@ class LocationHooker : XposedModule() {
                 val amapZeroHook = object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val config = readConfig()
-                        if (config != null && config.optBoolean("active", false)) {
+                        if (shouldSpoofLocation(config)) {
                             param.result = 0
                         }
                     }
@@ -1344,7 +1354,7 @@ class LocationHooker : XposedModule() {
                         object : XC_MethodHook() {
                             override fun afterHookedMethod(param: MethodHookParam) {
                                 val config = readConfig()
-                                if (config != null && config.optBoolean("active", false)) {
+                                if (shouldDeliverLocation(config)) {
                                     val originalLocationType = param.result as? Int ?: 1
                                     // 高德地图SDK中：1代表GPS定位，5代表Wifi网络定位，6代表基站网络定位，12代表系统网络定位
                                     // 为了防止反作弊SDK检测到在室内（无卫星）却返回GPS定位的异常情况，
@@ -1363,7 +1373,7 @@ class LocationHooker : XposedModule() {
                         object : XC_MethodHook() {
                             override fun afterHookedMethod(param: MethodHookParam) {
                                 val config = readConfig()
-                                if (config != null && config.optBoolean("active", false)) {
+                                if (shouldDeliverLocation(config)) {
                                     val originalProvider = param.result as? String ?: "gps"
                                     // 同样为了真实性，如果原始提供者是网络（network）相关的，则保留原样
                                     if (originalProvider == "network" || originalProvider.contains("wifi", ignoreCase = true)) {
@@ -1378,7 +1388,7 @@ class LocationHooker : XposedModule() {
                     val setFieldHook = object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
                             val config = readConfig()
-                            if (config != null && config.optBoolean("active", false)) {
+                            if (shouldSpoofLocation(config)) {
                                 val obj = param.thisObject ?: return
                                 try { XposedHelpers.setObjectField(obj, "mockData", null) } catch (e: Throwable) {}
                                 try { XposedHelpers.setIntField(obj, "mockFlag", 0) } catch (e: Throwable) {}
@@ -1415,7 +1425,7 @@ class LocationHooker : XposedModule() {
                             object : XC_MethodHook() {
                                 override fun beforeHookedMethod(param: MethodHookParam) {
                                     val config = readConfig()
-                                    if (config != null && config.optBoolean("active", false)) {
+                                    if (shouldDeliverLocation(config)) {
                                         // 强制设为 true，让高德自己相信当前位置是真实的
                                         param.args[0] = true
                                     }
@@ -1433,8 +1443,10 @@ class LocationHooker : XposedModule() {
         }
 
         // ── 第三方地图SDK深度Hook(腾讯/百度) ──
-        hookTencentSDK(classLoader)
-        hookBaiduSDK(classLoader)
+        if (shouldInstallLegacyMapSdkHooks(currentPkg)) {
+            hookTencentSDK(classLoader)
+            hookBaiduSDK(classLoader)
+        }
     }
 
     /**
@@ -1504,8 +1516,8 @@ class LocationHooker : XposedModule() {
     private fun hookTencentLocationClass(clazz: Class<*>) {
         val coordHook = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
-                val config = readConfig()
-                if (config != null && config.optBoolean("active", false)) {
+                val config = readConfig() ?: return
+                if (shouldDeliverLocation(config)) {
                     val baseLat = config.optDouble("lat", 0.0)
                     val baseLng = config.optDouble("lng", 0.0)
                     val jittered = getJitteredLocation(baseLat, baseLng)
@@ -1531,7 +1543,7 @@ class LocationHooker : XposedModule() {
             XposedBridge.hookAllMethods(clazz, "getProvider", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
+                    if (shouldDeliverLocation(config)) {
                         val originalProvider = param.result as? String ?: "gps"
                         // 腾讯地图SDK的定位提供者通常也是"gps"或者"network"
                         if (originalProvider == "network" || originalProvider.contains("wifi", ignoreCase = true)) {
@@ -1549,7 +1561,7 @@ class LocationHooker : XposedModule() {
             XposedBridge.hookAllMethods(clazz, "getAccuracy", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
+                    if (shouldDeliverLocation(config)) {
                         param.result = getJitteredAccuracy()
                     }
                 }
@@ -1561,7 +1573,7 @@ class LocationHooker : XposedModule() {
             XposedBridge.hookAllMethods(clazz, "isMockGps", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
+                    if (shouldSpoofLocation(config)) {
                         param.result = 0
                     }
                 }
@@ -1589,8 +1601,8 @@ class LocationHooker : XposedModule() {
                 listenerClass, "onLocationChanged",
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig()
-                        if (config == null || !config.optBoolean("active", false)) return
+                        val config = readConfig() ?: return
+                        if (!shouldDeliverLocation(config)) return
                         if (param.args.isEmpty()) return
 
                         val tencentLoc = param.args[0] ?: return
@@ -1650,8 +1662,8 @@ class LocationHooker : XposedModule() {
         // ── 方案1: 直接Hook BDLocation的Getter方法 ──
         val baiduCoordHook = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
-                val config = readConfig()
-                if (config != null && config.optBoolean("active", false)) {
+                val config = readConfig() ?: return
+                if (shouldDeliverLocation(config)) {
                     // 动态获取当前BDLocation期望的坐标系(App可通过LocationClientOption.setCoorType设置)
                     val coorType = try {
                         XposedHelpers.callMethod(param.thisObject!!, "getCoorType") as? String
@@ -1693,7 +1705,7 @@ class LocationHooker : XposedModule() {
             XposedBridge.hookAllMethods(baiduClazz, "getLocType", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val config = readConfig()
-                    if (config != null && config.optBoolean("active", false)) {
+                    if (shouldDeliverLocation(config)) {
                         val originalLocationType = param.result as? Int ?: 61
                         // 百度地图SDK中：61代表GPS定位结果，161代表网络定位结果，601代表某些特殊或离线网络定位结果
                         // 为了避免在室内环境（如没有GPS信号）强行返回61导致应用侧判定为作弊，
@@ -1712,7 +1724,7 @@ class LocationHooker : XposedModule() {
                 XposedBridge.hookAllMethods(baiduClazz, "getRadius", object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val config = readConfig()
-                        if (config != null && config.optBoolean("active", false)) {
+                        if (shouldDeliverLocation(config)) {
                             param.result = getJitteredAccuracy()
                         }
                     }
@@ -1724,7 +1736,7 @@ class LocationHooker : XposedModule() {
                 XposedBridge.hookAllMethods(baiduClazz, "getMockGps", object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val config = readConfig()
-                        if (config != null && config.optBoolean("active", false)) {
+                        if (shouldDeliverLocation(config)) {
                             param.result = 0
                         }
                     }
@@ -1736,7 +1748,7 @@ class LocationHooker : XposedModule() {
                 XposedBridge.hookAllMethods(baiduClazz, "getSatelliteNumber", object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val config = readConfig()
-                        if (config != null && config.optBoolean("active", false)) {
+                        if (shouldDeliverLocation(config)) {
                             param.result = 12 + rng.nextInt(7)
                         }
                     }
@@ -1762,7 +1774,7 @@ class LocationHooker : XposedModule() {
                     object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
                             val config = readConfig() ?: return
-                            if (!config.optBoolean("active", false)) return
+                            if (!shouldDeliverLocation(config)) return
                             if (param.args.isEmpty()) return
 
                             val bdLoc = param.args[0] ?: return
@@ -1818,6 +1830,25 @@ class LocationHooker : XposedModule() {
     // ══════════════════════════════════════════════════════════════════════════
     private fun selectSpoofedWifi(wifiObj: JSONObject?): JSONObject? {
         if (wifiObj != null) {
+            val mode = lastConfig?.optString("wifi_connection_mode", "FIXED") ?: "FIXED"
+            if (mode == "RANDOM") {
+                val candidates = ArrayList<JSONObject>()
+                val connected = wifiObj.optJSONObject("connectedWifi")
+                if (isUsableWifiObject(connected)) candidates.add(connected!!)
+                val nearbyArray = wifiObj.optJSONArray("nearbyWifi")
+                if (nearbyArray != null) {
+                    for (i in 0 until nearbyArray.length()) {
+                        val candidate = nearbyArray.optJSONObject(i)
+                        if (isUsableWifiObject(candidate)) candidates.add(candidate!!)
+                    }
+                }
+                if (candidates.isNotEmpty()) {
+                    val seed = lastConfig?.optLong("start_timestamp", 0L)?.takeIf { it > 0L }
+                        ?: lastConfig?.optLong("config_updated_at", 0L)
+                        ?: System.currentTimeMillis()
+                    return candidates[Math.floorMod(seed.toInt(), candidates.size)]
+                }
+            }
             val connected = wifiObj.optJSONObject("connectedWifi")
             if (isUsableWifiObject(connected)) return connected
             val nearbyArray = wifiObj.optJSONArray("nearbyWifi")
@@ -1938,7 +1969,7 @@ class LocationHooker : XposedModule() {
         val wifiInfoHook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val config = readConfig() ?: return
-                if (!config.optBoolean("active", false)) return
+                if (!shouldMockWifi(config)) return
                 val mockWifi = config.optBoolean("mock_wifi", true)
                 val wifiObj = if (mockWifi) config.optJSONObject("wifi_json") else null
                 val connectedWifi = selectSpoofedWifi(wifiObj)
@@ -1987,7 +2018,7 @@ class LocationHooker : XposedModule() {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
+                        if (!shouldMockWifi(config)) return
                         val mockWifi = config.optBoolean("mock_wifi", true)
                         val wifiObj = if (mockWifi) config.optJSONObject("wifi_json") else null
                         val isConnected = selectSpoofedWifi(wifiObj) != null
@@ -2020,7 +2051,7 @@ class LocationHooker : XposedModule() {
         val wifiScanHook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val config = readConfig() ?: return
-                if (!config.optBoolean("active", false)) return
+                if (!shouldMockWifi(config)) return
                 val fakeList = java.util.ArrayList<Any>()
                 val mockWifi = config.optBoolean("mock_wifi", true)
                 val wifiObj = if (mockWifi) config.optJSONObject("wifi_json") else null
@@ -2076,6 +2107,10 @@ class LocationHooker : XposedModule() {
                         }
                     } catch (e: Throwable) { /* 忽略 */ }
                 }
+                XposedBridge.logEvery(
+                    "wifiScanResults:${fakeList.size}",
+                    "[LocationSpoofer] getScanResults returning fake AP count=${fakeList.size}"
+                )
                 param.result = fakeList
             }
         }
@@ -2092,7 +2127,7 @@ class LocationHooker : XposedModule() {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
+                        if (!shouldMockWifi(config)) return
                         val mockWifi = config.optBoolean("mock_wifi", true)
                         val wifiObj = config.optJSONObject("wifi_json")
                         val hasWifiData = hasSpoofedWifiData(wifiObj)
@@ -2108,7 +2143,7 @@ class LocationHooker : XposedModule() {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
+                        if (!shouldMockWifi(config)) return
                         val mockWifi = config.optBoolean("mock_wifi", true)
                         val wifiObj = config.optJSONObject("wifi_json")
                         val hasWifiData = hasSpoofedWifiData(wifiObj)
@@ -2124,7 +2159,7 @@ class LocationHooker : XposedModule() {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
+                        if (!shouldMockWifi(config)) return
                         val mockWifi = config.optBoolean("mock_wifi", true)
                         val wifiObj = if (mockWifi) config.optJSONObject("wifi_json") else null
                         val connectedWifi = selectSpoofedWifi(wifiObj)
@@ -2155,7 +2190,7 @@ class LocationHooker : XposedModule() {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
+                        if (!shouldMockWifi(config)) return
                         param.result = java.util.ArrayList<Any>()
                     }
                 })
@@ -2166,7 +2201,12 @@ class LocationHooker : XposedModule() {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
+                        if (!shouldMockWifi(config)) return
+                        val connectedWifi = selectSpoofedWifi(config.optJSONObject("wifi_json"))
+                        if (connectedWifi == null) {
+                            param.result = null
+                            return
+                        }
                         try {
                             val dhcpClass = XposedHelpers.findClass("android.net.DhcpInfo", classLoader)
                             val dhcp = XposedHelpers.newInstance(dhcpClass)
@@ -2189,7 +2229,11 @@ class LocationHooker : XposedModule() {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
+                        if (!shouldMockWifi(config)) return
+                        val networkType = runCatching {
+                            XposedHelpers.callMethod(param.thisObject!!, "getType") as Int
+                        }.getOrNull()
+                        if (networkType != 1) return
                         val mockWifi = config.optBoolean("mock_wifi", true)
                         val wifiObj = if (mockWifi) config.optJSONObject("wifi_json") else null
                         val connectedWifi = selectSpoofedWifi(wifiObj)
@@ -2210,7 +2254,7 @@ class LocationHooker : XposedModule() {
                 val scannerHook = object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
+                        if (!shouldMockWifi(config)) return
                         
                         param.result = null
                         val mockWifi = config.optBoolean("mock_wifi", true)
@@ -2299,7 +2343,11 @@ class LocationHooker : XposedModule() {
                                     dispatchWifiScanResults(fakeScanDataArray)
                                 }
                             } catch (e: Throwable) {
-                                XposedBridge.log("[LocationSpoofer] WifiScanner 伪造失败: $e")
+                                XposedBridge.logOpenCellIdEvery(
+                                    "wifi-scanner-build:${e.javaClass.name}",
+                                    "WifiScanner simulated result build failed: ${e.javaClass.simpleName}: ${e.message}",
+                                    60_000L
+                                )
                             }
                         } else {
                             try {
@@ -2332,73 +2380,27 @@ class LocationHooker : XposedModule() {
         val cellHook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val methodName = param.method!!.name
-                val config = readConfig()
-                if (config == null) {
-                    XposedBridge.logOpenCellIdEvery("$methodName:config-null", "$methodName skipped: config=null", 30_000L)
-                    return
-                }
-                if (!config.optBoolean("active", false)) {
-                    XposedBridge.logOpenCellIdEvery("$methodName:inactive", "$methodName skipped: active=false", 30_000L)
-                    return
-                }
-                val lat = config.optDouble("lat", 0.0)
-                val lng = config.optDouble("lng", 0.0)
-                val mockCellForLog = config.optBoolean("mock_cell", true)
+                val config = readConfig() ?: return
+                if (!shouldMockCell(config)) return
                 val cellCountForLog = config.optJSONArray("cell_json")?.length() ?: 0
                 XposedBridge.logOpenCellIdEvery(
-                    "$methodName:called:$mockCellForLog:$cellCountForLog",
-                    "$methodName called active=true mockCell=$mockCellForLog cellJsonCount=$cellCountForLog lat=$lat lng=$lng"
+                    "$methodName:called:$cellCountForLog",
+                    "$methodName called with cell simulation active; cellJsonCount=$cellCountForLog"
                 )
 
                 when (methodName) {
                     "getCellLocation" -> {
-                        try {
-                            val mockCell = config.optBoolean("mock_cell", true)
-                            if (mockCell) {
-                                val gsmCellLocationClass = XposedHelpers.findClass(
-                                    "android.telephony.gsm.GsmCellLocation", classLoader
-                                )
-                                val fakeLocation = XposedHelpers.newInstance(gsmCellLocationClass)
-                                val cellArray = config.optJSONArray("cell_json")
-                                if (cellArray == null || cellArray.length() == 0) {
-                                    XposedBridge.logOpenCellId("getCellLocation returning null because cell_json is empty")
-                                    param.result = null
-                                    return
-                                }
-                                val cell = cellArray.getJSONObject(0)
-                                val lac = cellAreaCode(cell, 0)
-                                val cid = cellIdentityCode(cell, 0)
-                                if (lac <= 0 || cid <= 0) {
-                                    XposedBridge.logOpenCellId("getCellLocation returning null because first cell has invalid lac/cid")
-                                    param.result = null
-                                    return
-                                }
-                                XposedHelpers.callMethod(fakeLocation, "setLacAndCid", lac, cid)
-                                XposedBridge.logOpenCellId("getCellLocation returning GsmCellLocation lac=$lac cid=$cid")
-                                param.result = fakeLocation
-                            } else {
-                                XposedBridge.logOpenCellId("getCellLocation returning null because mock_cell=false")
-                                param.result = null
-                            }
-                        } catch (e: Throwable) {
-                            XposedBridge.logOpenCellId("getCellLocation failed: $e")
-                            param.result = null
-                        }
+                        param.result = buildFakeCellLocation(classLoader, config)
                     }
 
                     "getAllCellInfo" -> {
                         try {
-                            if (config.optBoolean("mock_cell", true)) {
-                                val fakeCells = buildFakeCellInfoList(classLoader, config)
-                                XposedBridge.logOpenCellIdEvery(
-                                    "getAllCellInfo:return:${fakeCells.size}",
-                                    "getAllCellInfo returning fakeCells=${fakeCells.size}"
-                                )
-                                param.result = fakeCells
-                            } else {
-                                XposedBridge.logOpenCellId("getAllCellInfo returning empty because mock_cell=false")
-                                param.result = java.util.ArrayList<Any>()
-                            }
+                            val fakeCells = buildFakeCellInfoList(classLoader, config)
+                            XposedBridge.logOpenCellIdEvery(
+                                "getAllCellInfo:return:${fakeCells.size}",
+                                "getAllCellInfo returning fakeCells=${fakeCells.size}"
+                            )
+                            param.result = fakeCells
                         } catch (e: Throwable) {
                             XposedBridge.logOpenCellId("getAllCellInfo build failed: $e")
                             param.result = java.util.ArrayList<Any>()
@@ -2428,86 +2430,33 @@ class LocationHooker : XposedModule() {
         val telephonyMetaHook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val methodName = param.method!!.name
-                val config = readConfig()
-                if (config == null) {
-                    XposedBridge.logOpenCellIdEvery("$methodName:config-null", "$methodName skipped: config=null", 30_000L)
-                    return
-                }
-                if (!config.optBoolean("active", false)) {
-                    XposedBridge.logOpenCellIdEvery("$methodName:inactive", "$methodName skipped: active=false", 30_000L)
-                    return
-                }
-                val mockCell = config.optBoolean("mock_cell", true)
-                val cellArray = if (mockCell) config.optJSONArray("cell_json") else null
+                val config = readConfig() ?: return
+                if (!shouldMockCell(config)) return
+                val cellArray = config.optJSONArray("cell_json")
+                val cell = firstServiceCell(cellArray)
                 XposedBridge.logOpenCellIdEvery(
-                    "$methodName:called:$mockCell:${cellArray?.length() ?: 0}",
-                    "$methodName called mockCell=$mockCell cellJsonCount=${cellArray?.length() ?: 0}"
+                    "$methodName:called:${cellArray?.length() ?: 0}",
+                    "$methodName called with cell simulation active; cellJsonCount=${cellArray?.length() ?: 0}"
                 )
                 when (methodName) {
-                    "getNetworkOperator" -> {
-                        if (cellArray != null && cellArray.length() > 0) {
-                            val cell = cellArray.getJSONObject(0)
-                            val mcc = positiveJsonInt(cell, "mcc", default = 460)
-                            val mnc = positiveJsonInt(cell, "mnc", "net", default = 0)
-                            val operator = String.format(java.util.Locale.US, "%d%02d", mcc, mnc)
-                            XposedBridge.logOpenCellIdEvery(
-                                "getNetworkOperator:return:$operator",
-                                "getNetworkOperator returning $operator"
-                            )
-                            param.result = operator
-                        } else if (!mockCell) {
-                            param.result = ""
-                        }
-                    }
-                    "getNetworkOperatorName" -> {
-                        if (cellArray != null && cellArray.length() > 0) {
-                            val mnc = positiveJsonInt(cellArray.getJSONObject(0), "mnc", "net", default = 0)
-                            param.result = when (mnc) {
-                                0, 2, 7 -> "中国移动"
-                                1, 6, 9 -> "中国联通"
-                                3, 5, 11 -> "中国电信"
-                                else -> "中国移动"
-                            }
-                            XposedBridge.logOpenCellIdEvery(
-                                "getNetworkOperatorName:return:${param.result}",
-                                "getNetworkOperatorName returning ${param.result}"
-                            )
-                        } else if (!mockCell) {
-                            param.result = ""
-                        }
-                    }
-                    "getSimOperator" -> { /* 保留真实值 */ }
-                    "getSimOperatorName" -> { /* 保留真实值 */ }
-                    "getNetworkType" -> param.result = if (mockCell) 13 else 0
-                    "getDataNetworkType" -> param.result = if (mockCell) 13 else 0
-                    "getDataState" -> param.result = if (mockCell) 2 else param.result // DATA_CONNECTED = 2
-                    "isDataEnabled", "isDataConnectionAllowed" -> param.result = if (mockCell) true else param.result
-                    "getPhoneType" -> param.result = 1      // PHONE_TYPE_GSM
-                    "getServiceState", "getServiceStateForSlot" -> {
-                        if (mockCell) buildFakeServiceState(classLoader, cellArray)?.let {
-                            XposedBridge.logOpenCellIdEvery(
-                                "$methodName:return-service-state",
-                                "$methodName returning fake ServiceState"
-                            )
-                            param.result = it
-                        }
-                    }
-                    "getSignalStrength" -> {
-                        if (mockCell) buildFakeSignalStrength(classLoader, config)?.let {
-                            XposedBridge.logOpenCellIdEvery(
-                                "getSignalStrength:return-signal-strength",
-                                "getSignalStrength returning fake SignalStrength"
-                            )
-                            param.result = it
-                        }
-                    }
+                    "getNetworkOperator" -> param.result = cellOperatorNumeric(cell) ?: ""
+                    "getNetworkOperatorName" -> param.result = cellOperatorName(cell)
+                    "getNetworkCountryIso" -> param.result = ""
+                    "getNetworkType", "getDataNetworkType", "getVoiceNetworkType" ->
+                        param.result = cellNetworkType(cell)
+                    "getDataState" -> param.result = if (cell != null) 2 else 0
+                    "isDataEnabled", "isDataConnectionAllowed" -> param.result = cell != null
+                    "getPhoneType" -> param.result = cellPhoneType(cell)
+                    "getServiceState", "getServiceStateForSlot" ->
+                        param.result = buildFakeServiceState(classLoader, cellArray)
+                    "getSignalStrength" -> param.result = buildFakeSignalStrength(classLoader, config)
                 }
             }
         }
 
         val telephonyMetaMethods = listOf(
-            "getNetworkOperator", "getNetworkOperatorName",
-            "getNetworkType", "getDataNetworkType", "getPhoneType",
+            "getNetworkOperator", "getNetworkOperatorName", "getNetworkCountryIso",
+            "getNetworkType", "getDataNetworkType", "getVoiceNetworkType", "getPhoneType",
             "getServiceState", "getServiceStateForSlot", "getSignalStrength",
             "getDataState", "isDataEnabled", "isDataConnectionAllowed"
         )
@@ -2534,133 +2483,11 @@ class LocationHooker : XposedModule() {
                 Int::class.javaPrimitiveType!!,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig()
-                        if (config == null) {
-                            XposedBridge.logOpenCellIdEvery("listen:config-null", "TelephonyManager.listen skipped: config=null", 30_000L)
-                            return
-                        }
-                        if (!config.optBoolean("active", false)) {
-                            XposedBridge.logOpenCellIdEvery("listen:inactive", "TelephonyManager.listen skipped: active=false", 30_000L)
-                            return
-                        }
-                        val listener = param.args[0] ?: return
-                        val originalEvents = param.args[1] as Int
-                        val mockCell = config.optBoolean("mock_cell", true)
-                        val cellJsonCount = config.optJSONArray("cell_json")?.length() ?: 0
-                        val needsCellInfo = (originalEvents and 0x400) != 0
-                        val needsCellLocation = (originalEvents and 0x10) != 0
-                        val needsServiceState = (originalEvents and 0x1) != 0
-                        val needsSignalStrength = (originalEvents and 0x100) != 0
-                        if (!needsCellInfo && !needsCellLocation && !needsServiceState && !needsSignalStrength) {
-                            return
-                        }
-                        XposedBridge.logOpenCellIdEvery(
-                            "listen:called:${listener.javaClass.name}:$originalEvents:$mockCell:$cellJsonCount",
-                            "TelephonyManager.listen called listener=${listener.javaClass.name} events=0x${originalEvents.toString(16)} mockCell=$mockCell cellJsonCount=$cellJsonCount"
-                        )
-                        val fakeCells by lazy {
-                            if (mockCell) {
-                                buildFakeCellInfoList(classLoader, config)
-                            } else {
-                                java.util.ArrayList<Any>()
-                            }
-                        }
-                        if ((originalEvents and 0x10) != 0) {
-                            try {
-                                if (mockCell) {
-                                    val gsmCellLocationClass = XposedHelpers.findClass(
-                                        "android.telephony.gsm.GsmCellLocation", classLoader
-                                    )
-                                    val fakeLocation = XposedHelpers.newInstance(gsmCellLocationClass)
-                                    val cellArray = config.optJSONArray("cell_json")
-                                    if (cellArray == null || cellArray.length() == 0) {
-                                        XposedBridge.logOpenCellIdEvery(
-                                            "listen:onCellLocationChanged:empty",
-                                            "listen skipped onCellLocationChanged because cell_json is empty"
-                                        )
-                                        return
-                                    }
-                                    val cell = cellArray.getJSONObject(0)
-                                    val lac = cellAreaCode(cell, 0)
-                                    val cid = cellIdentityCode(cell, 0)
-                                    if (lac <= 0 || cid <= 0) {
-                                        XposedBridge.logOpenCellIdEvery(
-                                            "listen:onCellLocationChanged:invalid",
-                                            "listen skipped onCellLocationChanged because first cell has invalid lac/cid"
-                                        )
-                                        return
-                                    }
-                                    XposedHelpers.callMethod(
-                                        fakeLocation,
-                                        "setLacAndCid",
-                                        lac,
-                                        cid
-                                    )
-                                    if (XposedHelpers.tryCallMethodDeep(listener, "onCellLocationChanged", fakeLocation)) {
-                                        XposedBridge.logOpenCellIdEvery(
-                                            "listen:onCellLocationChanged:$lac:$cid",
-                                            "listen dispatched onCellLocationChanged lac=$lac cid=$cid"
-                                        )
-                                    } else {
-                                        XposedBridge.logOpenCellIdEvery(
-                                            "listen:onCellLocationChanged:not-accepted:${listener.javaClass.name}",
-                                            "listen listener did not accept onCellLocationChanged class=${listener.javaClass.name}",
-                                            30_000L
-                                        )
-                                    }
-                                }
-                            } catch (e: Throwable) {
-                                XposedBridge.logOpenCellId("listen onCellLocationChanged failed: $e")
-                            }
-                        }
-                        if ((originalEvents and 0x400) != 0) {
-                            try {
-                                if (XposedHelpers.tryCallMethodDeep(listener, "onCellInfoChanged", fakeCells)) {
-                                    XposedBridge.logOpenCellIdEvery(
-                                        "listen:onCellInfoChanged:${fakeCells.size}",
-                                        "listen dispatched onCellInfoChanged fakeCells=${fakeCells.size}"
-                                    )
-                                } else {
-                                    XposedBridge.logOpenCellIdEvery(
-                                        "listen:onCellInfoChanged:not-accepted:${listener.javaClass.name}",
-                                        "listen listener did not accept onCellInfoChanged class=${listener.javaClass.name}",
-                                        30_000L
-                                    )
-                                }
-                            } catch (e: Throwable) {
-                                XposedBridge.logOpenCellId("listen onCellInfoChanged failed: $e")
-                            }
-                        }
-                        if ((originalEvents and 0x1) != 0) {
-                            try {
-                                buildFakeServiceState(classLoader, config.optJSONArray("cell_json"))
-                                    ?.let { XposedHelpers.tryCallMethodDeep(listener, "onServiceStateChanged", it) }
-                                XposedBridge.logOpenCellIdEvery("listen:onServiceStateChanged", "listen dispatched onServiceStateChanged")
-                            } catch (e: Throwable) {
-                                XposedBridge.logOpenCellId("listen onServiceStateChanged failed: $e")
-                            }
-                        }
-                        if ((originalEvents and 0x100) != 0) {
-                            try {
-                                buildFakeSignalStrength(classLoader, config)
-                                    ?.let { XposedHelpers.tryCallMethodDeep(listener, "onSignalStrengthsChanged", it) }
-                                XposedBridge.logOpenCellIdEvery("listen:onSignalStrengthsChanged", "listen dispatched onSignalStrengthsChanged")
-                            } catch (e: Throwable) {
-                                XposedBridge.logOpenCellId("listen onSignalStrengthsChanged failed: $e")
-                            }
-                        }
-                        var events = originalEvents
-                        // 移除会泄漏真实蜂窝环境的标志位
-                        // 这样系统就不会将真实的基站变更回调给应用
-                        events = events and 0x1.inv()    // LISTEN_SERVICE_STATE
-                        events = events and 0x10.inv()   // LISTEN_CELL_LOCATION
-                        events = events and 0x100.inv()  // LISTEN_SIGNAL_STRENGTHS
-                        events = events and 0x400.inv()  // LISTEN_CELL_INFO
-                        param.args[1] = events
-                        XposedBridge.logOpenCellIdEvery(
-                            "listen:sanitized:$originalEvents:$events",
-                            "TelephonyManager.listen sanitized events=0x${events.toString(16)}"
-                        )
+                        val listener = param.args.firstOrNull() ?: return
+                        // Keep the original registration intact. The callback method itself
+                        // checks the latest config so an existing listener automatically
+                        // returns to normal system data as soon as simulation stops.
+                        installCellDeliveryHooks(listener, classLoader)
                     }
                 }
             )
@@ -2676,45 +2503,33 @@ class LocationHooker : XposedModule() {
                 "requestCellInfoUpdate",
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig()
-                        if (config == null) {
-                            XposedBridge.logOpenCellIdEvery("requestCellInfoUpdate:config-null", "requestCellInfoUpdate skipped: config=null", 30_000L)
-                            return
-                        }
-                        if (!config.optBoolean("active", false)) {
-                            XposedBridge.logOpenCellIdEvery("requestCellInfoUpdate:inactive", "requestCellInfoUpdate skipped: active=false", 30_000L)
-                            return
-                        }
-                        
-                        // 阻断真实请求
-                        param.result = null
-                        
-                        val executor = param.args[0] as? java.util.concurrent.Executor ?: return
-                        val callback = param.args[1] ?: return
-                        XposedBridge.logOpenCellIdEvery(
-                            "requestCellInfoUpdate:called:${callback.javaClass.name}",
-                            "requestCellInfoUpdate called callback=${callback.javaClass.name} args=${param.args.size}"
-                        )
-                        
-                        val mockCell = config.optBoolean("mock_cell", true)
-                        
-                        val fakeCells = if (mockCell) {
-                            buildFakeCellInfoList(classLoader, config)
-                        } else {
-                            java.util.ArrayList<Any>()
-                        }
-                        
-                        // 异步回调
-                        executor.execute {
-                            try {
-                                if (XposedHelpers.tryCallMethodDeep(callback, "onCellInfo", fakeCells)) {
-                                    XposedBridge.logOpenCellId("requestCellInfoUpdate dispatched onCellInfo fakeCells=${fakeCells.size}")
-                                } else {
-                                    XposedBridge.logOpenCellId("requestCellInfoUpdate callback did not accept onCellInfo class=${callback.javaClass.name}")
-                                }
-                            } catch (e: Throwable) {
-                                XposedBridge.logOpenCellId("requestCellInfoUpdate onCellInfo failed: $e")
+                        val callback = param.args.firstOrNull { candidate ->
+                            candidate != null && candidate.javaClass.methods.any {
+                                it.name == "onCellInfo"
                             }
+                        } ?: return
+                        // Let the platform perform the request. The callback is rewritten only
+                        // at delivery time. For the standard Executor overload, avoid a real
+                        // modem refresh while simulation is active and dispatch from memory.
+                        installCellDeliveryHooks(callback, classLoader)
+                        val config = readConfig() ?: return
+                        if (!shouldMockCell(config)) return
+                        val executor = param.args.firstOrNull {
+                            it is java.util.concurrent.Executor
+                        } as? java.util.concurrent.Executor ?: return
+                        param.result = null
+                        executor.execute {
+                            val freshConfig = readConfig()?.takeIf { shouldMockCell(it) }
+                            val deliveredCells = if (freshConfig != null) {
+                                buildFakeCellInfoList(classLoader, freshConfig)
+                            } else {
+                                // This request was already intercepted while simulation was
+                                // active. Complete its callback contract even if stop/off wins
+                                // the race before the Executor runs; never resurrect a modem
+                                // refresh merely to service an outstanding simulated request.
+                                java.util.ArrayList<Any>()
+                            }
+                            XposedHelpers.tryCallMethodDeep(callback, "onCellInfo", deliveredCells)
                         }
                     }
                 }
@@ -2734,104 +2549,13 @@ class LocationHooker : XposedModule() {
                 "registerTelephonyCallback",
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig()
-                        if (config == null) {
-                            XposedBridge.logOpenCellIdEvery("registerTelephonyCallback:config-null", "registerTelephonyCallback skipped: config=null", 30_000L)
-                            return
-                        }
-                        if (!config.optBoolean("active", false)) {
-                            XposedBridge.logOpenCellIdEvery("registerTelephonyCallback:inactive", "registerTelephonyCallback skipped: active=false", 30_000L)
-                            return
-                        }
-
-                        // 找到 TelephonyCallback 实例参数
-                        val callback = param.args.firstOrNull { arg ->
-                            arg != null && arg.javaClass.interfaces.any { iface ->
-                                iface.name.contains("TelephonyCallback")
-                            } || (arg != null && runCatching {
-                                val base = XposedHelpers.findClass(
-                                    "android.telephony.TelephonyCallback", classLoader
-                                )
-                                base.isInstance(arg)
-                            }.getOrElse { false })
-                        }
-                        if (callback == null) {
-                            XposedBridge.logOpenCellId("registerTelephonyCallback called but callback not found args=${param.args.map { it?.javaClass?.name }}")
-                            return
-                        }
-
-                        val callbackClass = callback.javaClass
-                        XposedBridge.logOpenCellIdEvery(
-                            "registerTelephonyCallback:called:${callbackClass.name}",
-                            "registerTelephonyCallback called callback=${callbackClass.name} interfaces=${callbackClass.interfaces.joinToString { it.name }}"
-                        )
-
-                        if (isTelephonyCallbackListener(classLoader, callback, "CellInfoListener")) {
-                            XposedBridge.logOpenCellIdEvery(
-                                "registerTelephonyCallback:CellInfoListener:${callbackClass.name}",
-                                "registerTelephonyCallback installing CellInfoListener hook on ${callbackClass.name}",
-                                60_000L
-                            )
-                            XposedBridge.hookAllMethods(
-                                callbackClass,
-                                "onCellInfoChanged",
-                                object : XC_MethodHook() {
-                                    override fun beforeHookedMethod(param: MethodHookParam) {
-                                        val freshConfig = readConfig() ?: return
-                                        if (!freshConfig.optBoolean("active", false)) return
-                                        val fakeCells = buildFakeCellInfoList(classLoader, freshConfig)
-                                        param.args[0] = fakeCells
-                                        XposedBridge.logOpenCellId("TelephonyCallback.onCellInfoChanged injected fakeCells=${fakeCells.size}")
-                                    }
-                                }
-                            )
-                        }
-
-                        if (isTelephonyCallbackListener(classLoader, callback, "ServiceStateListener")) {
-                            XposedBridge.logOpenCellIdEvery(
-                                "registerTelephonyCallback:ServiceStateListener:${callbackClass.name}",
-                                "registerTelephonyCallback installing ServiceStateListener hook on ${callbackClass.name}",
-                                60_000L
-                            )
-                            XposedBridge.hookAllMethods(
-                                callbackClass,
-                                "onServiceStateChanged",
-                                object : XC_MethodHook() {
-                                    override fun beforeHookedMethod(param: MethodHookParam) {
-                                        val freshConfig = readConfig() ?: return
-                                        if (!freshConfig.optBoolean("active", false)) return
-                                        buildFakeServiceState(classLoader, freshConfig.optJSONArray("cell_json"))
-                                            ?.let {
-                                                param.args[0] = it
-                                                XposedBridge.logOpenCellId("TelephonyCallback.onServiceStateChanged injected fake ServiceState")
-                                            }
-                                    }
-                                }
-                            )
-                        }
-
-                        if (isTelephonyCallbackListener(classLoader, callback, "SignalStrengthsListener")) {
-                            XposedBridge.logOpenCellIdEvery(
-                                "registerTelephonyCallback:SignalStrengthsListener:${callbackClass.name}",
-                                "registerTelephonyCallback installing SignalStrengthsListener hook on ${callbackClass.name}",
-                                60_000L
-                            )
-                            XposedBridge.hookAllMethods(
-                                callbackClass,
-                                "onSignalStrengthsChanged",
-                                object : XC_MethodHook() {
-                                    override fun beforeHookedMethod(param: MethodHookParam) {
-                                        val freshConfig = readConfig() ?: return
-                                        if (!freshConfig.optBoolean("active", false)) return
-                                        buildFakeSignalStrength(classLoader, freshConfig)
-                                            ?.let {
-                                                param.args[0] = it
-                                                XposedBridge.logOpenCellId("TelephonyCallback.onSignalStrengthsChanged injected fake SignalStrength")
-                                            }
-                                    }
-                                }
-                            )
-                        }
+                        val callbackBase = runCatching {
+                            XposedHelpers.findClass("android.telephony.TelephonyCallback", classLoader)
+                        }.getOrNull() ?: return
+                        val callback = param.args.firstOrNull { candidate ->
+                            candidate != null && callbackBase.isInstance(candidate)
+                        } ?: return
+                        installCellDeliveryHooks(callback, classLoader)
                     }
                 }
             )
@@ -2868,29 +2592,28 @@ class LocationHooker : XposedModule() {
         val networkInfoHook = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val config = readConfig() ?: return
-                if (!config.optBoolean("active", false)) return
-                if (config.optBoolean("mock_wifi", true)) {
-                    val wifiObj = config.optJSONObject("wifi_json")
-                    val hasWifiData = selectSpoofedWifi(wifiObj) != null
-                    if (hasWifiData) {
-                        val fakeInfo = buildFakeNetworkInfo()
-                        if (fakeInfo != null) {
-                            param.result = fakeInfo
-                        }
-                    } else {
-                        // 如果用户要求模拟 Wi-Fi，但实际上数据库里没有 Wi-Fi 数据
-                        // 我们需要向系统返回 Wi-Fi 断开的状态
-                        val currentInfo = param.result
-                        if (currentInfo != null) {
-                            try {
-                                val type = XposedHelpers.callMethod(currentInfo, "getType") as Int
-                                if (type == 1) { // TYPE_WIFI
-                                    val stateEnum = XposedHelpers.findClass("android.net.NetworkInfo\$State", classLoader)
-                                    XposedHelpers.setObjectField(currentInfo, "mState", stateEnum.getField("DISCONNECTED").get(null))
-                                    XposedHelpers.callMethod(currentInfo, "setIsAvailable", false)
-                                    param.result = currentInfo
-                                }
-                            } catch (e: Throwable) {}
+                if (!shouldMockWifi(config)) return
+                val wifiObj = config.optJSONObject("wifi_json")
+                val hasWifiData = selectSpoofedWifi(wifiObj) != null
+                if (hasWifiData) {
+                    val fakeInfo = buildFakeNetworkInfo()
+                    if (fakeInfo != null) {
+                        param.result = fakeInfo
+                    }
+                } else {
+                    // 如果用户要求模拟 Wi-Fi，但实际上数据库里没有 Wi-Fi 数据
+                    // 我们需要向系统返回 Wi-Fi 断开的状态
+                    val currentInfo = param.result
+                    if (currentInfo != null) {
+                        try {
+                            val type = XposedHelpers.callMethod(currentInfo, "getType") as Int
+                            if (type == 1) { // TYPE_WIFI
+                                val stateEnum = XposedHelpers.findClass("android.net.NetworkInfo\$State", classLoader)
+                                XposedHelpers.setObjectField(currentInfo, "mState", stateEnum.getField("DISCONNECTED").get(null))
+                                XposedHelpers.callMethod(currentInfo, "setIsAvailable", false)
+                                param.result = currentInfo
+                            }
+                        } catch (e: Throwable) {
                         }
                     }
                 }
@@ -2909,8 +2632,7 @@ class LocationHooker : XposedModule() {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
-                        if (!config.optBoolean("mock_wifi", true)) return
+                        if (!shouldMockWifi(config)) return
                         
                         val nc = param.result ?: return
                         try {
@@ -2945,7 +2667,11 @@ class LocationHooker : XposedModule() {
                                 )
                             }
                         } catch (e: Throwable) {
-                            XposedBridge.log("[LocationSpoofer] fakeWifiInfo error: " + e.message)
+                            XposedBridge.logOpenCellIdEvery(
+                                "network-capabilities-wifi:${e.javaClass.name}",
+                                "NetworkCapabilities Wi-Fi overlay failed: ${e.javaClass.simpleName}: ${e.message}",
+                                60_000L
+                            )
                         }
                     }
                 }
@@ -2959,7 +2685,7 @@ class LocationHooker : XposedModule() {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
+                        if (!shouldMockWifi(config)) return
                         val result = param.result as? java.util.Enumeration<*> ?: return
                         val filtered = java.util.Collections.list(result).filter { iface ->
                             val name = try {
@@ -2975,203 +2701,6 @@ class LocationHooker : XposedModule() {
 
         XposedBridge.log("[LocationSpoofer] Connectivity layer hooks installed")
     }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // 蓝牙 BLE 扫描拦截 — 防止通过 iBeacon / Eddystone 信标定位
-    // ══════════════════════════════════════════════════════════════════════════
-    private fun hookBluetoothLE(classLoader: ClassLoader) {
-
-        // ── BLE 扫描结果伪造的核心逻辑（复用于不同 startScan 重载）──
-        val buildAndDeliverBleResults = fun(config: JSONObject, callbackObj: Any, cl: ClassLoader) {
-            if (!config.optBoolean("mock_bluetooth", true)) return
-            try {
-                val bluetoothArray = config.optJSONArray("bluetooth_json")
-                if (bluetoothArray != null && bluetoothArray.length() > 0) {
-                    val results = java.util.ArrayList<Any>()
-                    val scanResultClass = XposedHelpers.findClass("android.bluetooth.le.ScanResult", cl)
-                    val bluetoothDeviceClass = XposedHelpers.findClass("android.bluetooth.BluetoothDevice", cl)
-                    val scanRecordClass = XposedHelpers.findClass("android.bluetooth.le.ScanRecord", cl)
-
-                    for (i in 0 until bluetoothArray.length()) {
-                        try {
-                            val obj = bluetoothArray.getJSONObject(i)
-                            val address = obj.optString("address", "00:11:22:33:44:55")
-                            val rssi = obj.optInt("rssi", -60)
-                            val hexRecord = obj.optString("scanRecordHex", "")
-
-                            // 1. 构造 BluetoothDevice
-                            val device = XposedHelpers.newInstance(bluetoothDeviceClass, address)
-
-                            // 2. 构造 ScanRecord
-                            var scanRecord: Any? = null
-                            if (hexRecord.isNotEmpty()) {
-                                try {
-                                    val bytes = hexStringToByteArray(hexRecord)
-                                    scanRecord = XposedHelpers.callStaticMethod(scanRecordClass, "parseFromBytes", bytes)
-                                } catch (e: Throwable) { /* 忽略 */ }
-                            }
-
-                            // 3. 构造 ScanResult（兼容新旧构造器）
-                            val timestampNanos = android.os.SystemClock.elapsedRealtimeNanos()
-                            var scanResultObj: Any? = null
-                            try {
-                                // Android 8.0+ 构造器
-                                scanResultObj = XposedHelpers.newInstance(
-                                    scanResultClass, device,
-                                    0x001B, 1, 0, 255, 127, rssi, 0, scanRecord, timestampNanos
-                                )
-                            } catch (e: Throwable) {
-                                try {
-                                    // 旧版本构造器
-                                    scanResultObj = XposedHelpers.newInstance(
-                                        scanResultClass, device, scanRecord, rssi, timestampNanos
-                                    )
-                                } catch (e2: Throwable) { /* 忽略 */ }
-                            }
-
-                            if (scanResultObj != null) {
-                                results.add(scanResultObj)
-                                try { XposedHelpers.callMethod(callbackObj, "onScanResult", 1, scanResultObj) } catch (e: Throwable) {}
-                            }
-                        } catch (e: Throwable) {
-                            XposedBridge.log("[LocationSpoofer] 构建虚拟BLE失败: $e")
-                        }
-                    }
-
-                    // 批量触发回调
-                    if (results.isNotEmpty()) {
-                        try { XposedHelpers.callMethod(callbackObj, "onBatchScanResults", results) } catch (e: Throwable) {}
-                    }
-                }
-            } catch (e: Throwable) { XposedBridge.log(e) }
-            Unit
-        }
-
-        // ── 1. startScan(List<ScanFilter>, ScanSettings, ScanCallback) — 3参数重载 ──
-        try {
-            XposedHelpers.findAndHookMethod(
-                "android.bluetooth.le.BluetoothLeScanner", classLoader, "startScan",
-                java.util.List::class.java,
-                android.bluetooth.le.ScanSettings::class.java,
-                android.bluetooth.le.ScanCallback::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
-                        param.result = null // 短路原始扫描
-                        val callback = param.args[2] ?: return
-                        buildAndDeliverBleResults(config, callback, classLoader)
-                    }
-                }
-            )
-        } catch (e: Throwable) { XposedBridge.log(e) }
-
-        // ── 2. startScan(ScanCallback) — 1参数重载 ──
-        // 部分 App（如微信）使用无 filter 的简化版 startScan
-        try {
-            XposedHelpers.findAndHookMethod(
-                "android.bluetooth.le.BluetoothLeScanner", classLoader, "startScan",
-                android.bluetooth.le.ScanCallback::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
-                        param.result = null
-                        val callback = param.args[0] ?: return
-                        buildAndDeliverBleResults(config, callback, classLoader)
-                    }
-                }
-            )
-        } catch (e: Throwable) { XposedBridge.log(e) }
-
-
-        try {
-            XposedHelpers.findAndHookMethod(
-                "android.bluetooth.BluetoothAdapter", classLoader, "isEnabled",
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
-                        if (!config.optBoolean("mock_bluetooth", true)) {
-                            param.result = false
-                        }
-                    }
-                }
-            )
-            XposedHelpers.findAndHookMethod(
-                "android.bluetooth.BluetoothAdapter", classLoader, "getState",
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
-                        if (!config.optBoolean("mock_bluetooth", true)) {
-                            param.result = 10 // STATE_OFF
-                        }
-                    }
-                }
-            )
-        } catch (e: Throwable) { /* 忽略 */ }
-
-        // ── 3. BluetoothAdapter.getBondedDevices() → 空集合 ──
-        // 防止通过已配对蓝牙设备列表进行指纹识别
-        try {
-            XposedHelpers.findAndHookMethod(
-                "android.bluetooth.BluetoothAdapter", classLoader, "getBondedDevices",
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
-                        param.result = java.util.HashSet<Any>()
-                    }
-                }
-            )
-        } catch (e: Throwable) { /* 忽略 */ }
-
-        // ── 4. BluetoothAdapter.startDiscovery() → false ──
-        // 阻止经典蓝牙扫描发现周围真实设备
-        try {
-            XposedHelpers.findAndHookMethod(
-                "android.bluetooth.BluetoothAdapter", classLoader, "startDiscovery",
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
-                        param.result = false
-                    }
-                }
-            )
-        } catch (e: Throwable) { /* 忽略 */ }
-
-        // ── 5. 老接口 BluetoothAdapter.startLeScan（Android 4.x）──
-        try {
-            XposedHelpers.findAndHookMethod(
-                "android.bluetooth.BluetoothAdapter", classLoader, "startLeScan",
-                android.bluetooth.BluetoothAdapter.LeScanCallback::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val config = readConfig() ?: return
-                        if (!config.optBoolean("active", false)) return
-                        // 老接口不具备很好的伪造性，直接返回启动失败
-                        param.result = false
-                    }
-                }
-            )
-        } catch (e: Throwable) { XposedBridge.log(e) }
-
-        XposedBridge.log("[LocationSpoofer] Bluetooth LE hooks installed")
-    }
-    
-    private fun hexStringToByteArray(s: String): ByteArray {
-        val len = s.length
-        val data = ByteArray(len / 2)
-        var i = 0
-        while (i < len) {
-            data[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
-            i += 2
-        }
-        return data
-    }
-
     /**
      * 通过反射+Parcel机制构造CellInfoLte对象列表
      *
@@ -3206,25 +2735,42 @@ class LocationHooker : XposedModule() {
             for (i in 0 until cellArray.length()) {
                 try {
                     val obj = cellArray.getJSONObject(i)
-                    val type = normalizeCellType(obj.optString("type", obj.optString("radio", "LTE")))
-                    val isRegistered = obj.optBoolean("isRegistered", i == 0)
-                    when (type) {
-                        "GSM" -> gsmCount++
-                        "WCDMA", "UMTS" -> wcdmaCount++
-                        "NR" -> nrCount++
-                        else -> lteCount++
+                    val type = explicitCellType(obj)
+                    if (type == null) {
+                        XposedBridge.logOpenCellId("Skipping cell_json[$i] because radio type is missing or unsupported")
+                        continue
                     }
-                    
-                    val mcc = positiveJsonInt(obj, "mcc", default = 460)
-                    val mnc = positiveJsonInt(obj, "mnc", "net", default = 0)
+                    val isRegistered = obj.optBoolean("isRegistered", false)
                     val tacOrLac = cellAreaCode(obj, 0)
                     val ciOrCid = cellIdentityCode(obj, 0)
                     if (tacOrLac <= 0 || ciOrCid <= 0) {
                         XposedBridge.logOpenCellId("Skipping cell_json[$i] because area or identity is missing: $obj")
                         continue
                     }
-                    val pci = positiveJsonInt(obj, "pci", "psc", default = (ciOrCid % 504).coerceIn(0, 503))
+                    val mcc = jsonIntValue(obj, "mcc")?.takeIf { it in 100..999 }
+                    val mnc = jsonIntValue(obj, "mnc", "net")?.takeIf { it in 0..999 }
+                    if (mcc == null || mnc == null) {
+                        XposedBridge.logOpenCellId("Skipping cell_json[$i] because MCC/MNC is missing")
+                        continue
+                    }
+                    when (type) {
+                        "GSM" -> gsmCount++
+                        "WCDMA", "UMTS" -> wcdmaCount++
+                        "NR" -> nrCount++
+                        else -> lteCount++
+                    }
+                    val pci = jsonIntValue(obj, "pci", "psc")?.takeIf { it >= 0 } ?: 0
                     val dbm = signalDbm(obj, i)
+                    if (dbm == null) {
+                        XposedBridge.logOpenCellIdEvery(
+                            "cell-build-missing-signal:$i:$type",
+                            "Skipping cell_json[$i] because signal strength is missing",
+                            60_000L
+                        )
+                        continue
+                    }
+                    val rsrq = signalRsrq(obj, i)
+                    val sinr = signalSinr(obj, i)
                     if (firstSummary == null) {
                         firstSummary = "$type/$mcc-$mnc area=$tacOrLac identity=$ciOrCid dbm=$dbm registered=$isRegistered"
                     }
@@ -3238,7 +2784,7 @@ class LocationHooker : XposedModule() {
                     val cellInfoClass = when (type) {
                         "GSM" -> XposedHelpers.findClass("android.telephony.CellInfoGsm", classLoader)
                         "WCDMA", "UMTS" -> XposedHelpers.findClass("android.telephony.CellInfoWcdma", classLoader)
-                        "NR" -> try { XposedHelpers.findClass("android.telephony.CellInfoNr", classLoader) } catch (e: Throwable) { XposedHelpers.findClass("android.telephony.CellInfoLte", classLoader) }
+                        "NR" -> XposedHelpers.findClass("android.telephony.CellInfoNr", classLoader)
                         else -> XposedHelpers.findClass("android.telephony.CellInfoLte", classLoader)
                     }
                     val cellInfo = XposedHelpers.newInstance(cellInfoClass)
@@ -3256,7 +2802,7 @@ class LocationHooker : XposedModule() {
                     val cellIdentityClass = when (type) {
                         "GSM" -> XposedHelpers.findClass("android.telephony.CellIdentityGsm", classLoader)
                         "WCDMA", "UMTS" -> XposedHelpers.findClass("android.telephony.CellIdentityWcdma", classLoader)
-                        "NR" -> try { XposedHelpers.findClass("android.telephony.CellIdentityNr", classLoader) } catch (e: Throwable) { XposedHelpers.findClass("android.telephony.CellIdentityLte", classLoader) }
+                        "NR" -> XposedHelpers.findClass("android.telephony.CellIdentityNr", classLoader)
                         else -> XposedHelpers.findClass("android.telephony.CellIdentityLte", classLoader)
                     }
                     val mccStr = mcc.toString()
@@ -3299,7 +2845,7 @@ class LocationHooker : XposedModule() {
                     val cssClass = when (type) {
                         "GSM" -> XposedHelpers.findClass("android.telephony.CellSignalStrengthGsm", classLoader)
                         "WCDMA", "UMTS" -> XposedHelpers.findClass("android.telephony.CellSignalStrengthWcdma", classLoader)
-                        "NR" -> try { XposedHelpers.findClass("android.telephony.CellSignalStrengthNr", classLoader) } catch (e: Throwable) { XposedHelpers.findClass("android.telephony.CellSignalStrengthLte", classLoader) }
+                        "NR" -> XposedHelpers.findClass("android.telephony.CellSignalStrengthNr", classLoader)
                         else -> XposedHelpers.findClass("android.telephony.CellSignalStrengthLte", classLoader)
                     }
                     val css = XposedHelpers.newInstance(cssClass)
@@ -3309,24 +2855,29 @@ class LocationHooker : XposedModule() {
                             val asu = ((dbm + 113) / 2).coerceIn(0, 31)
                             try { XposedHelpers.setIntField(css, "mRssi", dbm) } catch (e: Throwable) {}
                             try { XposedHelpers.setIntField(css, "mGsmSignalStrength", asu) } catch (e: Throwable) {}
-                            try { XposedHelpers.setIntField(css, "mSignalStrength", dbm) } catch (e: Throwable) {}
+                            try { XposedHelpers.setIntField(css, "mSignalStrength", asu) } catch (e: Throwable) {}
                         }
                         "WCDMA", "UMTS" -> {
+                            try { XposedHelpers.setIntField(css, "mRssi", dbm) } catch (e: Throwable) {}
                             try { XposedHelpers.setIntField(css, "mRscp", dbm) } catch (e: Throwable) {}
                             try { XposedHelpers.setIntField(css, "mSignalStrength", dbm) } catch (e: Throwable) {}
                         }
                         "NR" -> {
                             try { XposedHelpers.setIntField(css, "mCsiRsrp", dbm) } catch (e: Throwable) {}
-                            try { XposedHelpers.setIntField(css, "mCsiRsrq", -10) } catch (e: Throwable) {}
-                            try { XposedHelpers.setIntField(css, "mCsiSinr", 15) } catch (e: Throwable) {}
                             try { XposedHelpers.setIntField(css, "mSsRsrp", dbm) } catch (e: Throwable) {}
-                            try { XposedHelpers.setIntField(css, "mSsRsrq", -10) } catch (e: Throwable) {}
-                            try { XposedHelpers.setIntField(css, "mSsSinr", 15) } catch (e: Throwable) {}
+                            if (rsrq != null) {
+                                try { XposedHelpers.setIntField(css, "mCsiRsrq", rsrq) } catch (e: Throwable) {}
+                                try { XposedHelpers.setIntField(css, "mSsRsrq", rsrq) } catch (e: Throwable) {}
+                            }
+                            if (sinr != null) {
+                                try { XposedHelpers.setIntField(css, "mCsiSinr", (sinr / 10).coerceIn(-10, 35)) } catch (e: Throwable) {}
+                                try { XposedHelpers.setIntField(css, "mSsSinr", (sinr / 10).coerceIn(-10, 35)) } catch (e: Throwable) {}
+                            }
                         }
                         else -> { // LTE
                             try { XposedHelpers.setIntField(css, "mRsrp", dbm) } catch (e: Throwable) {}
-                            try { XposedHelpers.setIntField(css, "mRsrq", -10) } catch (e: Throwable) {}
-                            try { XposedHelpers.setIntField(css, "mRssnr", 300) } catch (e: Throwable) {}
+                            if (rsrq != null) try { XposedHelpers.setIntField(css, "mRsrq", rsrq) } catch (e: Throwable) {}
+                            if (sinr != null) try { XposedHelpers.setIntField(css, "mRssnr", sinr) } catch (e: Throwable) {}
                             try { XposedHelpers.setIntField(css, "mSignalStrength", dbm + 113) } catch (e: Throwable) {}
                         }
                     }
@@ -3343,11 +2894,15 @@ class LocationHooker : XposedModule() {
 
                     result.add(cellInfo)
                 } catch (e: Throwable) {
-                    XposedBridge.logOpenCellId("buildFakeCellInfoList failed to parse/build cell_json[$i]", e)
+                    XposedBridge.logOpenCellIdEvery(
+                        "cell-build:$i:${e.javaClass.name}",
+                        "buildFakeCellInfoList failed at cell_json[$i]: ${e.javaClass.simpleName}: ${e.message}",
+                        60_000L
+                    )
                 }
             }
             XposedBridge.logOpenCellIdEvery(
-                "buildFakeCellInfoList:return:$lteCount:$nrCount:$wcdmaCount:$gsmCount:${result.size}:$firstSummary",
+                "buildFakeCellInfoList:return:$lteCount:$nrCount:$wcdmaCount:$gsmCount:${result.size}",
                 "buildFakeCellInfoList returning ${result.size} cells from cell_json types=LTE:$lteCount NR:$nrCount WCDMA:$wcdmaCount GSM:$gsmCount first=$firstSummary"
             )
             return result
@@ -3361,14 +2916,23 @@ class LocationHooker : XposedModule() {
         return result
     }
 
-    private fun normalizeCellType(rawType: String): String {
-        return when (rawType.uppercase(java.util.Locale.US)) {
-            "GSM" -> "GSM"
-            "UMTS", "WCDMA" -> "WCDMA"
+    private fun normalizeCellTypeOrNull(rawType: String): String? =
+        when (rawType.trim().uppercase(java.util.Locale.US)) {
+            "GSM", "GPRS", "EDGE" -> "GSM"
+            "UMTS", "WCDMA", "HSPA", "HSPAP", "HSPA+" -> "WCDMA"
+            "LTE", "LTE_CA", "4G" -> "LTE"
             "NR", "NR5G", "5G" -> "NR"
-            else -> "LTE"
+            else -> null
         }
+
+    private fun explicitCellType(cell: org.json.JSONObject?): String? {
+        cell ?: return null
+        val raw = cell.optString("type", cell.optString("radio", ""))
+        return normalizeCellTypeOrNull(raw)
     }
+
+    private fun normalizeCellType(rawType: String): String =
+        normalizeCellTypeOrNull(rawType) ?: "UNKNOWN"
 
     private fun cellAreaCode(cell: org.json.JSONObject, default: Int): Int =
         positiveJsonInt(cell, "tac", "lac", "area", default = default)
@@ -3387,34 +2951,274 @@ class LocationHooker : XposedModule() {
         return default
     }
 
-    private fun signalDbm(cell: org.json.JSONObject, index: Int): Int {
-        val direct = cell.optInt("dbm", Int.MIN_VALUE)
-        if (direct in -140..-40) return direct
+    private fun rawSignalDbm(cell: org.json.JSONObject): Int? = when {
+            cell.optInt("dbm", Int.MIN_VALUE) in -140..-40 -> cell.optInt("dbm")
+            cell.optInt("averageSignalStrength", Int.MIN_VALUE) in -140..-40 -> cell.optInt("averageSignalStrength")
+            cell.optInt("signal", Int.MIN_VALUE) in -140..-40 -> cell.optInt("signal")
+            else -> null
+        }
 
-        val average = cell.optInt("averageSignalStrength", Int.MIN_VALUE)
-        if (average in -140..-40) return average
-
-        val signal = cell.optInt("signal", Int.MIN_VALUE)
-        if (signal in -140..-40) return signal
-
-        return (-70 - index * 3).coerceAtLeast(-110)
+    private fun signalDbm(cell: org.json.JSONObject, index: Int): Int? {
+        val base = rawSignalDbm(cell) ?: return null
+        return (base + signalJitterDelta(index, 0, 5)).coerceIn(-140, -40)
     }
 
-    private fun firstCell(config: org.json.JSONObject?): org.json.JSONObject? {
-        val cells = config?.optJSONArray("cell_json") ?: return null
-        return if (cells.length() > 0) cells.optJSONObject(0) else null
+    private fun signalRsrq(cell: org.json.JSONObject, index: Int): Int? {
+        val direct = cell.optInt("rsrq", Int.MIN_VALUE)
+        if (direct !in -30..-3) return null
+        return (direct + signalJitterDelta(index, 1, 3)).coerceIn(-30, -3)
     }
 
-    private fun isTelephonyCallbackListener(classLoader: ClassLoader, callback: Any, listenerName: String): Boolean {
+    private fun signalSinr(cell: org.json.JSONObject, index: Int): Int? {
+        val direct = cell.optInt("sinr", Int.MIN_VALUE)
+        val normalized = when {
+            direct in -20..40 -> direct * 10
+            direct in -200..300 -> direct
+            else -> return null
+        }
+        return (normalized + signalJitterDelta(index, 2, 30)).coerceIn(-50, 180)
+    }
+
+    private fun signalJitterDelta(index: Int, salt: Int, maxAmplitude: Int): Int {
+        val config = lastConfig
+        if (config?.optBoolean("signal_jitter_enabled", true) == false) return 0
+        val level = config?.optInt("signal_jitter_level", 40)?.coerceIn(0, 100) ?: 40
+        if (level <= 0 || maxAmplitude <= 0) return 0
+        val amplitude = maxOf(1, (maxAmplitude * level / 100.0).toInt())
+        val tick = System.currentTimeMillis() / 2500L
+        val seed = tick + index * 97L + salt * 997L + (config?.optLong("start_timestamp", 0L) ?: 0L)
+        val rng = java.util.Random(seed)
+        return rng.nextInt(amplitude * 2 + 1) - amplitude
+    }
+
+    private fun firstUsableCell(cells: org.json.JSONArray?): org.json.JSONObject? {
+        if (cells == null) return null
+        for (index in 0 until cells.length()) {
+            val cell = cells.optJSONObject(index) ?: continue
+            if (cell.optBoolean("isRegistered", false) &&
+                cellAreaCode(cell, 0) > 0 && cellIdentityCode(cell, 0) > 0
+            ) return cell
+        }
+        return null
+    }
+
+    private fun firstServiceCell(cells: org.json.JSONArray?): org.json.JSONObject? {
+        if (cells == null) return null
+        for (index in 0 until cells.length()) {
+            val cell = cells.optJSONObject(index) ?: continue
+            if (cellAreaCode(cell, 0) <= 0 || cellIdentityCode(cell, 0) <= 0) continue
+            if (!cell.optBoolean("isRegistered", false)) continue
+            if (cellOperatorNumeric(cell) == null || explicitCellType(cell) == null) continue
+            return cell
+        }
+        return null
+    }
+
+    private fun firstSignalCell(cells: org.json.JSONArray?): org.json.JSONObject? {
+        if (cells == null) return null
+        for (index in 0 until cells.length()) {
+            val cell = cells.optJSONObject(index) ?: continue
+            if (cellAreaCode(cell, 0) <= 0 || cellIdentityCode(cell, 0) <= 0) continue
+            if (!cell.optBoolean("isRegistered", false)) continue
+            if (cellOperatorNumeric(cell) == null || explicitCellType(cell) == null) continue
+            if (rawSignalDbm(cell) == null) continue
+            return cell
+        }
+        return null
+    }
+
+    private fun firstCell(config: org.json.JSONObject?): org.json.JSONObject? =
+        firstUsableCell(config?.optJSONArray("cell_json"))
+
+    private fun jsonIntValue(cell: org.json.JSONObject, vararg keys: String): Int? {
+        for (key in keys) {
+            if (!cell.has(key) || cell.isNull(key)) continue
+            val value = runCatching {
+                val raw = cell.get(key)
+                when (raw) {
+                    is Number -> raw.toInt()
+                    else -> raw.toString().trim().toInt()
+                }
+            }.getOrNull()
+            if (value != null) return value
+        }
+        return null
+    }
+
+    private fun cellOperatorNumeric(cell: org.json.JSONObject?): String? {
+        cell ?: return null
+        val mcc = jsonIntValue(cell, "mcc")?.takeIf { it in 100..999 } ?: return null
+        val mnc = jsonIntValue(cell, "mnc", "net")?.takeIf { it in 0..999 } ?: return null
+        val mncWidth = if (mnc >= 100) 3 else 2
+        return String.format(java.util.Locale.US, "%03d%0${mncWidth}d", mcc, mnc)
+    }
+
+    private fun cellOperatorName(cell: org.json.JSONObject?): String {
+        cell ?: return ""
+        for (key in arrayOf("operatorName", "operator_name", "carrier")) {
+            val value = cell.optString(key, "").trim()
+            if (value.isNotEmpty()) return value
+        }
+        return cellOperatorNumeric(cell) ?: ""
+    }
+
+    private fun cellNetworkType(cell: org.json.JSONObject?): Int {
+        return when (explicitCellType(cell)) {
+            "GSM" -> 16
+            "WCDMA" -> 3
+            "LTE" -> 13
+            "NR" -> 20
+            else -> 0
+        }
+    }
+
+    private fun cellPhoneType(cell: org.json.JSONObject?): Int =
+        if (explicitCellType(cell) != null) 1 else 0
+
+    private fun buildFakeCellLocation(
+        classLoader: ClassLoader,
+        config: org.json.JSONObject?
+    ): Any? {
+        val cell = firstCell(config) ?: return null
+        val area = cellAreaCode(cell, 0)
+        val identity = cellIdentityCode(cell, 0)
+        if (area <= 0 || identity <= 0) return null
         return runCatching {
-            val listenerIface = XposedHelpers.findClass(
-                "android.telephony.TelephonyCallback\$$listenerName", classLoader
+            val clazz = XposedHelpers.findClass(
+                "android.telephony.gsm.GsmCellLocation",
+                classLoader
             )
-            listenerIface.isInstance(callback)
-        }.getOrElse { false }
+            XposedHelpers.newInstance(clazz).also {
+                XposedHelpers.callMethod(it, "setLacAndCid", area, identity)
+            }
+        }.getOrNull()
+    }
+
+    private fun installCellDeliveryHooks(callback: Any, classLoader: ClassLoader) {
+        val callbackClass = callback.javaClass
+        fun freshConfig(): org.json.JSONObject? = readConfig()?.takeIf { shouldMockCell(it) }
+        fun hasParameters(method: java.lang.reflect.Method, vararg typeNames: String): Boolean =
+            method.parameterTypes.map { it.name } == typeNames.toList()
+
+        fun installCellInfoMethod(methodName: String) {
+            hookDynamicMethodOnce(
+                callbackClass,
+                methodName,
+                { hasParameters(it, "java.util.List") },
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = freshConfig() ?: return
+                        if (param.args.isNotEmpty()) {
+                            param.args[0] = buildFakeCellInfoList(classLoader, config)
+                        } else {
+                            param.result = null
+                        }
+                    }
+                }
+            )
+        }
+        installCellInfoMethod("onCellInfoChanged")
+        installCellInfoMethod("onCellInfo")
+
+        hookDynamicMethodOnce(
+            callbackClass,
+            "onCellLocationChanged",
+            { hasParameters(it, "android.telephony.CellLocation") },
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val config = freshConfig() ?: return
+                    val fake = buildFakeCellLocation(classLoader, config)
+                    if (fake != null && param.args.isNotEmpty()) param.args[0] = fake else param.result = null
+                }
+            }
+        )
+        hookDynamicMethodOnce(
+            callbackClass,
+            "onServiceStateChanged",
+            { hasParameters(it, "android.telephony.ServiceState") },
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val config = freshConfig() ?: return
+                    val fake = buildFakeServiceState(classLoader, config.optJSONArray("cell_json"))
+                    if (fake != null && param.args.isNotEmpty()) param.args[0] = fake else param.result = null
+                }
+            }
+        )
+        hookDynamicMethodOnce(
+            callbackClass,
+            "onSignalStrengthsChanged",
+            { hasParameters(it, "android.telephony.SignalStrength") },
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val config = freshConfig() ?: return
+                    val fake = buildFakeSignalStrength(classLoader, config)
+                    if (fake != null && param.args.isNotEmpty()) param.args[0] = fake else param.result = null
+                }
+            }
+        )
+        hookDynamicMethodOnce(
+            callbackClass,
+            "onSignalStrengthChanged",
+            { hasParameters(it, "int") },
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val config = freshConfig() ?: return
+                    val cell = firstSignalCell(config.optJSONArray("cell_json"))
+                    val dbm = cell?.let { signalDbm(it, 0) }
+                    if (dbm != null && param.args.isNotEmpty()) {
+                        param.args[0] = ((dbm + 113) / 2).coerceIn(0, 31)
+                    } else {
+                        param.result = null
+                    }
+                }
+            }
+        )
+
+        fun suppressSensitiveCallback(methodName: String, vararg parameterTypes: String) {
+            hookDynamicMethodOnce(
+                callbackClass,
+                methodName,
+                { hasParameters(it, *parameterTypes) },
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (freshConfig() != null) param.result = null
+                    }
+                }
+            )
+        }
+        suppressSensitiveCallback(
+            "onRegistrationFailed",
+            "android.telephony.CellIdentity",
+            "java.lang.String",
+            "int",
+            "int",
+            "int"
+        )
+        suppressSensitiveCallback("onBarringInfoChanged", "android.telephony.BarringInfo")
+        hookDynamicMethodOnce(
+            callbackClass,
+            "onPhysicalChannelConfigChanged",
+            { hasParameters(it, "java.util.List") },
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (freshConfig() != null && param.args.isNotEmpty()) {
+                        param.args[0] = java.util.ArrayList<Any>()
+                    }
+                }
+            }
+        )
+        XposedBridge.logOpenCellIdEvery(
+            "cell-delivery-hooks:${callbackClass.name}",
+            "Installed delivery-time cell hooks on ${callbackClass.name}",
+            60_000L
+        )
     }
 
     private fun buildFakeServiceState(classLoader: ClassLoader, cellArray: org.json.JSONArray?): Any? {
+        val cell = firstServiceCell(cellArray) ?: return null
+        val operator = cellOperatorNumeric(cell) ?: return null
+        val operatorName = cellOperatorName(cell).ifBlank { operator }
+        val networkType = cellNetworkType(cell).takeIf { it != 0 } ?: return null
         XposedBridge.logOpenCellIdEvery(
             "buildFakeServiceState:called:${cellArray?.length() ?: 0}",
             "buildFakeServiceState called cellJsonCount=${cellArray?.length() ?: 0}"
@@ -3422,19 +3226,6 @@ class LocationHooker : XposedModule() {
         return try {
             val clazz = XposedHelpers.findClass("android.telephony.ServiceState", classLoader)
             val state = XposedHelpers.newInstance(clazz)
-            val cell = if (cellArray != null && cellArray.length() > 0) cellArray.optJSONObject(0) else null
-            val operator = if (cell != null) {
-                val mcc = positiveJsonInt(cell, "mcc", default = 460)
-                val mnc = positiveJsonInt(cell, "mnc", "net", default = 0)
-                String.format(java.util.Locale.US, "%d%02d", mcc, mnc)
-            } else {
-                "46000"
-            }
-            val operatorName = when (operator.takeLast(2).toIntOrNull() ?: 0) {
-                1, 6, 9 -> "中国联通"
-                3, 5, 11 -> "中国电信"
-                else -> "中国移动"
-            }
 
             try { XposedHelpers.callMethod(state, "setState", 0) } catch (_: Throwable) {}
             try { XposedHelpers.callMethod(state, "setVoiceRegState", 0) } catch (_: Throwable) {}
@@ -3449,20 +3240,24 @@ class LocationHooker : XposedModule() {
                 XposedHelpers.callMethod(psBuilder, "setDomain", 2) // DOMAIN_PS = 2
                 XposedHelpers.callMethod(psBuilder, "setTransportType", 1) // TRANSPORT_TYPE_WWAN = 1
                 XposedHelpers.callMethod(psBuilder, "setRegistrationState", 1) // REGISTRATION_STATE_HOME = 1
-                XposedHelpers.callMethod(psBuilder, "setAccessNetworkTechnology", 14) // NETWORK_TYPE_LTE = 14
+                XposedHelpers.callMethod(psBuilder, "setAccessNetworkTechnology", networkType)
                 val psNri = XposedHelpers.callMethod(psBuilder, "build")
                 
                 val csBuilder = XposedHelpers.newInstance(nriBuilderClass)
                 XposedHelpers.callMethod(csBuilder, "setDomain", 1) // DOMAIN_CS = 1
                 XposedHelpers.callMethod(csBuilder, "setTransportType", 1) // TRANSPORT_TYPE_WWAN = 1
                 XposedHelpers.callMethod(csBuilder, "setRegistrationState", 1) // REGISTRATION_STATE_HOME = 1
-                XposedHelpers.callMethod(csBuilder, "setAccessNetworkTechnology", 14) // NETWORK_TYPE_LTE = 14
+                XposedHelpers.callMethod(csBuilder, "setAccessNetworkTechnology", networkType)
                 val csNri = XposedHelpers.callMethod(csBuilder, "build")
 
                 XposedHelpers.callMethod(state, "addNetworkRegistrationInfo", psNri)
                 XposedHelpers.callMethod(state, "addNetworkRegistrationInfo", csNri)
             } catch (e: Throwable) {
-                XposedBridge.log("[LocationSpoofer] Failed to add NetworkRegistrationInfo to ServiceState: " + e.message)
+                XposedBridge.logOpenCellIdEvery(
+                    "service-state-registration:${e.javaClass.name}",
+                    "ServiceState registration build failed: ${e.javaClass.simpleName}: ${e.message}",
+                    60_000L
+                )
             }
             try { XposedHelpers.setIntField(state, "mVoiceRegState", 0) } catch (_: Throwable) {}
             try { XposedHelpers.setIntField(state, "mDataRegState", 0) } catch (_: Throwable) {}
@@ -3484,31 +3279,90 @@ class LocationHooker : XposedModule() {
     }
 
     private fun buildFakeSignalStrength(classLoader: ClassLoader, config: org.json.JSONObject?): Any? {
-        val cellCount = config?.optJSONArray("cell_json")?.length() ?: 0
+        val cellArray = config?.optJSONArray("cell_json")
+        val first = firstSignalCell(cellArray) ?: return null
+        val type = explicitCellType(first) ?: return null
+        val dbm = signalDbm(first, 0) ?: return null
+        val rsrq = signalRsrq(first, 0)
+        val sinr = signalSinr(first, 0)
+        val cellCount = cellArray?.length() ?: 0
         XposedBridge.logOpenCellIdEvery(
-            "buildFakeSignalStrength:called:$cellCount",
-            "buildFakeSignalStrength called cellJsonCount=$cellCount"
+            "buildFakeSignalStrength:called:$type:$cellCount",
+            "buildFakeSignalStrength called type=$type cellJsonCount=$cellCount"
         )
         return try {
             val clazz = XposedHelpers.findClass("android.telephony.SignalStrength", classLoader)
             val signalStrength = XposedHelpers.newInstance(clazz)
-            val dbm = signalDbm(firstCell(config) ?: org.json.JSONObject(), 0)
-            val lteSignalClass = XposedHelpers.findClass("android.telephony.CellSignalStrengthLte", classLoader)
-            val lteSignal = XposedHelpers.newInstance(lteSignalClass)
-            try { XposedHelpers.setIntField(lteSignal, "mRsrp", dbm) } catch (_: Throwable) {}
-            try { XposedHelpers.setIntField(lteSignal, "mRsrq", -10) } catch (_: Throwable) {}
-            try { XposedHelpers.setIntField(lteSignal, "mRssnr", 300) } catch (_: Throwable) {}
-            try { XposedHelpers.setIntField(lteSignal, "mSignalStrength", dbm + 113) } catch (_: Throwable) {}
-            try { XposedHelpers.setObjectField(signalStrength, "mLte", lteSignal) } catch (_: Throwable) {}
-            try { XposedHelpers.setObjectField(signalStrength, "mCellSignalStrengths", listOf(lteSignal)) } catch (_: Throwable) {}
-            try { XposedHelpers.setBooleanField(signalStrength, "mLteAsPrimaryInNrNsa", true) } catch (_: Throwable) {}
+            val componentClassName = when (type) {
+                "GSM" -> "android.telephony.CellSignalStrengthGsm"
+                "WCDMA" -> "android.telephony.CellSignalStrengthWcdma"
+                "NR" -> "android.telephony.CellSignalStrengthNr"
+                else -> "android.telephony.CellSignalStrengthLte"
+            }
+            val component = XposedHelpers.newInstance(
+                XposedHelpers.findClass(componentClassName, classLoader)
+            )
+            when (type) {
+                "GSM" -> {
+                    val gsmDbm = dbm.coerceIn(-113, -51)
+                    val asu = ((gsmDbm + 113) / 2).coerceIn(0, 31)
+                    try { XposedHelpers.setIntField(component, "mRssi", gsmDbm) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(component, "mGsmSignalStrength", asu) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(component, "mSignalStrength", asu) } catch (_: Throwable) {}
+                }
+                "WCDMA" -> {
+                    try { XposedHelpers.setIntField(component, "mRssi", dbm) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(component, "mRscp", dbm) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(component, "mSignalStrength", dbm) } catch (_: Throwable) {}
+                }
+                "NR" -> {
+                    try { XposedHelpers.setIntField(component, "mCsiRsrp", dbm) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(component, "mSsRsrp", dbm) } catch (_: Throwable) {}
+                    if (rsrq != null) {
+                        try { XposedHelpers.setIntField(component, "mCsiRsrq", rsrq) } catch (_: Throwable) {}
+                        try { XposedHelpers.setIntField(component, "mSsRsrq", rsrq) } catch (_: Throwable) {}
+                    }
+                    if (sinr != null) {
+                        val nrSinr = (sinr / 10).coerceIn(-10, 35)
+                        try { XposedHelpers.setIntField(component, "mCsiSinr", nrSinr) } catch (_: Throwable) {}
+                        try { XposedHelpers.setIntField(component, "mSsSinr", nrSinr) } catch (_: Throwable) {}
+                    }
+                }
+                else -> {
+                    try { XposedHelpers.setIntField(component, "mRsrp", dbm) } catch (_: Throwable) {}
+                    if (rsrq != null) try { XposedHelpers.setIntField(component, "mRsrq", rsrq) } catch (_: Throwable) {}
+                    if (sinr != null) try { XposedHelpers.setIntField(component, "mRssnr", sinr) } catch (_: Throwable) {}
+                    try { XposedHelpers.setIntField(component, "mSignalStrength", dbm + 113) } catch (_: Throwable) {}
+                }
+            }
+            val signalField = when (type) {
+                "GSM" -> "mGsm"
+                "WCDMA" -> "mWcdma"
+                "NR" -> "mNr"
+                else -> "mLte"
+            }
+            var attached = runCatching {
+                XposedHelpers.setObjectField(signalStrength, signalField, component)
+                true
+            }.getOrDefault(false)
+            if (!attached) {
+                attached = runCatching {
+                    XposedHelpers.setObjectField(signalStrength, "mCellSignalStrengths", listOf(component))
+                    true
+                }.getOrDefault(false)
+            }
+            if (!attached) return null
             XposedBridge.logOpenCellIdEvery(
-                "buildFakeSignalStrength:success:$dbm",
-                "buildFakeSignalStrength success dbm=$dbm"
+                "buildFakeSignalStrength:success:$type",
+                "buildFakeSignalStrength success type=$type dbm=$dbm"
             )
             signalStrength
         } catch (e: Throwable) {
-            XposedBridge.logOpenCellId("buildFakeSignalStrength failed", e)
+            XposedBridge.logOpenCellIdEvery(
+                "signal-strength-build:${e.javaClass.name}",
+                "buildFakeSignalStrength failed: ${e.javaClass.simpleName}: ${e.message}",
+                60_000L
+            )
             null
         }
     }
@@ -3625,7 +3479,11 @@ class LocationHooker : XposedModule() {
             )
             return obj
         } catch (e: Throwable) {
-            XposedBridge.log("[LocationSpoofer][CellMock] Unsafe failed for $type: $e")
+            XposedBridge.logOpenCellIdEvery(
+                "cell-identity-unsafe:$type:${e.javaClass.name}",
+                "CellIdentity Unsafe fallback failed type=$type: ${e.javaClass.simpleName}: ${e.message}",
+                60_000L
+            )
         }
 
         // ── 阶段三：最小参数构造器 + 安全默认值填充（绝对保底）──
@@ -3694,25 +3552,75 @@ class LocationHooker : XposedModule() {
     private var lastSatelliteUpdate: Long = 0L
     private var isSpoofingActiveCache: Boolean = false
     private var spoofingCountCache: Int = 0
+    private var nmeaGsvPageCounter: Int = 0
 
     private fun updateSatelliteCacheIfNeeded() {
         val now = System.currentTimeMillis()
         if (cachedSatellites == null || now - lastSatelliteUpdate > 1000) {
             val config = readConfig()
-            isSpoofingActiveCache = config?.optBoolean("active", false) ?: false
+            isSpoofingActiveCache = shouldDeliverLocation(config)
             if (isSpoofingActiveCache) {
-                val count = config?.optInt("satellite_count", 10) ?: 10
+                val count = (config?.optInt("satellite_count", 20) ?: 20).coerceIn(0, 64)
                 spoofingCountCache = count
                 val timeSec = now / 1000.0
                 val enableJitter = config?.optBoolean("enable_jitter", true) ?: true
-                
-                val newCache = Array(count) { i ->
-                    generateSatelliteData(i, enableJitter, timeSec)
+
+                val visible = ArrayList<SatelliteData>(count)
+                var candidate = 0
+                val maxCandidates = maxOf(240, count * 24)
+                while (visible.size < count && candidate < maxCandidates) {
+                    val sat = generateSatelliteData(candidate, config ?: JSONObject(), enableJitter, timeSec)
+                    if (sat.elevation >= 3f) {
+                        visible.add(sat)
+                    }
+                    candidate++
                 }
+                while (visible.size < count) {
+                    visible.add(generateFallbackSkySatellite(visible.size, config ?: JSONObject(), enableJitter, timeSec))
+                }
+
+                val usedCount = when {
+                    count <= 0 -> 0
+                    count <= 4 -> count
+                    else -> maxOf(4, (count * 0.65f).toInt()).coerceAtMost(count)
+                }
+                val sorted = visible.sortedWith(compareByDescending<SatelliteData> { it.cn0 }.thenByDescending { it.elevation })
+                val usedIndices = chooseUsedSatelliteIndices(sorted, usedCount, now)
+                val newCache = sorted
+                    .mapIndexed { index, sat -> sat.copy(usedInFix = index in usedIndices) }
+                    .toTypedArray()
                 cachedSatellites = newCache
+            } else {
+                spoofingCountCache = 0
+                cachedSatellites = emptyArray()
             }
             lastSatelliteUpdate = now
         }
+    }
+
+    private fun chooseUsedSatelliteIndices(sats: List<SatelliteData>, usedCount: Int, now: Long): Set<Int> {
+        if (usedCount <= 0 || sats.isEmpty()) return emptySet()
+        if (usedCount >= sats.size) return sats.indices.toSet()
+        val selected = linkedSetOf<Int>()
+        val rng = java.util.Random((now / 20_000L) + (lastConfig?.optLong("start_timestamp", 0L) ?: 0L))
+        selected.add(0)
+        if (sats.size > 1) selected.add(1)
+        var guard = 0
+        while (selected.size < usedCount && guard < sats.size * 12) {
+            guard++
+            val candidate = rng.nextInt(sats.size)
+            val sat = sats[candidate]
+            val quality = ((sat.cn0 - 18f) / 28f).coerceIn(0.15f, 1f)
+            val lateBoost = if (candidate > usedCount) 0.18 else 0.0
+            if (rng.nextDouble() < (quality * 0.72 + lateBoost).coerceIn(0.05, 0.95)) {
+                selected.add(candidate)
+            }
+        }
+        var fallback = 0
+        while (selected.size < usedCount && fallback < sats.size) {
+            selected.add(fallback++)
+        }
+        return selected
     }
 
     private fun getCachedSatellite(satIndex: Int): SatelliteData? {
@@ -3721,37 +3629,27 @@ class LocationHooker : XposedModule() {
         return cachedSatellites!![safeIndex]
     }
 
-    private fun generateSatelliteData(satIndex: Int, enableJitter: Boolean, timeSec: Double): SatelliteData {
-        // 增量刷新优化 (Incremental Update Optimization):
-        // 强制每个卫星的数据每 4 秒才变化一次，并使用 satIndex 进行错开 (Staggering)。
-        // 这意味着在任何一秒钟，只有 25% 的卫星数据发生变化。
-        // 目标 App 的 DiffUtil 会发现 75% 的卫星数据完全没变，从而跳过大部分 UI 重绘，彻底解决滑动卡顿！
+    private fun getApiSatellite(satIndex: Int): SatelliteData? {
+        updateSatelliteCacheIfNeeded()
+        val sats = cachedSatellites ?: return null
+        if (!isSpoofingActiveCache || satIndex !in sats.indices) return null
+        return sats[satIndex]
+    }
+
+    private fun generateSatelliteData(
+        satIndex: Int,
+        config: JSONObject,
+        enableJitter: Boolean,
+        timeSec: Double
+    ): SatelliteData {
         val updateIntervalSec = 4.0
         val steppedTimeSec = Math.floor((timeSec + satIndex) / updateIntervalSec) * updateIntervalSec - satIndex
-        val steppedDeltaTimeMin = steppedTimeSec / 60.0
+        val targetLat = config.optDouble("wgs84_lat", config.optDouble("lat", 0.0))
+        val targetLng = config.optDouble("wgs84_lng", config.optDouble("lng", 0.0))
 
-        val rng = java.util.Random(satIndex.toLong() + 1000L)
-        val initialPhase = rng.nextDouble() * Math.PI * 2
-        val amplitude = 20.0 + rng.nextDouble() * 20.0
-        val baseElevation = 30.0 + rng.nextDouble() * 20.0
-        val elevation = (baseElevation + amplitude * Math.sin(steppedDeltaTimeMin * 0.05 + initialPhase)).toFloat().coerceIn(0f, 90f)
-
-        val rngAz = java.util.Random(satIndex.toLong() + 4000L)
-        val initialAzimuth = rngAz.nextDouble() * 360.0
-        val currentAzimuth = ((initialAzimuth + steppedDeltaTimeMin * 0.5) % 360.0).toFloat()
-
-        val baseCn0 = 20.0 + (elevation / 90.0) * 20.0
-        val noise = if (enableJitter) {
-            val dynamicRng = java.util.Random((steppedTimeSec / 3.0).toLong() + satIndex)
-            (dynamicRng.nextDouble() - 0.5) * 4.0 // +/- 2 dB
-        } else 0.0
-        val cn0 = (baseCn0 + noise).coerceIn(10.0, 45.0).toFloat()
-
-        val rngType = java.util.Random(satIndex.toLong() + 3000L)
-        val rand = rngType.nextDouble()
-        val type = when {
-            rand < 0.5 -> 1
-            rand < 0.7 -> 3
+        val type = when (satIndex % 10) {
+            0, 1, 2, 3, 4 -> 1
+            5, 6 -> 3
             else -> 5
         }
         val svid = when (type) {
@@ -3759,14 +3657,155 @@ class LocationHooker : XposedModule() {
             3 -> 1 + (satIndex * 3) % 24 // GLONASS (GnssStatus standard is 1-24)
             else -> 1 + (satIndex * 5) % 63 // BDS
         }
-        
-        // Log satellite generated occasionally or if debugging
-        // XposedBridge.log("[GPS_Spoofer] Generated Sat: type=$type, svid=$svid, cn0=$cn0, elev=$elevation, az=$currentAzimuth")
 
-        val rngFix = java.util.Random(satIndex.toLong() + 2000L)
-        val usedInFix = rngFix.nextDouble() < 0.75
+        val orbitalRadiusMeters = when (type) {
+            3 -> 25_510_000.0
+            5 -> 27_906_000.0
+            else -> 26_560_000.0
+        }
+        val inclinationDeg = when (type) {
+            3 -> 64.8
+            5 -> 55.0
+            else -> 55.0
+        }
+        val orbitalPeriodSec = when (type) {
+            3 -> 40_544.0
+            5 -> 46_800.0
+            else -> 43_082.0
+        }
 
-        return SatelliteData(svid, type, elevation, currentAzimuth, cn0, usedInFix)
+        val raan = Math.toRadians(((satIndex * 47 + type * 23) % 360).toDouble())
+        val inclination = Math.toRadians(inclinationDeg)
+        val meanAnomaly = Math.toRadians(((satIndex * 137 + 53) % 360).toDouble()) +
+            (2.0 * Math.PI * steppedTimeSec / orbitalPeriodSec)
+
+        val cosRaan = Math.cos(raan)
+        val sinRaan = Math.sin(raan)
+        val cosInc = Math.cos(inclination)
+        val sinInc = Math.sin(inclination)
+        val xOrb = orbitalRadiusMeters * Math.cos(meanAnomaly)
+        val yOrb = orbitalRadiusMeters * Math.sin(meanAnomaly)
+        val xEci = cosRaan * xOrb - sinRaan * cosInc * yOrb
+        val yEci = sinRaan * xOrb + cosRaan * cosInc * yOrb
+        val zEci = sinInc * yOrb
+
+        val gmst = Math.toRadians(normalizeDegrees(280.46061837 + 360.98564736629 * (steppedTimeSec / 86400.0)))
+        val cosGmst = Math.cos(gmst)
+        val sinGmst = Math.sin(gmst)
+        val satX = cosGmst * xEci + sinGmst * yEci
+        val satY = -sinGmst * xEci + cosGmst * yEci
+        val satZ = zEci
+
+        val look = lookAnglesFromReceiver(targetLat, targetLng, satX, satY, satZ)
+        val noise = if (enableJitter) {
+            val dynamicRng = java.util.Random((steppedTimeSec / 3.0).toLong() + satIndex * 17L)
+            (dynamicRng.nextDouble() - 0.5) * 3.0
+        } else 0.0
+        val cn0 = (18.0 + (look.second.coerceIn(0.0, 85.0) / 85.0) * 24.0 + noise)
+            .coerceIn(12.0, 46.0)
+            .toFloat()
+
+        return SatelliteData(
+            svid = svid,
+            type = type,
+            elevation = look.second.toFloat().coerceIn(-90f, 90f),
+            azimuth = look.first.toFloat(),
+            cn0 = cn0,
+            usedInFix = false
+        )
+    }
+
+    private fun generateFallbackSkySatellite(
+        satIndex: Int,
+        config: JSONObject,
+        enableJitter: Boolean,
+        timeSec: Double
+    ): SatelliteData {
+        val targetLat = config.optDouble("wgs84_lat", config.optDouble("lat", 0.0))
+        val targetLng = config.optDouble("wgs84_lng", config.optDouble("lng", 0.0))
+        val type = when (satIndex % 10) {
+            0, 1, 2, 3, 4 -> 1
+            5, 6 -> 3
+            else -> 5
+        }
+        val svid = when (type) {
+            1 -> 1 + (satIndex * 7) % 32
+            3 -> 1 + (satIndex * 3) % 24
+            else -> 1 + (satIndex * 5) % 63
+        }
+        val phase = normalizeDegrees(targetLng + targetLat * 0.37 + satIndex * 137.5 + timeSec / 240.0)
+        val elevation = (18.0 + ((satIndex * 23 + Math.abs(targetLat).toInt()) % 58)).toFloat()
+        val cn0Noise = if (enableJitter) {
+            val rng = java.util.Random((timeSec / 4.0).toLong() + satIndex * 31L)
+            (rng.nextDouble() - 0.5) * 3.0
+        } else 0.0
+        val cn0 = (20.0 + elevation / 90.0 * 22.0 + cn0Noise).coerceIn(14.0, 45.0).toFloat()
+        return SatelliteData(svid, type, elevation, phase.toFloat(), cn0, false)
+    }
+
+    private fun lookAnglesFromReceiver(
+        latDeg: Double,
+        lngDeg: Double,
+        satX: Double,
+        satY: Double,
+        satZ: Double
+    ): Pair<Double, Double> {
+        val lat = Math.toRadians(latDeg)
+        val lng = Math.toRadians(lngDeg)
+        val earthRadius = 6_378_137.0
+        val recX = earthRadius * Math.cos(lat) * Math.cos(lng)
+        val recY = earthRadius * Math.cos(lat) * Math.sin(lng)
+        val recZ = earthRadius * Math.sin(lat)
+        val dx = satX - recX
+        val dy = satY - recY
+        val dz = satZ - recZ
+        val east = -Math.sin(lng) * dx + Math.cos(lng) * dy
+        val north = -Math.sin(lat) * Math.cos(lng) * dx -
+            Math.sin(lat) * Math.sin(lng) * dy +
+            Math.cos(lat) * dz
+        val up = Math.cos(lat) * Math.cos(lng) * dx +
+            Math.cos(lat) * Math.sin(lng) * dy +
+            Math.sin(lat) * dz
+        val horizontal = Math.sqrt(east * east + north * north)
+        val azimuth = normalizeDegrees(Math.toDegrees(Math.atan2(east, north)))
+        val elevation = Math.toDegrees(Math.atan2(up, horizontal))
+        return Pair(azimuth, elevation)
+    }
+
+    private fun normalizeDegrees(value: Double): Double {
+        val mod = value % 360.0
+        return if (mod < 0.0) mod + 360.0 else mod
+    }
+
+    private fun spoofedBearing(config: JSONObject): Float {
+        val base = config.optDouble("sim_bearing", 0.0)
+        val enableJitter = config.optBoolean("enable_jitter", true)
+        val noise = if (enableJitter) {
+            val tick = System.currentTimeMillis() / 1500L
+            val rng = java.util.Random(tick + 0xBEEFL)
+            (rng.nextDouble() - 0.5) * 2.0
+        } else {
+            0.0
+        }
+        return normalizeDegrees(base + noise).toFloat()
+    }
+
+    private fun spoofedSpeed(config: JSONObject): Float {
+        val base = config.optDouble("sim_speed", 0.0).coerceAtLeast(0.0)
+        if (base <= 0.05) return 0f
+        val enableJitter = config.optBoolean("enable_jitter", true)
+        val noise = if (enableJitter) {
+            val tick = System.currentTimeMillis() / 1200L
+            val rng = java.util.Random(tick + 0x5EEDL)
+            (rng.nextDouble() - 0.5) * minOf(0.4, base * 0.08)
+        } else {
+            0.0
+        }
+        return (base + noise).coerceAtLeast(0.05).toFloat()
+    }
+
+    private fun hasSpoofedMotion(config: JSONObject): Boolean {
+        return spoofedSpeed(config) > 0.1f
     }
 
     /**
@@ -3783,6 +3822,7 @@ class LocationHooker : XposedModule() {
     private fun hookGnssStatus(classLoader: ClassLoader) {
         try {
             val locationManagerClazz = XposedHelpers.findClass("android.location.LocationManager", classLoader)
+            installGnssStatusGetterHooks(classLoader)
             
             // Hook addGpsStatusListener
             try {
@@ -3796,9 +3836,11 @@ class LocationHooker : XposedModule() {
                                     XposedBridge.hookAllMethods(clazz, "onGpsStatusChanged", object : XC_MethodHook() {
                                         private var lastCallTime = 0L
                                         override fun beforeHookedMethod(param: MethodHookParam) {
+                                            val config = readConfig()
+                                            if (!shouldDeliverLocation(config)) return
                                             val event = param.args[0] as? Int
                                             if (event == 4) { // GPS_EVENT_SATELLITE_STATUS
-                                                val now = System.currentTimeMillis()
+                                                val now = android.os.SystemClock.elapsedRealtime()
                                                 if (now - lastCallTime < 1000) {
                                                     param.result = null // Throttle
                                                 } else {
@@ -3826,7 +3868,7 @@ class LocationHooker : XposedModule() {
             // Hook registerGnssStatusCallback
             try {
                 XposedBridge.hookAllMethods(locationManagerClazz, "registerGnssStatusCallback", object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
+                    override fun afterHookedMethod(param: MethodHookParam) {
                         var callbackObj: Any? = null
                         val cbClass = try {
                             classLoader.loadClass("android.location.GnssStatus\$Callback")
@@ -3844,108 +3886,53 @@ class LocationHooker : XposedModule() {
                                 try {
                                     XposedBridge.hookAllMethods(clazz, "onSatelliteStatusChanged", object : XC_MethodHook() {
                                         private var lastCallTime = 0L
-                                        private var cachedGnssStatus: Any? = null
-                                        private var lastGnssStatusUpdate = 0L
 
                                         override fun beforeHookedMethod(param: MethodHookParam) {
-                                            val now = System.currentTimeMillis()
+                                            val config = readConfig()
+                                            if (!shouldDeliverLocation(config)) return
+                                            val now = android.os.SystemClock.elapsedRealtime()
                                             if (now - lastCallTime < 1000) {
-                                                param.result = null // Throttle
+                                                param.result = null // Throttle real callbacks
                                                 return
                                             }
                                             lastCallTime = now
 
-                                            val statusObj = param.args[0] ?: return
+                                            if (param.args.isEmpty() || param.args[0] == null) return
                                             updateSatelliteCacheIfNeeded()
 
-                                            if (isSpoofingActiveCache && cachedSatellites != null) {
-                                                val count = spoofingCountCache
-                                                val sats = cachedSatellites!!
-
-                                                // 1. Android 11+ (API 30+) 优先使用原生 Builder
-                                                // 解决了 Android 11+ mSvidWithFlags 的位移变化 (8 -> 12) 导致的 SVID 全部变 0 的致命 Bug。
-                                                try {
-                                                    val builderClass = XposedHelpers.findClassIfExists("android.location.GnssStatus\$Builder", clazz.classLoader)
-                                                    if (builderClass != null) {
-                                                        if (cachedGnssStatus == null || now - lastGnssStatusUpdate > 1000) {
-                                                            val builder = builderClass.getDeclaredConstructor().newInstance()
-                                                            val addMethod = builderClass.getDeclaredMethod(
-                                                                "addSatellite",
-                                                                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, Float::class.javaPrimitiveType,
-                                                                Float::class.javaPrimitiveType, Float::class.javaPrimitiveType, Boolean::class.javaPrimitiveType,
-                                                                Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType,
-                                                                Float::class.javaPrimitiveType, Boolean::class.javaPrimitiveType, Float::class.javaPrimitiveType
-                                                            )
-                                                            addMethod.isAccessible = true
-                                                            for (i in 0 until count) {
-                                                                val sat = sats[i]
-                                                                addMethod.invoke(
-                                                                    builder, sat.type, sat.svid, sat.cn0, sat.elevation, sat.azimuth,
-                                                                    true, true, sat.usedInFix, false, 0f, false, 0f
-                                                                )
-                                                            }
-                                                            val buildMethod = builderClass.getDeclaredMethod("build")
-                                                            buildMethod.isAccessible = true
-                                                            cachedGnssStatus = buildMethod.invoke(builder)
-                                                            lastGnssStatusUpdate = now
-                                                        }
-                                                        param.args[0] = cachedGnssStatus
-                                                        return // 成功构建并替换，直接返回
-                                                    }
-                                                } catch (e: Throwable) {}
-
-                                                // 2. Android 10 及以下 (API 24-29) 回退到反射直接篡改底层数组
-                                                // 旧版系统的 SVID_SHIFT_WIDTH = 8，以下位运算完全兼容。
-                                                try {
-                                                    val countField = statusObj.javaClass.getDeclaredField("mSvCount")
-                                                    countField.isAccessible = true
-                                                    countField.setInt(statusObj, count)
-
-                                                    val cn0DbHzs = FloatArray(count)
-                                                    val elevations = FloatArray(count)
-                                                    val azimuths = FloatArray(count)
-                                                    val svidWithFlags = IntArray(count)
-
-                                                    for (i in 0 until count) {
-                                                        val sat = sats[i]
-                                                        cn0DbHzs[i] = sat.cn0
-                                                        elevations[i] = sat.elevation
-                                                        azimuths[i] = sat.azimuth
-                                                        var flags = 1 or 2
-                                                        if (sat.usedInFix) flags = flags or 4
-                                                        svidWithFlags[i] = (sat.svid shl 8) or (sat.type and 0xF) or (flags shl 4)
-                                                    }
-
-                                                    val setField = { name: String, value: Any ->
-                                                        try {
-                                                            val f = statusObj.javaClass.getDeclaredField(name)
-                                                            f.isAccessible = true
-                                                            f.set(statusObj, value)
-                                                        } catch (e: Exception) {}
-                                                    }
-
-                                                    setField("mSvidWithFlags", svidWithFlags)
-                                                    setField("mCn0DbHz", cn0DbHzs)
-                                                    setField("mElevations", elevations)
-                                                    setField("mAzimuths", azimuths)
-                                                    setField("mCarrierFrequencies", FloatArray(count))
-                                                    setField("mBasebandCn0DbHzs", FloatArray(count))
-                                                } catch (e: Exception) {}
-                                            }
+                                            // Do not mutate GnssStatus internals here. Android keeps parallel
+                                            // arrays for CN0/elevation/azimuth/flags, and field-name drift can
+                                            // leave mSvCount larger than one of those arrays. Public getter hooks
+                                            // below provide a coherent satellite view without corrupting objects.
                                         }
                                     })
                                 } catch (e: Throwable) {}
+                            }
+                            // Start an active injector so the callback is driven even when the real
+                            // GPS has no satellite signal (indoor, airplane mode, etc.).
+                            // Without this, onSatelliteStatusChanged is never called by the system,
+                            // and satellite view apps see an empty sky regardless of our getter hooks.
+                            if (shouldActivelyInjectClientGnss()) {
+                                val config = readConfig()
+                                if (shouldDeliverLocation(config)) {
+                                    startGnssStatusInjector(callbackObj, classLoader)
+                                }
                             }
                         }
                     }
                 })
             } catch (e: Throwable) { XposedBridge.log(e) }
 
-            // Hook unregisterGnssStatusCallback
+            // Hook unregisterGnssStatusCallback — cancel any active injector
             try {
                 XposedBridge.hookAllMethods(locationManagerClazz, "unregisterGnssStatusCallback", object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        // No longer needed
+                        for (arg in param.args) {
+                            if (arg != null) {
+                                val key = System.identityHashCode(arg)
+                                gnssStatusInjectors.remove(key)?.cancel()
+                            }
+                        }
                     }
                 })
             } catch (e: Throwable) {}
@@ -3955,7 +3942,7 @@ class LocationHooker : XposedModule() {
                 XposedHelpers.findAndHookMethod("android.location.GpsStatus", classLoader, "getSatellites", object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val config = readConfig()
-                        if (config != null && config.optBoolean("active", false)) {
+                        if (shouldDeliverLocation(config)) {
                             param.result = createSpoofedGpsSatellites(classLoader)
                         }
                     }
@@ -3969,6 +3956,223 @@ class LocationHooker : XposedModule() {
         }
     }
 
+    /**
+     * Actively drives GnssStatus callbacks so satellite view apps see a live spoofed sky
+     * even when the real GPS hardware has no signal (indoor / airplane mode).
+     *
+     * Strategy:
+     * - Every 1 second, build a minimal GnssStatus via Builder (Android 7+) or reflection constructor.
+     * - Call onSatelliteStatusChanged(gnssStatus) on the registered callback object directly.
+     * - The getter hooks installed by installGnssStatusGetterHooks() rewrite the returned values
+     *   (getSatelliteCount, getCn0DbHz, etc.) so the app sees spoofed satellite data.
+     * - Do NOT mutate GnssStatus parallel arrays; only construct a trivially valid shell.
+     */
+    private fun startGnssStatusInjector(callbackObj: Any, classLoader: ClassLoader) {
+        val key = System.identityHashCode(callbackObj)
+        if (gnssStatusInjectors.containsKey(key)) return
+        val timer = java.util.Timer("LocationSpoofer_GnssSat_${key}", true)
+        gnssStatusInjectors[key] = timer
+        XposedBridge.logEvery(
+            "gnssInjectorStart:$currentPackageName:${callbackObj.javaClass.simpleName}",
+            "[GPS_Spoofer] GnssStatus active injector started pkg=$currentPackageName cb=${callbackObj.javaClass.simpleName}"
+        )
+        timer.scheduleAtFixedRate(object : java.util.TimerTask() {
+            override fun run() {
+                try {
+                    val config = readConfig()
+                    if (!shouldDeliverLocation(config)) {
+                        gnssStatusInjectors.remove(key)?.cancel()
+                        return
+                    }
+                    updateSatelliteCacheIfNeeded()
+                    if (!isSpoofingActiveCache) return
+                    val satCount = cachedSatellites?.size ?: 0
+                    if (satCount == 0) return
+
+                    // Build the smallest valid GnssStatus that the getter hooks can wrap.
+                    // We need to call onSatelliteStatusChanged; the argument just needs to
+                    // be a GnssStatus instance — actual field values are overridden by hooks.
+                    val gnssStatus = buildMinimalGnssStatus(classLoader, satCount) ?: return
+
+                    // Directly invoke the callback — this is how the satellite view refreshes.
+                    XposedHelpers.tryCallMethodDeep(callbackObj, "onSatelliteStatusChanged", gnssStatus)
+                } catch (_: Throwable) {}
+            }
+        }, 200L, 1000L)
+    }
+
+    /**
+     * Constructs a minimal GnssStatus shell with the given satellite count.
+     * Tries GnssStatus.Builder (Android 7+) first, then falls back to the
+     * internal constructor via reflection.
+     * Returns null if no construction path works on this Android version.
+     */
+    private fun buildMinimalGnssStatus(classLoader: ClassLoader, satCount: Int): Any? {
+        val gnssStatusClazz = XposedHelpers.findClassIfExists("android.location.GnssStatus", classLoader)
+            ?: return null
+
+        // Path 1: GnssStatus.Builder (Android 7.0+ / API 24+)
+        try {
+            val builderClazz = XposedHelpers.findClassIfExists("android.location.GnssStatus\$Builder", classLoader)
+            if (builderClazz != null) {
+                val builder = builderClazz.getDeclaredConstructor().also { it.isAccessible = true }.newInstance()
+                val sats = cachedSatellites ?: return null
+                for (i in 0 until minOf(satCount, sats.size)) {
+                    val sat = sats[i]
+                    // addSatellite(constellationType, svid, cn0DbHz, elevation, azimuth,
+                    //              hasAlmanac, hasEphemeris, usedInFix)
+                    try {
+                        val addSat = builderClazz.getMethod(
+                            "addSatellite",
+                            Int::class.javaPrimitiveType,
+                            Int::class.javaPrimitiveType,
+                            Float::class.javaPrimitiveType,
+                            Float::class.javaPrimitiveType,
+                            Float::class.javaPrimitiveType,
+                            Boolean::class.javaPrimitiveType,
+                            Boolean::class.javaPrimitiveType,
+                            Boolean::class.javaPrimitiveType
+                        )
+                        addSat.invoke(builder, sat.type, sat.svid, sat.cn0,
+                            sat.elevation, sat.azimuth, true, true, sat.usedInFix)
+                    } catch (_: Throwable) {}
+                }
+                val buildMethod = builderClazz.getMethod("build")
+                return buildMethod.invoke(builder)
+            }
+        } catch (_: Throwable) {}
+
+        // Path 2: Internal constructor GnssStatus(int, float[], float[], float[], int[])
+        // Used on Android 7.0 where the Builder may not be public.
+        try {
+            val sats = cachedSatellites ?: return null
+            val n = minOf(satCount, sats.size)
+            val svidsAndFlags = IntArray(n) { i ->
+                val sat = sats[i]
+                var flags = sat.type shl 3
+                if (sat.usedInFix) flags = flags or 0x01
+                flags = flags or 0x02 // hasEphemeris
+                flags = flags or 0x04 // hasAlmanac
+                (sat.svid shl 8) or flags
+            }
+            val cn0s   = FloatArray(n) { i -> sats[i].cn0 }
+            val elvs   = FloatArray(n) { i -> sats[i].elevation }
+            val azis   = FloatArray(n) { i -> sats[i].azimuth }
+            for (ctor in gnssStatusClazz.declaredConstructors) {
+                if (ctor.parameterCount == 5) {
+                    ctor.isAccessible = true
+                    return ctor.newInstance(n, cn0s, elvs, azis, svidsAndFlags)
+                }
+            }
+        } catch (_: Throwable) {}
+
+        return null
+    }
+
+    private fun installGnssStatusGetterHooks(classLoader: ClassLoader) {
+        val gnssStatusClazz = XposedHelpers.findClassIfExists("android.location.GnssStatus", classLoader) ?: return
+        try {
+            XposedHelpers.findAndHookMethod(
+                gnssStatusClazz,
+                "getSatelliteCount",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        updateSatelliteCacheIfNeeded()
+                        if (isSpoofingActiveCache) {
+                            val count = cachedSatellites?.size ?: 0
+                            param.result = count
+                            XposedBridge.logEvery(
+                                "gnssStatusCount:$currentPackageName:$count",
+                                "[GPS_Spoofer] GnssStatus.getSatelliteCount spoofed count=$count package=$currentPackageName"
+                            )
+                        }
+                    }
+                }
+            )
+        } catch (_: Throwable) {}
+
+        fun hookIndexedInt(methodName: String, value: (SatelliteData) -> Int) {
+            try {
+                XposedHelpers.findAndHookMethod(
+                    gnssStatusClazz,
+                    methodName,
+                    Int::class.javaPrimitiveType!!,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val sat = getApiSatellite(param.args.getOrNull(0) as? Int ?: return) ?: return
+                            param.result = value(sat)
+                        }
+                    }
+                )
+            } catch (_: Throwable) {}
+        }
+
+        fun hookIndexedFloat(methodName: String, value: (SatelliteData) -> Float) {
+            try {
+                XposedHelpers.findAndHookMethod(
+                    gnssStatusClazz,
+                    methodName,
+                    Int::class.javaPrimitiveType!!,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val sat = getApiSatellite(param.args.getOrNull(0) as? Int ?: return) ?: return
+                            param.result = value(sat)
+                        }
+                    }
+                )
+            } catch (_: Throwable) {}
+        }
+
+        fun hookIndexedBoolean(methodName: String, value: (SatelliteData) -> Boolean) {
+            try {
+                XposedHelpers.findAndHookMethod(
+                    gnssStatusClazz,
+                    methodName,
+                    Int::class.javaPrimitiveType!!,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val sat = getApiSatellite(param.args.getOrNull(0) as? Int ?: return) ?: return
+                            param.result = value(sat)
+                        }
+                    }
+                )
+            } catch (_: Throwable) {}
+        }
+
+        hookIndexedInt("getSvid") { it.svid }
+        hookIndexedInt("getConstellationType") { it.type }
+        hookIndexedFloat("getCn0DbHz") { it.cn0 }
+        hookIndexedFloat("getElevationDegrees") { it.elevation }
+        hookIndexedFloat("getAzimuthDegrees") { it.azimuth }
+        hookIndexedBoolean("hasEphemerisData") { true }
+        hookIndexedBoolean("hasAlmanacData") { true }
+        hookIndexedBoolean("usedInFix") { it.usedInFix }
+        hookIndexedBoolean("hasCarrierFrequencyHz") { true }
+        hookIndexedFloat("getCarrierFrequencyHz") { sat ->
+            when (sat.type) {
+                3 -> 1_602_000_000f
+                5 -> 1_561_098_000f
+                else -> 1_575_420_000f
+            }
+        }
+        hookIndexedBoolean("hasBasebandCn0DbHz") { true }
+        hookIndexedFloat("getBasebandCn0DbHz") { (it.cn0 - 1.5f).coerceAtLeast(0f) }
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                gnssStatusClazz,
+                "getCodeType",
+                Int::class.javaPrimitiveType!!,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val sat = getApiSatellite(param.args.getOrNull(0) as? Int ?: return) ?: return
+                        param.result = if (sat.type == 5) "I" else "C"
+                    }
+                }
+            )
+        } catch (_: Throwable) {}
+    }
+
     @Volatile
     private var lastConfig: JSONObject? = null
     @Volatile
@@ -3976,64 +4180,369 @@ class LocationHooker : XposedModule() {
     @Volatile
     private var lastOpenCellConfigReadFailureLogTime = 0L
     private val providerConfigDebugLastTimes = ConcurrentHashMap<String, Long>()
-    @Volatile
-    private var isConfigPollingStarted = false
+    private val configPollingClaimed = java.util.concurrent.atomic.AtomicBoolean(false)
     @Volatile
     private var configPollIntervalMs = 1_000L
-    private val pollingLock = Any()
+    private val configPollWake = java.util.concurrent.Semaphore(0)
+    @Volatile
+    private var configChangeCallbackInstalled = false
+    private var configChangeCallback: Runnable? = null
+    @Volatile
+    private var configContentObserverInstalled = false
+    private val configContentObserverLock = Any()
+    private var configContentObserver: android.database.ContentObserver? = null
+    private val lastConfigContentObserverAttemptAt = AtomicLong(0L)
+    @Volatile
+    private var lastObservedRuntimeFrame: String? = null
+    @Volatile
+    private var lastObservedStopGeneration: String? = null
     private val localConfigPath = "/data/local/tmp/locationspoofer_config.json"
     private val systemConfigPath = "/data/system/locationspoofer_config.json"
     private val activeConfigTtlMs = 30_000L
+    private val inactiveConfigPollIntervalMs = 60_000L
+    private val locationDisabledPollIntervalMs = 10_000L
+    @Volatile
+    private var cachedBootId: String? = null
+    @Volatile
+    private var cachedBootIdInitialized = false
+    private val bootIdLock = Any()
+    @Volatile
+    private var configDiskReadDisabled = false
+    @Volatile
+    private var cachedSystemPropertyGetMethod: java.lang.reflect.Method? = null
+    private val systemPropertyMethodLock = Any()
+    private val highestObservedStopGeneration = AtomicLong(0L)
+    private val lastHotStopGenerationReadAt = AtomicLong(0L)
+    private val configContentUri = Uri.parse("content://com.suseoaa.locationspoofer.provider")
+    private val configContentObserverRetryIntervalMs = 10_000L
+    private val hotStopGenerationReadIntervalMs = 250L
+
+    private data class ConfigCandidate(
+        val source: String,
+        val config: JSONObject,
+        val priority: Int
+    ) {
+        private val semanticFreshness: Long = maxOf(
+            config.optLong("heartbeat_at", 0L),
+            config.optLong("config_updated_at", 0L)
+        )
+        val freshness: Long = semanticFreshness.takeIf { it > 0L }
+            ?: config.optLong("_file_modified_at", 0L)
+        val generation: Long = config.optLong("config_generation", 0L)
+        val inactive: Boolean = !config.optBoolean("active", false)
+    }
+
+    private data class RuntimeFrame(
+        val active: Boolean,
+        val snapshotGeneration: Long,
+        val heartbeatUptimeMs: Long,
+        val latitude: Double,
+        val longitude: Double,
+        val bearing: Double,
+        val speed: Double
+    )
+
+    private fun parseRuntimeFrame(raw: String): RuntimeFrame? {
+        val parts = raw.split('|')
+        if (parts.size != 8 || parts[0] != "1") return null
+        val active = when (parts[1]) {
+            "1" -> true
+            "0" -> false
+            else -> return null
+        }
+        val generation = parts[2].toLongOrNull()?.takeIf { it >= 0L } ?: return null
+        val heartbeatUptimeMs = parts[3].toLongOrNull()?.takeIf { it >= 0L } ?: return null
+        val latitudeE7 = parts[4].toLongOrNull() ?: return null
+        val longitudeE7 = parts[5].toLongOrNull() ?: return null
+        val bearingCentiDegrees = parts[6].toIntOrNull() ?: return null
+        val speedCentimetersPerSecond = parts[7].toIntOrNull() ?: return null
+        val nowUptime = android.os.SystemClock.uptimeMillis()
+        if (heartbeatUptimeMs > nowUptime + 5_000L) return null
+        // Current writers always emit a real generation for both active and inactive
+        // frames. Reject legacy generation zero so it cannot mask a newer snapshot on
+        // a cold process start where no in-memory generation is available for comparison.
+        if (generation == 0L || (active && heartbeatUptimeMs == 0L)) return null
+        if (latitudeE7 !in -900_000_000L..900_000_000L ||
+            longitudeE7 !in -1_800_000_000L..1_800_000_000L ||
+            bearingCentiDegrees !in 0..35_999 ||
+            speedCentimetersPerSecond !in 0..100_000
+        ) return null
+        return RuntimeFrame(
+            active = active,
+            snapshotGeneration = generation,
+            heartbeatUptimeMs = heartbeatUptimeMs,
+            latitude = latitudeE7 / 10_000_000.0,
+            longitude = longitudeE7 / 10_000_000.0,
+            bearing = bearingCentiDegrees / 100.0,
+            speed = speedCentimetersPerSecond / 100.0
+        )
+    }
+
+    private fun readStopGeneration(): Long {
+        val observed = getSystemProperty("gsm.locsp.stop_generation", "0")
+            .toLongOrNull()
+            ?.coerceAtLeast(0L)
+            ?: 0L
+        while (true) {
+            val previous = highestObservedStopGeneration.get()
+            if (observed <= previous) return previous
+            if (highestObservedStopGeneration.compareAndSet(previous, observed)) return observed
+        }
+    }
+
+    /**
+     * A SystemProperties callback is process-local and may miss writes made by the root
+     * helper. While an active snapshot is cached, sample only the tiny stop fence at a
+     * bounded rate so STOP becomes pass-through promptly without restoring disk polling.
+     * Inactive configs short-circuit before this method, so normal idle has no extra reads.
+     */
+    private fun readStopGenerationHotPath(): Long {
+        val now = android.os.SystemClock.elapsedRealtime()
+        while (true) {
+            val previous = lastHotStopGenerationReadAt.get()
+            if (previous != 0L && now - previous < hotStopGenerationReadIntervalMs) {
+                return highestObservedStopGeneration.get()
+            }
+            if (lastHotStopGenerationReadAt.compareAndSet(previous, now)) {
+                return readStopGeneration()
+            }
+        }
+    }
+
+    private fun isStoppedGeneration(generation: Long, stopGeneration: Long): Boolean {
+        return stopGeneration > 0L &&
+            (generation <= 0L || generation <= stopGeneration)
+    }
+
+    private fun normalizedCandidate(
+        source: String,
+        rawConfig: JSONObject,
+        priority: Int,
+        runtimeFrame: RuntimeFrame? = null,
+        stopGeneration: Long = readStopGeneration()
+    ): ConfigCandidate? {
+        return try {
+            ConfigCandidate(
+                source,
+                normalizeConfig(rawConfig, runtimeFrame, stopGeneration),
+                priority
+            )
+        } catch (e: Throwable) {
+            XposedBridge.logOpenCellIdEvery(
+                "config:normalize:$source:${e.javaClass.name}",
+                "readConfig ignored invalid $source config: ${e.javaClass.simpleName}: ${e.message}",
+                30_000L
+            )
+            null
+        }
+    }
+
+    private fun selectFreshestConfig(candidates: List<ConfigCandidate>): ConfigCandidate? {
+        return candidates.maxWithOrNull(
+            compareBy<ConfigCandidate> { it.freshness }
+                // At an exact freshness tie, an explicit stop is safer and represents the
+                // terminal lifecycle transition. This also covers a stop written in the same
+                // millisecond as the last active heartbeat.
+                .thenBy { if (it.inactive) 1 else 0 }
+                .thenBy { it.generation }
+                .thenBy { it.priority }
+        )
+    }
+
+    private fun publishConfigCandidate(
+        requestSource: String,
+        candidate: ConfigCandidate,
+        stopGeneration: Long = readStopGeneration(),
+        runtimeFrame: RuntimeFrame? = null
+    ): JSONObject {
+        var selectedCandidate = candidate
+        val cached = lastConfig
+        val cachedGeneration = cached?.optLong("config_generation", 0L) ?: 0L
+        if (candidate.inactive &&
+            cached?.optBoolean("active", false) == true &&
+            cachedGeneration > candidate.generation &&
+            (stopGeneration == 0L || cachedGeneration > stopGeneration)
+        ) {
+            // A timed-out older tombstone may land after a newer run. Refresh the
+            // newer in-memory snapshot (including TTL validation) before deciding;
+            // never let the stale inactive generation overwrite it blindly.
+            shallowCopyConfig(cached)?.let { cachedCopy ->
+                normalizedCandidate(
+                    "memory-newer-than-${candidate.source}",
+                    cachedCopy,
+                    candidate.priority,
+                    runtimeFrame,
+                    stopGeneration
+                )?.let { selectedCandidate = it }
+            }
+        }
+        val activeChanged = lastConfig?.optBoolean("active", false) !=
+            selectedCandidate.config.optBoolean("active", false)
+        lastConfig = selectedCandidate.config
+        configPollIntervalMs = when {
+            !selectedCandidate.config.optBoolean("active", false) -> inactiveConfigPollIntervalMs
+            !isSystemLocationSwitchEnabled() -> if (
+                configChangeCallbackInstalled || configContentObserverInstalled
+            ) {
+                inactiveConfigPollIntervalMs
+            } else {
+                locationDisabledPollIntervalMs
+            }
+            // Runtime frames normally wake the poller. This fallback exists only to
+            // enforce the 30-second TTL after an unexpected writer death.
+            configChangeCallbackInstalled || configContentObserverInstalled ->
+                activeConfigTtlMs + 1_000L
+            else -> 1_000L
+        }
+        logOpenCellConfigLoaded(
+            "$requestSource:${selectedCandidate.source}",
+            selectedCandidate.config
+        )
+        if (activeChanged ||
+            (selectedCandidate.config.optBoolean("active", false) && !systemInjectorStarted)
+        ) {
+            wakeSystemLocationInjector()
+        }
+        return selectedCandidate.config
+    }
 
     private fun logOpenCellConfigLoaded(source: String, config: JSONObject) {
         val cellArray = config.optJSONArray("cell_json")
         val cellCount = cellArray?.length() ?: 0
+        val wifiCount = config.optJSONObject("wifi_json")?.optJSONArray("nearbyWifi")?.length() ?: 0
+        val logKey = "${config.optBoolean("active", false)}|${config.optBoolean("fail_closed", false)}|${config.optBoolean("mock_cell", false)}|$cellCount|$wifiCount"
+        if (logKey == lastOpenCellConfigLogKey) return
+        lastOpenCellConfigLogKey = logKey
         val firstCell = if (cellArray != null && cellArray.length() > 0) cellArray.optJSONObject(0) else null
         val firstSummary = if (firstCell != null) {
             val type = normalizeCellType(firstCell.optString("type", firstCell.optString("radio", "LTE")))
-            val mcc = positiveJsonInt(firstCell, "mcc", default = 460)
-            val mnc = positiveJsonInt(firstCell, "mnc", "net", default = 0)
             val area = cellAreaCode(firstCell, 0)
             val identity = cellIdentityCode(firstCell, 0)
-            "$type/$mcc-$mnc area=$area identity=$identity"
+            "$type/${cellOperatorNumeric(firstCell) ?: "unknown"} area=$area identity=$identity"
         } else {
             "none"
         }
-        val logKey = "${config.optBoolean("active", false)}|${config.optBoolean("mock_cell", true)}|${config.optDouble("lat", 0.0)}|${config.optDouble("lng", 0.0)}|$cellCount|$firstSummary"
-        if (logKey != lastOpenCellConfigLogKey) {
-            lastOpenCellConfigLogKey = logKey
-            XposedBridge.logOpenCellId(
-                "readConfig[$source] active=${config.optBoolean("active", false)} mockCell=${config.optBoolean("mock_cell", true)} lat=${config.optDouble("lat", 0.0)} lng=${config.optDouble("lng", 0.0)} cellJsonCount=$cellCount firstCell=$firstSummary"
-            )
-        }
+        XposedBridge.logOpenCellId(
+            "readConfig[$source] active=${config.optBoolean("active", false)} failClosed=${config.optBoolean("fail_closed", false)} mockCell=${config.optBoolean("mock_cell", false)} wifiCount=$wifiCount cellJsonCount=$cellCount firstCell=$firstSummary"
+        )
     }
 
     private fun configReadPaths(): Array<String> {
         return if (android.os.Process.myUid() == 1000) {
-            arrayOf(systemConfigPath, localConfigPath)
+            arrayOf(systemConfigPath)
         } else {
-            arrayOf(localConfigPath, systemConfigPath)
+            arrayOf(localConfigPath)
         }
     }
 
-    private fun shouldPreferProviderConfig(): Boolean {
-        val uid = android.os.Process.myUid()
-        return uid == 1001 ||
-            currentPackageName == "com.android.ons" ||
-            currentPackageName == "com.android.phone"
-    }
-
-    private fun logConfigDebugEvery(key: String, msg: String, intervalMs: Long = 30_000L) {
-        val now = System.currentTimeMillis()
+    private fun logConfigDebugEvery(key: String, msg: String, intervalMs: Long = 60_000L) {
+        val now = android.os.SystemClock.elapsedRealtime()
         val last = providerConfigDebugLastTimes[key]
         if (last == null || now - last >= intervalMs) {
+            if (providerConfigDebugLastTimes.size >= 128 && last == null) {
+                providerConfigDebugLastTimes.clear()
+            }
             providerConfigDebugLastTimes[key] = now
             android.util.Log.d("LocationSpoofer_Debug", msg)
         }
     }
 
-    private fun normalizeConfig(config: JSONObject): JSONObject {
-        if (!config.has("wifi_json")) config.put("wifi_json", org.json.JSONArray())
+    private fun shouldSpoofLocation(config: JSONObject?): Boolean {
+        if (config?.optBoolean("active", false) != true) return false
+        val stopped = isStoppedGeneration(
+            config.optLong("config_generation", 0L),
+            readStopGenerationHotPath()
+        )
+        if (stopped) requestConfigRefresh()
+        return !stopped
+    }
+
+    private fun shouldDeliverLocation(config: JSONObject?): Boolean {
+        return shouldSpoofLocation(config) && isSystemLocationSwitchEnabled()
+    }
+
+    private fun shouldMockWifi(config: JSONObject?): Boolean {
+        return config?.optBoolean("mock_wifi", false) == true &&
+            shouldDeliverLocation(config)
+    }
+
+    private fun shouldMockCell(config: JSONObject?): Boolean {
+        return config?.optBoolean("mock_cell", false) == true &&
+            shouldDeliverLocation(config)
+    }
+
+    private fun isSystemLocationSwitchEnabled(): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastSystemLocationCheckAt < 1_000L) {
+            return lastSystemLocationEnabled
+        }
+        lastSystemLocationCheckAt = now
+        val context = currentProcessContext()
+        if (context == null) {
+            lastSystemLocationEnabled = false
+            return false
+        }
+        val managerState = runCatching {
+            val manager = context.getSystemService(android.content.Context.LOCATION_SERVICE) as?
+                android.location.LocationManager
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                manager?.isLocationEnabled
+            } else {
+                null
+            }
+        }.getOrNull()
+        val settingsState = runCatching {
+            @Suppress("DEPRECATION")
+            android.provider.Settings.Secure.getInt(
+                context.contentResolver,
+                android.provider.Settings.Secure.LOCATION_MODE,
+                android.provider.Settings.Secure.LOCATION_MODE_OFF
+            ) != android.provider.Settings.Secure.LOCATION_MODE_OFF
+        }.getOrNull()
+        // Unknown state means do not interfere. Returning false here is fail-open
+        // for normal Android behaviour because all hooks simply pass through.
+        lastSystemLocationEnabled = managerState ?: settingsState ?: false
+        return lastSystemLocationEnabled
+    }
+
+    private fun currentProcessContext(): android.content.Context? {
+        cachedProcessContext?.let { return it }
+        val context = try {
+            Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication")
+                .invoke(null) as? android.content.Context
+        } catch (_: Throwable) {
+            null
+        } ?: try {
+            val activityThread = Class.forName("android.app.ActivityThread")
+                .getMethod("currentActivityThread")
+                .invoke(null)
+            activityThread?.let { XposedHelpers.callMethod(it, "getSystemContext") as? android.content.Context }
+        } catch (_: Throwable) {
+            null
+        }
+        if (context != null) cachedProcessContext = context
+        return context
+    }
+
+    private fun normalizeConfig(
+        config: JSONObject,
+        runtimeFrame: RuntimeFrame? = null,
+        stopGeneration: Long = readStopGeneration()
+    ): JSONObject {
+        applyRuntimePropertyOverlay(config, runtimeFrame, stopGeneration)
+        if (config.optBoolean("active", false) &&
+            isStoppedGeneration(config.optLong("config_generation", 0L), stopGeneration)
+        ) {
+            markExpiredConfigInactive(config)
+        }
+        if (config.opt("wifi_json") !is org.json.JSONObject) {
+            config.put("wifi_json", emptyWifiPayload())
+        }
+        if (config.opt("cell_json") !is org.json.JSONArray) {
+            config.put("cell_json", org.json.JSONArray())
+        }
+        config.put("bluetooth_json", org.json.JSONArray())
         if (config.optBoolean("active", false)) {
             val now = System.currentTimeMillis()
             val configBootId = config.optString("boot_id", "")
@@ -4049,14 +4558,32 @@ class LocationHooker : XposedModule() {
             }
             val heartbeatAt = maxOf(
                 config.optLong("heartbeat_at", 0L),
-                config.optLong("config_updated_at", 0L),
-                config.optLong("_file_modified_at", 0L)
+                config.optLong("config_updated_at", 0L)
             )
-            if (config.optBoolean("active", false) && heartbeatAt > 0L && now - heartbeatAt > activeConfigTtlMs) {
-                markFailClosed(config)
+            val heartbeatUptime = config.optLong("heartbeat_uptime_ms", 0L)
+            val heartbeatAgeMs = if (heartbeatUptime > 0L) {
+                val currentUptime = android.os.SystemClock.uptimeMillis()
+                if (heartbeatUptime <= currentUptime) currentUptime - heartbeatUptime else Long.MAX_VALUE
+            } else if (heartbeatAt > 0L) {
+                (now - heartbeatAt).coerceAtLeast(0L)
+            } else {
+                Long.MAX_VALUE
+            }
+            if (config.optBoolean("active", false) && heartbeatAgeMs == Long.MAX_VALUE) {
+                markExpiredConfigInactive(config)
+                XposedBridge.logOpenCellIdEvery(
+                    "config:heartbeat-missing",
+                    "readConfig restored pass-through because active config has no trusted heartbeat",
+                    30_000L
+                )
+            } else if (
+                config.optBoolean("active", false) &&
+                heartbeatAgeMs > activeConfigTtlMs
+            ) {
+                markExpiredConfigInactive(config)
                 XposedBridge.logOpenCellIdEvery(
                     "config:expired",
-                    "readConfig entered fail-closed after stale active config age=${now - heartbeatAt}ms",
+                    "readConfig restored pass-through after stale active config age=${heartbeatAgeMs}ms",
                     30_000L
                 )
             }
@@ -4078,12 +4605,115 @@ class LocationHooker : XposedModule() {
         )
         val jitterSpeed = config.optString("jitter_speed", "MEDIUM").uppercase()
         config.put("jitter_speed", if (jitterSpeed in setOf("SLOW", "MEDIUM", "FAST")) jitterSpeed else "MEDIUM")
+        config.put("sim_speed", config.optDouble("sim_speed", 0.0).coerceAtLeast(0.0))
+        config.put("satellite_count", config.optInt("satellite_count", 20).coerceIn(0, 64))
+        config.put("mock_wifi", config.optBoolean("mock_wifi", false))
+        config.put("mock_cell", config.optBoolean("mock_cell", false))
+        config.put("mock_bluetooth", false)
+        config.put("signal_jitter_enabled", config.optBoolean("signal_jitter_enabled", true))
+        config.put("signal_jitter_level", config.optInt("signal_jitter_level", 40).coerceIn(0, 100))
+        val wifiMode = config.optString("wifi_connection_mode", "FIXED").uppercase()
+        config.put("wifi_connection_mode", if (wifiMode == "RANDOM") "RANDOM" else "FIXED")
         return config
     }
 
-    private fun markFailClosed(config: JSONObject) {
-        config.put("active", true)
-        config.put("fail_closed", true)
+    private fun applyRuntimePropertyOverlay(
+        config: JSONObject,
+        suppliedRuntimeFrame: RuntimeFrame? = null,
+        stopGeneration: Long = readStopGeneration()
+    ) {
+        val runtimeFrame = suppliedRuntimeFrame ?: parseRuntimeFrame(
+            getSystemProperty("gsm.locsp.frame", "")
+        )
+        if (runtimeFrame != null) {
+            val configGeneration = config.optLong("config_generation", 0L)
+            if (!runtimeFrame.active) {
+                // A delayed stop from an older generation must not turn off a newer
+                // active snapshot. Its stop fence still blocks every older/equal run.
+                if (runtimeFrame.snapshotGeneration < configGeneration &&
+                    !isStoppedGeneration(configGeneration, stopGeneration)
+                ) return
+                markExpiredConfigInactive(config)
+                return
+            }
+            // Likewise, ignore a delayed active frame when the loaded snapshot is
+            // already newer. If both are fenced, fail open to normal platform data.
+            if (runtimeFrame.snapshotGeneration < configGeneration &&
+                !isStoppedGeneration(configGeneration, stopGeneration)
+            ) return
+            if (isStoppedGeneration(runtimeFrame.snapshotGeneration, stopGeneration)) {
+                markExpiredConfigInactive(config)
+                return
+            }
+            if (!config.optBoolean("active", false)) return
+            if (configGeneration <= 0L ||
+                runtimeFrame.snapshotGeneration != configGeneration
+            ) return
+            val previousUptime = config.optLong("heartbeat_uptime_ms", 0L)
+            if (previousUptime > runtimeFrame.heartbeatUptimeMs) return
+            config.put("lat", runtimeFrame.latitude)
+            config.put("lng", runtimeFrame.longitude)
+            config.put("sim_bearing", runtimeFrame.bearing)
+            config.put("sim_speed", runtimeFrame.speed)
+            config.put("heartbeat_uptime_ms", runtimeFrame.heartbeatUptimeMs)
+            return
+        }
+
+        // Legacy property overlay remains as a compatibility fallback for snapshots
+        // created before the compact runtime-frame protocol was introduced.
+        if (!config.optBoolean("active", false)) return
+        if (getSystemProperty("gsm.locsp.active", "false").lowercase() != "true") return
+        val propertyHeartbeat = getSystemProperty("gsm.locsp.heartbeat", "0")
+            .toLongOrNull() ?: return
+        val configHeartbeat = maxOf(
+            config.optLong("heartbeat_at", 0L),
+            config.optLong("config_updated_at", 0L)
+        )
+        if (propertyHeartbeat <= configHeartbeat) return
+        val propertyBootId = getSystemProperty("gsm.locsp.boot_id", "")
+        val configBootId = config.optString("boot_id", "")
+        if (propertyBootId.isNotEmpty() && configBootId.isNotEmpty() &&
+            propertyBootId != configBootId
+        ) return
+        val lat = getSystemProperty("gsm.locsp.lat", "").toDoubleOrNull() ?: return
+        val lng = getSystemProperty("gsm.locsp.lng", "").toDoubleOrNull() ?: return
+        if (lat !in -90.0..90.0 || lng !in -180.0..180.0) return
+        config.put("lat", lat)
+        config.put("lng", lng)
+        config.put(
+            "sim_bearing",
+            getSystemProperty("gsm.locsp.bearing", "0").toDoubleOrNull() ?: 0.0
+        )
+        config.put(
+            "sim_speed",
+            (getSystemProperty("gsm.locsp.speed", "0").toDoubleOrNull() ?: 0.0)
+                .coerceAtLeast(0.0)
+        )
+        config.put("heartbeat_at", propertyHeartbeat)
+        config.put(
+            "heartbeat_uptime_ms",
+            getSystemProperty("gsm.locsp.heartbeat_uptime", "0").toLongOrNull() ?: 0L
+        )
+        if (propertyBootId.isNotEmpty()) config.put("boot_id", propertyBootId)
+    }
+
+    private fun emptyWifiPayload(): org.json.JSONObject = org.json.JSONObject().apply {
+        put("isConnected", false)
+        put("connectedWifi", org.json.JSONObject.NULL)
+        put("nearbyWifi", org.json.JSONArray())
+    }
+
+    private fun safeWifiPayload(raw: String?): org.json.JSONObject = runCatching {
+        org.json.JSONObject(raw ?: "")
+    }.getOrElse { emptyWifiPayload() }
+
+    private fun safeArrayPayload(raw: String?): org.json.JSONArray = runCatching {
+        org.json.JSONArray(raw ?: "")
+    }.getOrElse { org.json.JSONArray() }
+
+    private fun markExpiredConfigInactive(config: JSONObject) {
+        config.put("active", false)
+        config.put("fail_closed", false)
         config.put(
             "wifi_json",
             org.json.JSONObject().apply {
@@ -4094,91 +4724,363 @@ class LocationHooker : XposedModule() {
         )
         config.put("cell_json", org.json.JSONArray())
         config.put("bluetooth_json", org.json.JSONArray())
+        // A dead writer is not an active simulation. Restore normal platform data
+        // instead of keeping location/radio hooks engaged indefinitely.
+        config.put("mock_wifi", false)
+        config.put("mock_cell", false)
+        config.put("mock_bluetooth", false)
         config.put("satellite_count", 0)
     }
 
     private fun readBootId(): String {
+        if (cachedBootIdInitialized) return cachedBootId.orEmpty()
+        synchronized(bootIdLock) {
+            if (cachedBootIdInitialized) return cachedBootId.orEmpty()
+            val value = try {
+                File("/proc/sys/kernel/random/boot_id").readText().trim()
+            } catch (_: Throwable) {
+                ""
+            }
+            cachedBootId = value
+            // Cache an empty result too. A domain denied by SELinux must not probe
+            // /proc again on every 1 Hz runtime frame.
+            cachedBootIdInitialized = true
+            return value
+        }
+    }
+
+    private fun shallowCopyConfig(config: JSONObject): JSONObject? {
         return try {
-            File("/proc/sys/kernel/random/boot_id").readText().trim()
+            val names = ArrayList<String>()
+            val keys = config.keys()
+            while (keys.hasNext()) names.add(keys.next())
+            if (names.isEmpty()) JSONObject() else JSONObject(config, names.toTypedArray())
         } catch (e: Throwable) {
-            ""
+            XposedBridge.logOpenCellIdEvery(
+                "config:shallow-copy:${e.javaClass.name}",
+                "readConfig could not copy cached config: ${e.javaClass.simpleName}: ${e.message}",
+                30_000L
+            )
+            null
         }
     }
 
     private fun loadConfigFromDisk(source: String): JSONObject? {
-        if (shouldPreferProviderConfig()) {
-            loadConfigFromContentProvider()?.let { return it }
-            lastConfig?.let { cached ->
-                if (cached.optBoolean("active", false)) {
-                    return normalizeConfig(cached)
+        val candidates = ArrayList<ConfigCandidate>()
+        val runtimeFrame = parseRuntimeFrame(getSystemProperty("gsm.locsp.frame", ""))
+        val stopGeneration = readStopGeneration()
+        val lifecycleState = getSystemProperty(
+            "gsm.locsp.active",
+            "__locationspoofer_property_missing__"
+        ).lowercase()
+        val hasNewerActiveFrame = runtimeFrame?.active == true &&
+            !isStoppedGeneration(runtimeFrame.snapshotGeneration, stopGeneration)
+        val publishedSnapshotGeneration = if (runtimeFrame?.active != true) {
+            getSystemProperty("gsm.locsp.snapshot_generation", "0")
+                .toLongOrNull()
+                ?.coerceAtLeast(0L)
+                ?: 0L
+        } else {
+            0L
+        }
+        val inactiveFrameSuperseded = runtimeFrame?.active == false &&
+            publishedSnapshotGeneration > runtimeFrame.snapshotGeneration &&
+            publishedSnapshotGeneration > stopGeneration
+        // Before the stop-fence protocol existed, STOP could leave active=false and a
+        // generation-zero/missing frame beside a newer active snapshot. Do not let that
+        // legacy property hide the snapshot before disk/provider freshness is compared.
+        // Current STOP writers publish snapshot_generation == stop_generation, so they
+        // never satisfy this strictly-newer test.
+        val legacyLifecycleSuperseded = runtimeFrame == null &&
+            lifecycleState == "false" &&
+            publishedSnapshotGeneration > 0L &&
+            publishedSnapshotGeneration > stopGeneration
+        val hasNewerActiveEvidence = hasNewerActiveFrame ||
+            inactiveFrameSuperseded ||
+            legacyLifecycleSuperseded
+
+        // The lifecycle property is the cheap stop tombstone. It wins without touching
+        // files/provider unless a runtime frame proves that a strictly newer run is active.
+        // This keeps idle scoped processes passive without letting a delayed old stop kill
+        // a newer generation.
+        if (runtimeFrame?.active == false &&
+            stopGeneration > 0L &&
+            !inactiveFrameSuperseded
+        ) {
+            val inactiveBase = lastConfig?.let(::shallowCopyConfig) ?: JSONObject()
+            inactiveBase.put("active", false)
+            inactiveBase.put("config_generation", runtimeFrame.snapshotGeneration)
+            normalizedCandidate(
+                "runtime-frame-stop",
+                inactiveBase,
+                500,
+                runtimeFrame,
+                stopGeneration
+            )?.let {
+                return publishConfigCandidate(source, it, stopGeneration, runtimeFrame)
+            }
+        }
+        if (lifecycleState == "false" && !hasNewerActiveEvidence) {
+            loadConfigFromProperties(stopGeneration)?.let { propertyConfig ->
+                normalizedCandidate(
+                    "system-properties-stop",
+                    propertyConfig,
+                    400,
+                    runtimeFrame,
+                    stopGeneration
+                )?.let {
+                    return publishConfigCandidate(source, it, stopGeneration, runtimeFrame)
                 }
             }
-            loadConfigFromXSharedPreferences()?.let { return it }
-            loadConfigFromProperties()?.let { return it }
-            return null
+        }
+
+        if ((lifecycleState == "true" || hasNewerActiveEvidence) &&
+            runtimeFrame?.active == true
+        ) {
+            val cached = lastConfig
+            if (cached?.optBoolean("active", false) == true &&
+                cached.optLong("config_generation", 0L) == runtimeFrame.snapshotGeneration
+            ) {
+                val cachedCopy = shallowCopyConfig(cached)
+                if (cachedCopy != null) {
+                    normalizedCandidate(
+                        "runtime-frame",
+                        cachedCopy,
+                        450,
+                        runtimeFrame,
+                        stopGeneration
+                    )?.let {
+                        return publishConfigCandidate(source, it, stopGeneration, runtimeFrame)
+                    }
+                }
+            }
         }
 
         val errors = ArrayList<String>()
-        for (path in configReadPaths()) {
-            try {
-                val file = File(path)
-                if (!file.exists()) {
-                    errors.add("$path missing")
-                    continue
+        if (!configDiskReadDisabled) {
+            for ((index, path) in configReadPaths().withIndex()) {
+                try {
+                    val file = File(path)
+                    if (!file.exists()) {
+                        errors.add("$path missing")
+                        continue
+                    }
+                    val rawConfig = JSONObject(file.readText())
+                    if (!rawConfig.has("active")) {
+                        errors.add("$path missing active state")
+                        continue
+                    }
+                    val modifiedAt = file.lastModified()
+                    rawConfig.put("_file_modified_at", modifiedAt)
+                    normalizedCandidate(
+                        "disk:$path",
+                        rawConfig,
+                        200 - index,
+                        runtimeFrame,
+                        stopGeneration
+                    )?.let(candidates::add)
+                    // Each SELinux domain has one known-readable path. Never probe the other
+                    // domain after a valid primary snapshot; doing so caused thousands of AVCs.
+                    if (candidates.isNotEmpty()) break
+                } catch (e: Throwable) {
+                    val detail = "${e.javaClass.simpleName}: ${e.message}"
+                    errors.add("$path $detail")
+                    if (e is SecurityException ||
+                        detail.contains("EACCES", ignoreCase = true) ||
+                        detail.contains("Permission denied", ignoreCase = true)
+                    ) {
+                        // One denied open is enough evidence for this process/domain.
+                        // Future generations use the provider cache instead of producing AVCs.
+                        configDiskReadDisabled = true
+                        break
+                    }
                 }
-                val rawConfig = JSONObject(file.readText())
-                rawConfig.put("_file_modified_at", file.lastModified())
-                val config = normalizeConfig(rawConfig)
-                lastConfig = config
-                configPollIntervalMs = 1_000L
-                logOpenCellConfigLoaded("$source:$path", config)
-                return config
-            } catch (e: Throwable) {
-                errors.add("$path ${e.javaClass.simpleName}: ${e.message}")
+            }
+        } else {
+            errors.add("disk source disabled for this SELinux domain")
+        }
+
+        selectFreshestConfig(candidates)?.let { diskCandidate ->
+            val shadowedByNewerActiveFrame = hasNewerActiveFrame &&
+                diskCandidate.inactive &&
+                runtimeFrame != null &&
+                diskCandidate.generation < runtimeFrame.snapshotGeneration
+            if (!shadowedByNewerActiveFrame) {
+                return publishConfigCandidate(
+                    source,
+                    diskCandidate,
+                    stopGeneration,
+                    runtimeFrame
+                )
             }
         }
 
-        loadConfigFromContentProvider()?.let {
-            return it
+        // When no disk source is readable, a live provider snapshot is authoritative. In
+        // particular, provider active=false must not be mistaken for a missing source and then
+        // replaced by an older active preference/cache value.
+        if (lifecycleState == "true" || hasNewerActiveEvidence) {
+            loadConfigFromContentProvider()?.let { providerConfig ->
+                normalizedCandidate(
+                    "content-provider",
+                    providerConfig,
+                    300,
+                    runtimeFrame,
+                    stopGeneration
+                )?.let {
+                    return publishConfigCandidate(source, it, stopGeneration, runtimeFrame)
+                }
+            }
         }
 
-        val now = System.currentTimeMillis()
-        val isPermissionDenied = errors.any { it.contains("EACCES") || it.contains("Permission denied") }
-        val shouldBackoff = currentPackageName == "com.android.phone" && isPermissionDenied
-        val logIntervalMs = if (isPermissionDenied) 60_000L else 10_000L
-        if (shouldBackoff) {
-            configPollIntervalMs = 60_000L
+        // Disk/provider absence is exceptional. Do not touch XSharedPreferences here:
+        // cross-app data probing can itself create SELinux AVCs. Properties are the
+        // only reduced fallback and never carry rich RF payloads.
+        loadConfigFromProperties(stopGeneration)?.let { propertyConfig ->
+            normalizedCandidate(
+                "system-properties",
+                propertyConfig,
+                90,
+                runtimeFrame,
+                stopGeneration
+            )?.let(candidates::add)
         }
+
+        selectFreshestConfig(candidates)?.let {
+            return publishConfigCandidate(source, it, stopGeneration, runtimeFrame)
+        }
+
+        val now = android.os.SystemClock.elapsedRealtime()
+        val isPermissionDenied = errors.any { it.contains("EACCES") || it.contains("Permission denied") }
+        val logIntervalMs = if (isPermissionDenied) 60_000L else 10_000L
+        configPollIntervalMs = 60_000L
         if (now - lastOpenCellConfigReadFailureLogTime > logIntervalMs) {
             lastOpenCellConfigReadFailureLogTime = now
             XposedBridge.logOpenCellId("readConfig[$source] no readable config (${errors.joinToString(" | ")})")
         }
 
-        // Fall back to XSharedPreferences before system properties.
-        loadConfigFromXSharedPreferences()?.let {
-            return it
-        }
+        return publishCachedConfigIfNoSource(source, stopGeneration, runtimeFrame)
+    }
 
-        // If disk read failed, attempt to fall back to system properties
-        loadConfigFromProperties()?.let {
-            return it
-        }
-
-        lastConfig?.let { cached ->
-            if (cached.optBoolean("active", false)) {
-                normalizeConfig(cached)
-            }
-        }
-        return null
+    private fun publishCachedConfigIfNoSource(
+        source: String,
+        stopGeneration: Long = readStopGeneration(),
+        runtimeFrame: RuntimeFrame? = null
+    ): JSONObject? {
+        val cached = lastConfig ?: return null
+        // normalizeConfig mutates only top-level fields. Preserve the immutable nested
+        // Wi-Fi/cell payload references and avoid serializing/parsing them every frame.
+        val cachedCopy = shallowCopyConfig(cached) ?: return null
+        val candidate = normalizedCandidate(
+            "memory-cache",
+            cachedCopy,
+            0,
+            runtimeFrame,
+            stopGeneration
+        ) ?: return null
+        return publishConfigCandidate(source, candidate, stopGeneration, runtimeFrame)
     }
 
     private fun getSystemProperty(key: String, default: String): String {
         return try {
-            val clazz = Class.forName("android.os.SystemProperties")
-            val method = clazz.getMethod("get", String::class.java, String::class.java)
+            val method = cachedSystemPropertyGetMethod ?: synchronized(systemPropertyMethodLock) {
+                cachedSystemPropertyGetMethod ?: Class.forName("android.os.SystemProperties")
+                    .getMethod("get", String::class.java, String::class.java)
+                    .also { cachedSystemPropertyGetMethod = it }
+            }
             method.invoke(null, key, default) as String
         } catch (e: Throwable) {
             default
+        }
+    }
+
+    private fun requestConfigRefresh() {
+        if (configPollWake.availablePermits() == 0) {
+            configPollWake.release()
+        }
+    }
+
+    private fun requestConfigRefreshIfRuntimeStateChanged() {
+        val runtimeFrame = getSystemProperty("gsm.locsp.frame", "")
+        val stopGeneration = getSystemProperty("gsm.locsp.stop_generation", "0")
+        if (runtimeFrame == lastObservedRuntimeFrame &&
+            stopGeneration == lastObservedStopGeneration
+        ) return
+        lastObservedRuntimeFrame = runtimeFrame
+        lastObservedStopGeneration = stopGeneration
+        requestConfigRefresh()
+    }
+
+    /**
+     * Lifecycle commits notify this exported, read-only provider URI. ContentService keeps
+     * the observer dormant in system_server while idle and wakes the existing background
+     * config poller only for an actual start/stop/full-snapshot commit. This closes the
+     * cross-process notification gap without shortening the 31/60-second safety fallback.
+     */
+    private fun installConfigContentObserver() {
+        if (configContentObserverInstalled) return
+        val context = currentProcessContext() ?: return
+        val now = android.os.SystemClock.elapsedRealtime()
+        while (true) {
+            val previous = lastConfigContentObserverAttemptAt.get()
+            if (previous != 0L && now - previous < configContentObserverRetryIntervalMs) return
+            if (lastConfigContentObserverAttemptAt.compareAndSet(previous, now)) break
+        }
+        synchronized(configContentObserverLock) {
+            if (configContentObserverInstalled) return
+            try {
+                val observer = object : android.database.ContentObserver(null) {
+                    override fun onChange(selfChange: Boolean) {
+                        requestConfigRefreshIfRuntimeStateChanged()
+                    }
+
+                    override fun onChange(selfChange: Boolean, uri: Uri?) {
+                        requestConfigRefreshIfRuntimeStateChanged()
+                    }
+                }
+                context.contentResolver.registerContentObserver(
+                    configContentUri,
+                    true,
+                    observer
+                )
+                configContentObserver = observer
+                configContentObserverInstalled = true
+                // Cover a commit racing between the initial load and observer registration.
+                requestConfigRefresh()
+            } catch (e: Throwable) {
+                XposedBridge.logEvery(
+                    "configContentObserverUnavailable:${e.javaClass.name}",
+                    "[LocationSpoofer] config content observer unavailable; using fallback poll"
+                )
+            }
+        }
+    }
+
+    private fun installConfigChangeCallback() {
+        if (configChangeCallbackInstalled) return
+        try {
+            lastObservedRuntimeFrame = getSystemProperty("gsm.locsp.frame", "")
+            lastObservedStopGeneration = getSystemProperty("gsm.locsp.stop_generation", "0")
+            val callback = Runnable {
+                // SystemProperties callbacks are global, not key-specific. Keep the
+                // hot callback O(1): two memory-backed reads and equality comparisons.
+                requestConfigRefreshIfRuntimeStateChanged()
+            }
+            val clazz = Class.forName("android.os.SystemProperties")
+            val method = clazz.getDeclaredMethod("addChangeCallback", Runnable::class.java)
+            method.isAccessible = true
+            method.invoke(null, callback)
+            configChangeCallback = callback
+            configChangeCallbackInstalled = true
+            // Close the tiny read-before-register race: if the frame changed between
+            // initial load and callback registration, this one coalesced refresh sees it.
+            requestConfigRefresh()
+        } catch (e: Throwable) {
+            // Hidden-API availability varies by Android release. The long idle fallback poll
+            // remains in place; this transition log is emitted once per process only.
+            XposedBridge.logEvery(
+                "configChangeCallbackUnavailable:${e.javaClass.name}",
+                "[LocationSpoofer] property change callback unavailable; using idle fallback poll"
+            )
         }
     }
 
@@ -4230,6 +5132,8 @@ class LocationHooker : XposedModule() {
     }
 
     private fun initXSharedPreferences() {
+        if (xsharedPreferencesInitializationAttempted) return
+        xsharedPreferencesInitializationAttempted = true
         try {
             val clazz = findXSharedPreferencesClass()
             if (clazz == null) {
@@ -4258,49 +5162,87 @@ class LocationHooker : XposedModule() {
         val prefs = xsharedPrefs ?: return null
         return try {
             XposedHelpers.callMethod(prefs, "reload")
+            val hasExplicitActive = runCatching {
+                XposedHelpers.callMethod(prefs, "contains", "active") as Boolean
+            }.getOrDefault(false)
+            if (!hasExplicitActive) {
+                return null
+            }
             val active = XposedHelpers.callMethod(prefs, "getBoolean", "active", false) as Boolean
             logConfigDebugEvery(
                 "xshared-load:$currentPackageName:$active",
                 "loadConfigFromXSharedPreferences in $currentPackageName: active=$active"
             )
+            val heartbeat = XposedHelpers.callMethod(prefs, "getLong", "heartbeat", 0L) as Long
+            val bootId = XposedHelpers.callMethod(prefs, "getString", "boot_id", "") as String
             if (!active) {
-                return null
+                return JSONObject().apply {
+                    put("active", false)
+                    put("fail_closed", false)
+                    put("heartbeat_at", 0L)
+                    // ConfigManager records the lifecycle write time in this preference even
+                    // for a stop, allowing it to supersede an older active disk snapshot.
+                    put("config_updated_at", heartbeat)
+                    put("boot_id", bootId)
+                    put("wifi_json", emptyWifiPayload())
+                    put("cell_json", org.json.JSONArray())
+                    put("bluetooth_json", org.json.JSONArray())
+                }
             }
             val lat = XposedHelpers.callMethod(prefs, "getFloat", "lat", 0f) as Float
             val lng = XposedHelpers.callMethod(prefs, "getFloat", "lng", 0f) as Float
             val alt = XposedHelpers.callMethod(prefs, "getFloat", "alt", 0f) as Float
             val bearing = XposedHelpers.callMethod(prefs, "getFloat", "bearing", 0f) as Float
-            val satCount = XposedHelpers.callMethod(prefs, "getInt", "sat_count", 10) as Int
-            val heartbeat = XposedHelpers.callMethod(prefs, "getLong", "heartbeat", 0L) as Long
-            val bootId = XposedHelpers.callMethod(prefs, "getString", "boot_id", "") as String
+            val speed = runCatching {
+                XposedHelpers.callMethod(prefs, "getFloat", "speed", 0f) as Float
+            }.getOrDefault(0f)
+            val satCount = XposedHelpers.callMethod(prefs, "getInt", "sat_count", 20) as Int
             val enableJitter = XposedHelpers.callMethod(prefs, "getBoolean", "enable_jitter", true) as Boolean
             val jitterRadius = XposedHelpers.callMethod(prefs, "getInt", "jitter_radius_meters", DEFAULT_JITTER_RADIUS_METERS.toInt()) as Int
             val jitterSpeed = XposedHelpers.callMethod(prefs, "getString", "jitter_speed", "MEDIUM") as String
-
-            val config = JSONObject().apply {
+            val signalJitterEnabled = runCatching {
+                XposedHelpers.callMethod(prefs, "getBoolean", "signal_jitter_enabled", true) as Boolean
+            }.getOrDefault(true)
+            val signalJitterLevel = runCatching {
+                XposedHelpers.callMethod(prefs, "getInt", "signal_jitter_level", 40) as Int
+            }.getOrDefault(40)
+            val wifiConnectionMode = runCatching {
+                XposedHelpers.callMethod(prefs, "getString", "wifi_connection_mode", "FIXED") as String
+            }.getOrDefault("FIXED")
+            val mockWifi = runCatching {
+                XposedHelpers.callMethod(prefs, "getBoolean", "mock_wifi", false) as Boolean
+            }.getOrDefault(false)
+            val mockCell = runCatching {
+                XposedHelpers.callMethod(prefs, "getBoolean", "mock_cell", false) as Boolean
+            }.getOrDefault(false)
+            JSONObject().apply {
                 put("active", true)
                 put("lat", lat.toDouble())
                 put("lng", lng.toDouble())
                 put("altitude", alt.toDouble())
                 put("sim_bearing", bearing.toDouble())
+                put("sim_speed", speed.toDouble())
                 put("satellite_count", satCount)
                 put("heartbeat_at", heartbeat)
                 put("config_updated_at", heartbeat)
                 put("boot_id", bootId)
-                put("mock_cell", true)
-                put("mock_wifi", true)
-                put("mock_bluetooth", true)
+                put("mock_cell", mockCell)
+                put("mock_wifi", mockWifi)
+                put("mock_bluetooth", false)
                 put("enable_jitter", enableJitter)
                 put("jitter_radius_meters", jitterRadius.coerceIn(1, 80))
                 put("jitter_speed", jitterSpeed)
+                put("signal_jitter_enabled", signalJitterEnabled)
+                put("signal_jitter_level", signalJitterLevel.coerceIn(0, 100))
+                put("wifi_connection_mode", wifiConnectionMode)
                 put("cell_json", org.json.JSONArray())
             }
-            val normConfig = normalizeConfig(config)
-            lastConfig = normConfig
-            configPollIntervalMs = 1000L
-            normConfig
         } catch (e: Throwable) {
-            android.util.Log.e("LocationSpoofer_Debug", "loadConfigFromContentProvider in $currentPackageName error", e)
+            XposedBridge.logOpenCellIdEvery(
+                "config:xshared:$currentPackageName:${e.javaClass.name}",
+                "loadConfigFromXSharedPreferences failed in $currentPackageName: ${e.javaClass.simpleName}: ${e.message}",
+                60_000L
+            )
             null
         }
     }
@@ -4316,8 +5258,38 @@ class LocationHooker : XposedModule() {
             cursor.use { c ->
                 if (c.moveToFirst()) {
                     val activeInt = c.getInt(c.getColumnIndexOrThrow("active"))
+                    val heartbeatAt = runCatching {
+                        c.getLong(c.getColumnIndexOrThrow("heartbeat_at"))
+                    }.getOrDefault(0L)
+                    val heartbeatUptimeMs = runCatching {
+                        c.getLong(c.getColumnIndexOrThrow("heartbeat_uptime_ms"))
+                    }.getOrDefault(0L)
+                    val configUpdatedAt = runCatching {
+                        c.getLong(c.getColumnIndexOrThrow("config_updated_at"))
+                    }.getOrDefault(heartbeatAt)
+                    val configGeneration = runCatching {
+                        c.getLong(c.getColumnIndexOrThrow("config_generation"))
+                    }.getOrDefault(0L)
+                    val lifecycleToken = runCatching {
+                        c.getLong(c.getColumnIndexOrThrow("runtime_lifecycle_token"))
+                    }.getOrDefault(0L)
+                    val bootId = runCatching {
+                        c.getString(c.getColumnIndexOrThrow("boot_id"))
+                    }.getOrDefault("")
                     if (activeInt != 1) {
-                        return null
+                        return JSONObject().apply {
+                            put("active", false)
+                            put("fail_closed", false)
+                            put("heartbeat_at", 0L)
+                            put("heartbeat_uptime_ms", 0L)
+                            put("config_updated_at", configUpdatedAt)
+                            put("config_generation", configGeneration)
+                            put("runtime_lifecycle_token", lifecycleToken)
+                            put("boot_id", bootId)
+                            put("wifi_json", emptyWifiPayload())
+                            put("cell_json", org.json.JSONArray())
+                            put("bluetooth_json", org.json.JSONArray())
+                        }
                     }
                     
                     val lat = c.getDouble(c.getColumnIndexOrThrow("lat"))
@@ -4325,6 +5297,9 @@ class LocationHooker : XposedModule() {
                     val wifiJson = c.getString(c.getColumnIndexOrThrow("wifi_json"))
                     val cellJson = c.getString(c.getColumnIndexOrThrow("cell_json"))
                     val simBearing = c.getFloat(c.getColumnIndexOrThrow("sim_bearing"))
+                    val simSpeed = runCatching {
+                        c.getFloat(c.getColumnIndexOrThrow("sim_speed"))
+                    }.getOrDefault(0f)
                     val altitude = c.getDouble(c.getColumnIndexOrThrow("altitude"))
                     val satelliteCount = c.getInt(c.getColumnIndexOrThrow("satellite_count"))
                     val enableJitter = runCatching {
@@ -4336,93 +5311,157 @@ class LocationHooker : XposedModule() {
                     val jitterSpeed = runCatching {
                         c.getString(c.getColumnIndexOrThrow("jitter_speed"))
                     }.getOrDefault("MEDIUM")
-                    
+                    val signalJitterEnabled = runCatching {
+                        c.getInt(c.getColumnIndexOrThrow("signal_jitter_enabled")) == 1
+                    }.getOrDefault(true)
+                    val signalJitterLevel = runCatching {
+                        c.getInt(c.getColumnIndexOrThrow("signal_jitter_level"))
+                    }.getOrDefault(40)
+                    val wifiConnectionMode = runCatching {
+                        c.getString(c.getColumnIndexOrThrow("wifi_connection_mode"))
+                    }.getOrDefault("FIXED")
+                    val mockWifi = runCatching {
+                        c.getInt(c.getColumnIndexOrThrow("mock_wifi")) == 1
+                    }.getOrDefault(false)
+                    val mockCell = runCatching {
+                        c.getInt(c.getColumnIndexOrThrow("mock_cell")) == 1
+                    }.getOrDefault(false)
                     val config = JSONObject().apply {
                         put("active", true)
                         put("lat", lat)
                         put("lng", lng)
                         put("altitude", altitude)
                         put("sim_bearing", simBearing.toDouble())
+                        put("sim_speed", simSpeed.toDouble())
                         put("satellite_count", satelliteCount)
-                        put("heartbeat_at", System.currentTimeMillis())
-                        put("config_updated_at", System.currentTimeMillis())
-                        put("boot_id", readBootId())
-                        put("mock_cell", true)
-                        put("mock_wifi", true)
-                        put("mock_bluetooth", true)
+                        // These values are emitted by the host's sole runtime writer. The reader
+                        // must never renew liveness merely because a ContentProvider query ran.
+                        put("heartbeat_at", heartbeatAt)
+                        put("heartbeat_uptime_ms", heartbeatUptimeMs)
+                        put("config_updated_at", configUpdatedAt)
+                        put("config_generation", configGeneration)
+                        put("runtime_lifecycle_token", lifecycleToken)
+                        put("boot_id", bootId)
+                        put("mock_cell", mockCell)
+                        put("mock_wifi", mockWifi)
+                        put("mock_bluetooth", false)
                         put("enable_jitter", enableJitter)
                         put("jitter_radius_meters", jitterRadius.coerceIn(1, 80))
                         put("jitter_speed", jitterSpeed)
-                        put("cell_json", org.json.JSONArray(cellJson))
-                        put("wifi_json", org.json.JSONObject(wifiJson))
+                        put("signal_jitter_enabled", signalJitterEnabled)
+                        put("signal_jitter_level", signalJitterLevel.coerceIn(0, 100))
+                        put("wifi_connection_mode", wifiConnectionMode)
+                        put("cell_json", safeArrayPayload(cellJson))
+                        put("wifi_json", safeWifiPayload(wifiJson))
+                        put("bluetooth_json", org.json.JSONArray())
                     }
-                    val normConfig = normalizeConfig(config)
-                    lastConfig = normConfig
-                    configPollIntervalMs = 1000L
-                    val wifiCount = normConfig.optJSONObject("wifi_json")
+                    val wifiCount = config.optJSONObject("wifi_json")
                         ?.optJSONArray("nearbyWifi")
                         ?.length() ?: 0
-                    val cellCount = normConfig.optJSONArray("cell_json")?.length() ?: 0
+                    val cellCount = config.optJSONArray("cell_json")?.length() ?: 0
                     logConfigDebugEvery(
-                        "provider:$currentPackageName:$lat:$lng:$wifiCount:$cellCount",
-                        "loadConfigFromContentProvider in $currentPackageName: active=true lat=$lat lng=$lng wifi=$wifiCount cell=$cellCount"
+                        "provider:$currentPackageName:$wifiCount:$cellCount",
+                        "loadConfigFromContentProvider in $currentPackageName: active=true wifi=$wifiCount cell=$cellCount"
                     )
-                    normConfig
+                    config
                 } else {
                     null
                 }
             }
         } catch (e: Throwable) {
-            android.util.Log.e("LocationSpoofer_Debug", "loadConfigFromContentProvider in $currentPackageName error", e)
+            XposedBridge.logOpenCellIdEvery(
+                "config:provider:$currentPackageName:${e.javaClass.name}",
+                "loadConfigFromContentProvider failed in $currentPackageName: ${e.javaClass.simpleName}: ${e.message}",
+                60_000L
+            )
             null
         }
     }
 
-    private fun loadConfigFromProperties(): JSONObject? {
-        val activeStr = getSystemProperty("gsm.locsp.active", "false")
+    private fun loadConfigFromProperties(
+        stopGeneration: Long = readStopGeneration()
+    ): JSONObject? {
+        val missing = "__locationspoofer_property_missing__"
+        val activeStr = getSystemProperty("gsm.locsp.active", missing).lowercase()
         logConfigDebugEvery(
             "properties:$currentPackageName:$activeStr",
             "loadConfigFromProperties in $currentPackageName: activeStr=$activeStr"
         )
-        if (activeStr != "true") {
+        if (activeStr != "true" && activeStr != "false") {
             return null
         }
         return try {
+            val heartbeatStr = getSystemProperty("gsm.locsp.heartbeat", "0")
+            val heartbeat = heartbeatStr.toLongOrNull() ?: 0L
+            val heartbeatUptime = getSystemProperty("gsm.locsp.heartbeat_uptime", "0")
+                .toLongOrNull() ?: 0L
+            val bootId = getSystemProperty("gsm.locsp.boot_id", "")
+            val snapshotGeneration = getSystemProperty("gsm.locsp.snapshot_generation", "0")
+                .toLongOrNull()
+                ?.coerceAtLeast(0L)
+                ?: 0L
+            if (activeStr == "false") {
+                return JSONObject().apply {
+                    put("active", false)
+                    put(
+                        "config_generation",
+                        stopGeneration.takeIf { it > 0L } ?: snapshotGeneration
+                    )
+                    put("fail_closed", false)
+                    put("heartbeat_at", 0L)
+                    put("config_updated_at", heartbeat)
+                    put("boot_id", bootId)
+                    put("wifi_json", emptyWifiPayload())
+                    put("cell_json", org.json.JSONArray())
+                    put("bluetooth_json", org.json.JSONArray())
+                }
+            }
+
             val latStr = getSystemProperty("gsm.locsp.lat", "0.0")
             val lngStr = getSystemProperty("gsm.locsp.lng", "0.0")
             val altStr = getSystemProperty("gsm.locsp.alt", "0.0")
             val bearingStr = getSystemProperty("gsm.locsp.bearing", "0.0")
+            val speedStr = getSystemProperty("gsm.locsp.speed", "0.0")
             val satCountStr = getSystemProperty("gsm.locsp.sat_count", "10")
+            val mockWifiStr = getSystemProperty("gsm.locsp.mock_wifi", "false")
+            val mockCellStr = getSystemProperty("gsm.locsp.mock_cell", "false")
             val enableJitterStr = getSystemProperty("gsm.locsp.enable_jitter", "true")
             val jitterRadiusStr = getSystemProperty("gsm.locsp.jitter_radius", DEFAULT_JITTER_RADIUS_METERS.toInt().toString())
             val jitterSpeed = getSystemProperty("gsm.locsp.jitter_speed", "MEDIUM")
-            val heartbeatStr = getSystemProperty("gsm.locsp.heartbeat", "0")
-            val bootId = getSystemProperty("gsm.locsp.boot_id", "")
-            
-            val config = JSONObject().apply {
+            val signalJitterStr = getSystemProperty("gsm.locsp.signal_jitter", "true")
+            val signalJitterLevelStr = getSystemProperty("gsm.locsp.signal_jitter_level", "40")
+            val wifiMode = getSystemProperty("gsm.locsp.wifi_mode", "FIXED")
+
+            JSONObject().apply {
                 put("active", true)
+                put("config_generation", snapshotGeneration)
                 put("lat", latStr.toDoubleOrNull() ?: 0.0)
                 put("lng", lngStr.toDoubleOrNull() ?: 0.0)
                 put("altitude", altStr.toDoubleOrNull() ?: 0.0)
                 put("sim_bearing", bearingStr.toDoubleOrNull() ?: 0.0)
+                put("sim_speed", speedStr.toDoubleOrNull() ?: 0.0)
                 put("satellite_count", satCountStr.toIntOrNull() ?: 10)
-                put("heartbeat_at", heartbeatStr.toLongOrNull() ?: 0L)
-                put("config_updated_at", heartbeatStr.toLongOrNull() ?: 0L)
+                put("heartbeat_at", heartbeat)
+                put("heartbeat_uptime_ms", heartbeatUptime)
+                put("config_updated_at", heartbeat)
                 put("boot_id", bootId)
-                put("mock_cell", true)
-                put("mock_wifi", true)
-                put("mock_bluetooth", true)
+                put("mock_cell", mockCellStr == "true")
+                put("mock_wifi", mockWifiStr == "true")
+                put("mock_bluetooth", false)
                 put("enable_jitter", enableJitterStr == "true")
                 put("jitter_radius_meters", (jitterRadiusStr.toIntOrNull() ?: DEFAULT_JITTER_RADIUS_METERS.toInt()).coerceIn(1, 80))
                 put("jitter_speed", jitterSpeed)
+                put("signal_jitter_enabled", signalJitterStr == "true")
+                put("signal_jitter_level", (signalJitterLevelStr.toIntOrNull() ?: 40).coerceIn(0, 100))
+                put("wifi_connection_mode", wifiMode)
                 put("cell_json", org.json.JSONArray())
             }
-            val normConfig = normalizeConfig(config)
-            lastConfig = normConfig
-            configPollIntervalMs = 1000L
-            normConfig
         } catch (e: Throwable) {
-            android.util.Log.e("LocationSpoofer_Debug", "loadConfigFromContentProvider in $currentPackageName error", e)
+            XposedBridge.logOpenCellIdEvery(
+                "config:properties:$currentPackageName:${e.javaClass.name}",
+                "loadConfigFromProperties failed in $currentPackageName: ${e.javaClass.simpleName}: ${e.message}",
+                60_000L
+            )
             null
         }
     }
@@ -4434,31 +5473,58 @@ class LocationHooker : XposedModule() {
      *    由于此方法会被各种 Hook 在主线程极其高频地调用（例如每秒数百次），
      *    任何在主线程进行的文件 IO（哪怕是偶尔一次）都会导致严重的丢帧卡顿（Stutter）。
      *    因此重构为：在首次调用时启动一个后台守护线程（Daemon Thread），
-     *    每隔 1000ms 在后台异步读取文件并更新 Volatile 的 lastConfig。
+     *    active 时在后台更新 Volatile 的 lastConfig；inactive 时由 system property
+     *    change callback 唤醒，并仅保留一分钟一次的兼容性 fallback。
      *    主线程的 readConfig() 永远只返回内存中的 lastConfig，实现真正的 0 IO 延迟。
      */
     private fun readConfig(): JSONObject? {
-        if (!isConfigPollingStarted) {
-            synchronized(pollingLock) {
-                if (!isConfigPollingStarted) {
-                    isConfigPollingStarted = true
+        // Claim before the synchronous initial read. Hooks reached re-entrantly from that read
+        // fail open against the current cache instead of starting a second permanent poller.
+        if (configPollingClaimed.compareAndSet(false, true)) {
+            try {
+                loadConfigFromDisk("initial")
+            } catch (e: Throwable) {
+                XposedBridge.logOpenCellIdEvery(
+                    "config:initial-load:${e.javaClass.name}",
+                    "readConfig initial load failed: ${e.javaClass.simpleName}: ${e.message}",
+                    30_000L
+                )
+            }
+            installConfigChangeCallback()
+            installConfigContentObserver()
 
-                    initXSharedPreferences()
-                    // 首次调用时同步读取一次，确保立即有数据可用
-                    loadConfigFromDisk("initial")
-
-                    // 启动后台轮询守护线程
-                    Thread {
-                        while (true) {
-                            Thread.sleep(configPollIntervalMs)
-                            loadConfigFromDisk("poll")
-                        }
-                    }.apply {
-                        isDaemon = true
-                        name = "LocationSpoofer_ConfigPoller"
-                        start()
+            // Start one process-local watcher. It performs no file/provider I/O while
+            // idle unless a lifecycle transition wakes it or the long fallback expires.
+            Thread {
+                while (true) {
+                    try {
+                        configPollWake.tryAcquire(
+                            configPollIntervalMs,
+                            java.util.concurrent.TimeUnit.MILLISECONDS
+                        )
+                        // Retry observer registration only on this existing low-frequency
+                        // watcher. A transient early-boot/context failure therefore recovers
+                        // without adding a timer or work to hot location/radio hooks.
+                        installConfigContentObserver()
+                        loadConfigFromDisk("poll")
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        XposedBridge.logOpenCellId("LocationSpoofer config poller interrupted")
+                        break
+                    } catch (e: Throwable) {
+                        // A malformed/transient source must not permanently freeze the
+                        // volatile cache. Log this iteration and retry on the next tick.
+                        XposedBridge.logOpenCellIdEvery(
+                            "config:poll-load:${e.javaClass.name}",
+                            "readConfig poll failed: ${e.javaClass.simpleName}: ${e.message}",
+                            30_000L
+                        )
                     }
                 }
+            }.apply {
+                isDaemon = true
+                name = "LocationSpoofer_ConfigPoller"
+                start()
             }
         }
         return lastConfig
@@ -4467,6 +5533,7 @@ class LocationHooker : XposedModule() {
     private var cachedGpsSatellitesList: Iterable<Any>? = null
     private var lastGpsSatellitesUpdate = 0L
 
+    @android.annotation.SuppressLint("SoonBlockedPrivateApi")
     private fun createSpoofedGpsSatellites(classLoader: ClassLoader): Iterable<Any> {
         val now = System.currentTimeMillis()
         if (cachedGpsSatellitesList == null || now - lastGpsSatellitesUpdate > 1000) {
@@ -4514,100 +5581,331 @@ class LocationHooker : XposedModule() {
         return cachedGpsSatellitesList ?: ArrayList()
     }
 
-    private fun buildSpoofedAndroidLocation(config: JSONObject): android.location.Location {
-        return android.location.Location(android.location.LocationManager.GPS_PROVIDER).also {
-            applySpoofedLocationToObject(it, config)
+    private fun buildSpoofedAndroidLocation(
+        config: JSONObject,
+        provider: String
+    ): android.location.Location {
+        return android.location.Location(provider).also {
+            applySpoofedLocationToObject(it, config, provider)
         }
     }
 
-    private fun locationCallbackTargets(args: Array<Any?>): List<Any> {
-        return args.filterNotNull().filterNot { arg ->
-            arg is String ||
-                arg is Number ||
-                arg is Boolean ||
-                arg is android.os.Looper ||
-                arg is android.os.CancellationSignal ||
-                arg is java.util.concurrent.Executor
-        }
-    }
+    private fun hookSystemLocationProviderPipeline(classLoader: ClassLoader, pkg: String) {
+        if (pkg != "android" && pkg != "system") return
 
-    private fun deliverLocationOnce(args: Array<Any?>, config: JSONObject) {
-        val loc = buildSpoofedAndroidLocation(config)
-        val executor = args.firstOrNull { it is java.util.concurrent.Executor } as? java.util.concurrent.Executor
-        val callbacks = locationCallbackTargets(args)
-        val deliver = {
-            for (callback in callbacks) {
-                if (XposedHelpers.tryCallMethodDeep(callback, "onLocationChanged", loc) ||
-                    XposedHelpers.tryCallMethodDeep(callback, "accept", loc)
-                ) {
-                    break
+        val managerClassName = "com.android.server.location.provider.LocationProviderManager"
+        val managerClass = XposedHelpers.findClassIfExists(managerClassName, classLoader) ?: return
+        val processMethodCount = managerClass.declaredMethods.count {
+            it.name == "processReportedLocation" && it.parameterCount == 1
+        }
+
+        try {
+            if (processMethodCount > 0) {
+                XposedBridge.hookAllMethods(managerClass, "processReportedLocation", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (param.result == null) return
+                        val config = readConfig() ?: return
+                        if (!shouldDeliverLocation(config)) return
+                        val manager = param.thisObject ?: return
+                        val provider = systemProviderName(manager) ?: return
+                        if (!isSyntheticSystemProvider(provider)) return
+                        val replacement = buildCanonicalFrameworkLocationResult(classLoader, config, provider) ?: return
+                        param.result = replacement
+                        XposedBridge.logEvery(
+                            "systemCanonicalFix:$provider",
+                            "[LocationSpoofer] canonical $provider fix created after provider validation and before framework cache/filter",
+                            10_000L
+                        )
+                    }
+                })
+            } else {
+                // Compatibility fallback for releases without processReportedLocation().
+                XposedBridge.hookAllMethods(managerClass, "onReportLocation", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val config = readConfig() ?: return
+                        if (!shouldDeliverLocation(config)) return
+                        val manager = param.thisObject ?: return
+                        val provider = systemProviderName(manager) ?: return
+                        if (!isSyntheticSystemProvider(provider)) return
+                        val replacement = buildCanonicalFrameworkLocationResult(classLoader, config, provider) ?: return
+                        if (param.args.isNotEmpty()) param.args[0] = replacement
+                    }
+                })
+            }
+
+            XposedBridge.hookAllMethods(managerClass, "startManager", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    param.thisObject?.let(::captureSystemProviderManager)
+                }
+            })
+
+            val lateCaptureHook = object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    param.thisObject?.let(::captureSystemProviderManager)
                 }
             }
+            for (methodName in listOf("registerLocationRequest", "getCurrentLocation", "getLastLocation")) {
+                XposedBridge.hookAllMethods(managerClass, methodName, lateCaptureHook)
+            }
+
+            XposedBridge.log(
+                "[LocationSpoofer] system framework fix hook installed at " +
+                    if (processMethodCount > 0) "processReportedLocation-after" else "onReportLocation-before"
+            )
+        } catch (e: Throwable) {
+            XposedBridge.log("[LocationSpoofer] system framework fix hook failed: $e")
         }
-        if (executor != null) {
-            executor.execute { deliver() }
+    }
+
+    private fun systemProviderName(manager: Any): String? {
+        return try {
+            XposedHelpers.getObjectField(manager, "mName") as? String
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun isSyntheticSystemProvider(provider: String): Boolean {
+        return provider == android.location.LocationManager.GPS_PROVIDER ||
+            provider == android.location.LocationManager.NETWORK_PROVIDER ||
+            provider == "fused"
+    }
+
+    private fun captureSystemProviderManager(manager: Any) {
+        val provider = systemProviderName(manager) ?: return
+        if (!isSyntheticSystemProvider(provider)) return
+        systemProviderManagers[provider] = manager
+        XposedBridge.logEvery(
+            "systemProviderCaptured:$provider",
+            "[LocationSpoofer] captured real $provider provider manager for framework cadence"
+        )
+        // system_server installs only the provider-pipeline hook group, so it may not
+        // encounter any other callback that calls readConfig() before the first client
+        // asks for a location. Seed the passive config watcher at the exact point where
+        // a usable real provider manager becomes available. Without this, lastConfig
+        // remains null and the cadence never starts on devices with no physical fix.
+        // Subsequent calls are memory-only; inactive polling still sleeps for 60 seconds
+        // and lifecycle commits wake it through the ContentService observer.
+        readConfig()
+        installConfigContentObserver()
+        ensureSystemLocationInjector()
+    }
+
+    private fun ensureSystemLocationInjector() {
+        synchronized(systemInjectorLock) {
+            if (!shouldSpoofLocation(lastConfig)) return
+            if (systemInjectorStarted) return
+            systemInjectorStarted = true
+            lateinit var tick: Runnable
+            tick = Runnable {
+                try {
+                    injectSystemProviderFixes()
+                } catch (e: Throwable) {
+                    XposedBridge.logEvery(
+                        "systemProviderTickFailed",
+                        "[LocationSpoofer] system provider cadence failed: $e"
+                    )
+                } finally {
+                    val shouldContinue = shouldDeliverLocation(lastConfig)
+                    synchronized(systemInjectorLock) {
+                        if (systemInjectorStarted && systemInjectorTick === tick && shouldContinue) {
+                            systemLocationHandler.postDelayed(tick, 1_000L)
+                        } else if (systemInjectorTick === tick) {
+                            systemInjectorStarted = false
+                            systemInjectorTick = null
+                        }
+                        Unit
+                    }
+                }
+            }
+            systemInjectorTick = tick
+            systemLocationHandler.post(tick)
+        }
+    }
+
+    private fun wakeSystemLocationInjector() {
+        if (shouldSpoofLocation(lastConfig)) {
+            ensureSystemLocationInjector()
+            return
+        }
+        synchronized(systemInjectorLock) {
+            systemInjectorTick?.let(systemLocationHandler::removeCallbacks)
+            systemInjectorTick = null
+            systemInjectorStarted = false
+        }
+    }
+
+    private fun injectSystemProviderFixes() {
+        val config = readConfig() ?: return
+        if (!shouldDeliverLocation(config)) return
+
+        var delivered = 0
+        for ((provider, manager) in systemProviderManagers) {
+            val rawLocation = buildCompleteRawLocation(config, provider)
+            val managerClassLoader = manager.javaClass.classLoader ?: ClassLoader.getSystemClassLoader()
+            val result = createFrameworkLocationResult(managerClassLoader, rawLocation) ?: continue
+            if (reportThroughRealProvider(manager, result)) delivered++
+        }
+        if (delivered > 0) {
+            systemInjectedReportCount += delivered.toLong()
+            XposedBridge.logEvery(
+                "systemProviderCadence",
+                "[LocationSpoofer] framework cadence delivered $delivered provider reports (total=$systemInjectedReportCount)",
+                10_000L
+            )
+        }
+    }
+
+    private fun buildCompleteRawLocation(config: JSONObject, provider: String): android.location.Location {
+        val base = standardLocationCoordinates(config)
+        return android.location.Location(provider).also { location ->
+            location.latitude = base.first
+            location.longitude = base.second
+            location.accuracy = 20f
+            location.time = System.currentTimeMillis()
+            location.elapsedRealtimeNanos = android.os.SystemClock.elapsedRealtimeNanos()
+        }
+    }
+
+    private fun reportThroughRealProvider(manager: Any, result: Any): Boolean {
+        return try {
+            val mockable = XposedHelpers.getObjectField(manager, "mProvider") ?: return false
+            val realProvider = try {
+                XposedHelpers.getObjectField(mockable, "mRealProvider")
+            } catch (_: Throwable) {
+                null
+            }
+            val provider = realProvider ?: XposedHelpers.callMethod(mockable, "getProvider") ?: return false
+            // Never route through Android's MockLocationProvider. The real provider abstraction
+            // owns the listener/lock that enters LocationProviderManager normally.
+            if (provider.javaClass.name.endsWith(".MockLocationProvider")) return false
+            XposedHelpers.callMethod(provider, "reportLocation", result)
+            true
+        } catch (e: Throwable) {
+            XposedBridge.logEvery(
+                "systemProviderReportFailed:${systemProviderName(manager)}",
+                "[LocationSpoofer] unable to report through real ${systemProviderName(manager)} provider: $e",
+                10_000L
+            )
+            false
+        }
+    }
+
+    private fun buildCanonicalFrameworkLocationResult(
+        classLoader: ClassLoader,
+        config: JSONObject,
+        provider: String
+    ): Any? {
+        return createFrameworkLocationResult(classLoader, buildSpoofedAndroidLocation(config, provider))
+    }
+
+    private fun createFrameworkLocationResult(
+        classLoader: ClassLoader,
+        location: android.location.Location
+    ): Any? {
+        val resultClass = XposedHelpers.findClassIfExists("android.location.LocationResult", classLoader)
+            ?: return null
+        val locations = arrayListOf(location)
+        val candidateNames = setOf("wrap", "create", "of", "from")
+        for (method in resultClass.declaredMethods) {
+            if (!java.lang.reflect.Modifier.isStatic(method.modifiers) || method.parameterCount != 1) continue
+            if (method.name !in candidateNames) continue
+            val parameter = method.parameterTypes[0]
+            val argument: Any = when {
+                java.util.List::class.java.isAssignableFrom(parameter) ||
+                    java.util.Collection::class.java.isAssignableFrom(parameter) -> locations
+                parameter.isArray &&
+                    parameter.componentType?.isAssignableFrom(android.location.Location::class.java) == true ->
+                    arrayOf(location)
+                else -> continue
+            }
+            try {
+                method.isAccessible = true
+                return method.invoke(null, argument)
+            } catch (_: Throwable) {
+            }
+        }
+        for (constructor in resultClass.declaredConstructors) {
+            if (constructor.parameterCount != 1) continue
+            val parameter = constructor.parameterTypes[0]
+            val argument: Any = when {
+                java.util.List::class.java.isAssignableFrom(parameter) ||
+                    java.util.Collection::class.java.isAssignableFrom(parameter) -> locations
+                parameter.isArray &&
+                    parameter.componentType?.isAssignableFrom(android.location.Location::class.java) == true ->
+                    arrayOf(location)
+                else -> continue
+            }
+            try {
+                constructor.isAccessible = true
+                return constructor.newInstance(argument)
+            } catch (_: Throwable) {
+            }
+        }
+        XposedBridge.logEvery(
+            "frameworkLocationResultFactoryMissing",
+            "[LocationSpoofer] no compatible android.location.LocationResult factory"
+        )
+        return null
+    }
+
+    private fun applySpoofedLocationToObject(
+        loc: Any,
+        config: JSONObject,
+        provider: String
+    ) {
+        val sample = createLocationSample(
+            config = config,
+            provider = provider,
+            timestamps = nextSpoofedTimestamps()
+        )
+
+        try { XposedHelpers.callMethod(loc, "setLatitude", sample.latitude) } catch (_: Throwable) {
+            try { XposedHelpers.setDoubleField(loc, "mLatitude", sample.latitude) } catch (_: Throwable) {}
+        }
+        try { XposedHelpers.callMethod(loc, "setLongitude", sample.longitude) } catch (_: Throwable) {
+            try { XposedHelpers.setDoubleField(loc, "mLongitude", sample.longitude) } catch (_: Throwable) {}
+        }
+        try { XposedHelpers.callMethod(loc, "setAccuracy", sample.accuracy) } catch (_: Throwable) {
+            try { XposedHelpers.setFloatField(loc, "mHorizontalAccuracyMeters", sample.accuracy) } catch (_: Throwable) {}
+        }
+        try { XposedHelpers.callMethod(loc, "setTime", sample.timestamps.wallTimeMs) } catch (_: Throwable) {
+            try { XposedHelpers.setLongField(loc, "mTimeMs", sample.timestamps.wallTimeMs) } catch (_: Throwable) {}
+        }
+        try { XposedHelpers.callMethod(loc, "setElapsedRealtimeNanos", sample.timestamps.elapsedRealtimeNanos) } catch (_: Throwable) {
+            try { XposedHelpers.setLongField(loc, "mElapsedRealtimeNs", sample.timestamps.elapsedRealtimeNanos) } catch (_: Throwable) {}
+        }
+        try { XposedHelpers.callMethod(loc, "setProvider", sample.provider) } catch (_: Throwable) {}
+
+        if (sample.altitude > 0.0) {
+            try { XposedHelpers.callMethod(loc, "setAltitude", sample.altitude) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(loc, "setVerticalAccuracyMeters", (sample.accuracy * 0.6f).coerceAtLeast(2f)) } catch (_: Throwable) {}
         } else {
-            deliver()
+            try { XposedHelpers.callMethod(loc, "removeAltitude") } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(loc, "removeVerticalAccuracy") } catch (_: Throwable) {}
         }
-    }
-
-    private fun startContinuousLocationUpdates(args: Array<Any?>) {
-        val executor = args.firstOrNull { it is java.util.concurrent.Executor } as? java.util.concurrent.Executor
-        for (callback in locationCallbackTargets(args)) {
-            val key = System.identityHashCode(callback)
-            if (activeLocationUpdateRunnables.containsKey(key)) continue
-            lateinit var runnable: Runnable
-            runnable = Runnable {
-                val config = readConfig()
-                if (config == null || !config.optBoolean("active", false)) {
-                    activeLocationUpdateRunnables.remove(key)
-                    return@Runnable
-                }
-                deliverLocationOnce(arrayOf(callback, executor).filterNotNull().toTypedArray(), config)
-                locationUpdateHandler.postDelayed(runnable, 1000L)
+        // MSL values belong to the original real fix and must not survive coordinate replacement.
+        try { XposedHelpers.callMethod(loc, "removeMslAltitude") } catch (_: Throwable) {}
+        try { XposedHelpers.callMethod(loc, "removeMslAltitudeAccuracy") } catch (_: Throwable) {}
+        if (sample.hasMotion) {
+            try { XposedHelpers.callMethod(loc, "setSpeed", sample.speed) } catch (_: Throwable) {
+                try { XposedHelpers.setFloatField(loc, "mSpeed", sample.speed) } catch (_: Throwable) {}
             }
-            activeLocationUpdateRunnables[key] = runnable
-            locationUpdateHandler.postDelayed(runnable, 1000L)
-        }
-    }
-
-    private fun stopContinuousLocationUpdates(args: Array<Any?>) {
-        for (callback in locationCallbackTargets(args)) {
-            val key = System.identityHashCode(callback)
-            val runnable = activeLocationUpdateRunnables.remove(key) ?: continue
-            locationUpdateHandler.removeCallbacks(runnable)
-        }
-    }
-
-    private fun applySpoofedLocationToObject(loc: Any, config: JSONObject) {
-        val baseLat = config.optDouble("lat", 0.0)
-        val baseLng = config.optDouble("lng", 0.0)
-        val jittered = getJitteredLocation(baseLat, baseLng)
-        val timestamps = nextSpoofedTimestamps()
-
-        try { XposedHelpers.callMethod(loc, "setLatitude", jittered.first) } catch (e: Throwable) {
-            try { XposedHelpers.setDoubleField(loc, "mLatitude", jittered.first) } catch (_: Throwable) {}
-        }
-        try { XposedHelpers.callMethod(loc, "setLongitude", jittered.second) } catch (e: Throwable) {
-            try { XposedHelpers.setDoubleField(loc, "mLongitude", jittered.second) } catch (_: Throwable) {}
-        }
-        try { XposedHelpers.callMethod(loc, "setAccuracy", getJitteredAccuracy()) } catch (e: Throwable) {
-            try { XposedHelpers.setFloatField(loc, "mHorizontalAccuracyMeters", getJitteredAccuracy()) } catch (_: Throwable) {}
-        }
-        try { XposedHelpers.callMethod(loc, "setTime", timestamps.wallTimeMs) } catch (e: Throwable) {
-            try { XposedHelpers.setLongField(loc, "mTimeMs", timestamps.wallTimeMs) } catch (_: Throwable) {}
-        }
-        try { XposedHelpers.callMethod(loc, "setElapsedRealtimeNanos", timestamps.elapsedRealtimeNanos) } catch (e: Throwable) {
-            try { XposedHelpers.setLongField(loc, "mElapsedRealtimeNs", timestamps.elapsedRealtimeNanos) } catch (_: Throwable) {}
-        }
-        rememberLocationTimestamps(loc, timestamps)
-        try { XposedHelpers.callMethod(loc, "setProvider", android.location.LocationManager.GPS_PROVIDER) } catch (_: Throwable) {}
-
-        val baseAlt = config.optDouble("altitude", 0.0)
-        if (baseAlt > 0.0) {
-            try { XposedHelpers.callMethod(loc, "setAltitude", baseAlt + (rng.nextDouble() - 0.5)) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(loc, "setSpeedAccuracyMetersPerSecond", 0.35f) } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(loc, "setBearing", sample.bearing) } catch (_: Throwable) {
+                try { XposedHelpers.setFloatField(loc, "mBearing", sample.bearing) } catch (_: Throwable) {}
+            }
+            try { XposedHelpers.callMethod(loc, "setBearingAccuracyDegrees", 4.5f) } catch (_: Throwable) {
+                try { XposedHelpers.setFloatField(loc, "mBearingAccuracyDegrees", 4.5f) } catch (_: Throwable) {}
+            }
+        } else {
+            try { XposedHelpers.callMethod(loc, "removeSpeed") } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(loc, "removeSpeedAccuracy") } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(loc, "removeBearing") } catch (_: Throwable) {}
+            try { XposedHelpers.callMethod(loc, "removeBearingAccuracy") } catch (_: Throwable) {}
         }
 
+        try { XposedHelpers.callMethod(loc, "setMock", false) } catch (_: Throwable) {}
         try { XposedHelpers.setBooleanField(loc, "mMock", false) } catch (_: Throwable) {}
         try { XposedHelpers.setBooleanField(loc, "mIsFromMockProvider", false) } catch (_: Throwable) {}
         try {
@@ -4615,7 +5913,7 @@ class LocationHooker : XposedModule() {
             val bundle = extras ?: android.os.Bundle()
             bundle.remove("mockLocation")
             bundle.remove("isMock")
-            bundle.putInt("satellites", config.optInt("satellite_count", 10))
+            bundle.putInt("satellites", config.optInt("satellite_count", 20).coerceIn(0, 64))
             if (extras == null) {
                 XposedHelpers.callMethod(loc, "setExtras", bundle)
             }
@@ -4623,22 +5921,36 @@ class LocationHooker : XposedModule() {
     }
 
     private fun createOnNmeaMessageListenerProxy(original: Any, classLoader: ClassLoader): Any {
+        nmeaListenerProxies[original]?.let { proxy ->
+            startNmeaInjector(original, "onNmeaMessage")
+            return proxy
+        }
         val interfaceClass = classLoader.loadClass("android.location.OnNmeaMessageListener")
         val proxy = java.lang.reflect.Proxy.newProxyInstance(
             classLoader,
             arrayOf(interfaceClass),
             object : java.lang.reflect.InvocationHandler {
                 override fun invoke(proxy: Any, method: java.lang.reflect.Method, args: Array<out Any>?): Any? {
-                    if (method.name == "onNmeaMessage" && args != null && args.size >= 1) {
+                    if (method.name == "onNmeaMessage" && args != null && args.size >= 2) {
                         val originalMsg = args[0] as? String
-                        if (originalMsg != null) {
-                            val spoofedMsg = spoofNmeaMessage(originalMsg)
-                            if (spoofedMsg == null) return null // Allow dropping messages
-                            val newArgs = arrayOfNulls<Any>(args.size)
-                            for (i in args.indices) {
-                                newArgs[i] = if (i == 0) spoofedMsg else args[i]
+                        val timestamp = (args[1] as? Number)?.toLong()
+                        if (originalMsg != null && timestamp != null) {
+                            val config = lastConfig
+                            val deliveredMsg = if (shouldDeliverLocation(config)) {
+                                spoofNmeaMessage(originalMsg, config ?: return null)
+                            } else {
+                                originalMsg
                             }
-                            return method.invoke(original, *newArgs)
+                            if (deliveredMsg == null) return null // Allow dropping messages
+                            val listener = original as? android.location.OnNmeaMessageListener
+                            if (listener != null) {
+                                // An active-created proxy can outlive the simulation. In the
+                                // inactive state this is now a direct, allocation-free pass-through:
+                                // no config read, sentence rewrite, argument copy, or reflection.
+                                listener.onNmeaMessage(deliveredMsg, timestamp)
+                                return null
+                            }
+                            return method.invoke(original, deliveredMsg, timestamp)
                         }
                     }
                     val methodArgs = if (args == null) emptyArray<Any>() else Array(args.size) { i -> args[i] }
@@ -4646,11 +5958,17 @@ class LocationHooker : XposedModule() {
                 }
             }
         )
-        // startNmeaGsvInjector(original, "onNmeaMessage", classLoader)
+        nmeaListenerProxies[original] = proxy
+        startNmeaInjector(original, "onNmeaMessage")
         return proxy
     }
 
+    @Suppress("DEPRECATION")
     private fun createGpsStatusNmeaListenerProxy(original: Any, classLoader: ClassLoader): Any {
+        nmeaListenerProxies[original]?.let { proxy ->
+            startNmeaInjector(original, "onNmeaReceived")
+            return proxy
+        }
         val interfaceClass = classLoader.loadClass("android.location.GpsStatus\$NmeaListener")
         val proxy = java.lang.reflect.Proxy.newProxyInstance(
             classLoader,
@@ -4659,14 +5977,21 @@ class LocationHooker : XposedModule() {
                 override fun invoke(proxy: Any, method: java.lang.reflect.Method, args: Array<out Any>?): Any? {
                     if (method.name == "onNmeaReceived" && args != null && args.size >= 2) {
                         val originalMsg = args[1] as? String
-                        if (originalMsg != null) {
-                            val spoofedMsg = spoofNmeaMessage(originalMsg)
-                            if (spoofedMsg == null) return null // Allow dropping messages
-                            val newArgs = arrayOfNulls<Any>(args.size)
-                            for (i in args.indices) {
-                                newArgs[i] = if (i == 1) spoofedMsg else args[i]
+                        val timestamp = (args[0] as? Number)?.toLong()
+                        if (originalMsg != null && timestamp != null) {
+                            val config = lastConfig
+                            val deliveredMsg = if (shouldDeliverLocation(config)) {
+                                spoofNmeaMessage(originalMsg, config ?: return null)
+                            } else {
+                                originalMsg
                             }
-                            return method.invoke(original, *newArgs)
+                            if (deliveredMsg == null) return null // Allow dropping messages
+                            val listener = original as? android.location.GpsStatus.NmeaListener
+                            if (listener != null) {
+                                listener.onNmeaReceived(timestamp, deliveredMsg)
+                                return null
+                            }
+                            return method.invoke(original, timestamp, deliveredMsg)
                         }
                     }
                     val methodArgs = if (args == null) emptyArray<Any>() else Array(args.size) { i -> args[i] }
@@ -4674,14 +5999,47 @@ class LocationHooker : XposedModule() {
                 }
             }
         )
-        // startNmeaGsvInjector(original, "onNmeaReceived", classLoader)
+        nmeaListenerProxies[original] = proxy
+        startNmeaInjector(original, "onNmeaReceived")
         return proxy
     }
 
-    private fun spoofNmeaMessage(sentence: String): String? {
+    private fun startNmeaInjector(original: Any, methodName: String) {
+        if (!shouldActivelyInjectClientGnss()) return
+        if (!shouldDeliverLocation(readConfig())) return
+        if (nmeaTimers.containsKey(original)) return
+        val timer = java.util.Timer("LocationSpoofer_NMEA_${System.identityHashCode(original)}", true)
+        nmeaTimers[original] = timer
+        XposedBridge.logEvery(
+            "nmeaInjectorStarted:$currentPackageName:${original.javaClass.name}",
+            "[GPS_Spoofer] active NMEA injector started for $currentPackageName listener=${original.javaClass.name}"
+        )
+        timer.scheduleAtFixedRate(object : java.util.TimerTask() {
+            override fun run() {
+                try {
+                    val config = readConfig()
+                    if (!shouldDeliverLocation(config)) {
+                        nmeaTimers.remove(original)?.cancel()
+                        return
+                    }
+                    val activeConfig = config ?: return
+                    val now = System.currentTimeMillis()
+                    for (sentence in buildSpoofedNmeaBurst(activeConfig)) {
+                        if (methodName == "onNmeaReceived") {
+                            XposedHelpers.tryCallMethodDeep(original, methodName, now, sentence)
+                        } else {
+                            XposedHelpers.tryCallMethodDeep(original, methodName, sentence, now)
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }, 150L, 1000L)
+    }
+
+    private fun spoofNmeaMessage(sentence: String, config: JSONObject): String? {
         try {
-            val config = readConfig() ?: return sentence
-            if (!config.optBoolean("active", false)) return sentence
+            if (!shouldDeliverLocation(config)) return sentence
             
             val targetLat = config.optDouble("wgs84_lat", 0.0)
             val targetLng = config.optDouble("wgs84_lng", 0.0)
@@ -4695,20 +6053,22 @@ class LocationHooker : XposedModule() {
             val type = fields[0]
             var modified = false
             
-            // Drop GSV sentences to hide real hardware satellites.
-            // (We removed the fake GSV injector, so the app will simply not see GSV sentences,
-            // which is safer than showing real hardware GSV sentences that conflict with our fake GnssStatus).
             if (type.endsWith("GSV")) {
-                return null
+                return buildSpoofedGsvSentence()
+            }
+            if (type.endsWith("GSA")) {
+                return buildSpoofedGsaSentence()
             }
             
             if (type.endsWith("RMC") && fields.size >= 7) {
                 val (latStr, latDir) = convertToNmeaLatitude(targetLat)
                 val (lngStr, lngDir) = convertToNmeaLongitude(targetLng)
+                if (fields.size > 2) fields[2] = "A"
                 fields[3] = latStr
                 fields[4] = latDir
                 fields[5] = lngStr
                 fields[6] = lngDir
+                if (fields.size > 8) fields[8] = String.format(java.util.Locale.US, "%.1f", spoofedBearing(config))
                 modified = true
             } else if (type.endsWith("GGA") && fields.size >= 6) {
                 val (latStr, latDir) = convertToNmeaLatitude(targetLat)
@@ -4717,6 +6077,9 @@ class LocationHooker : XposedModule() {
                 fields[3] = latDir
                 fields[4] = lngStr
                 fields[5] = lngDir
+                if (fields.size > 6) fields[6] = "1"
+                if (fields.size > 7) fields[7] = String.format(java.util.Locale.US, "%02d", config.optInt("satellite_count", 20).coerceIn(0, 64))
+                if (fields.size > 8) fields[8] = estimateNmeaHdop()
                 modified = true
             } else if (type.endsWith("GLL") && fields.size >= 5) {
                 val (latStr, latDir) = convertToNmeaLatitude(targetLat)
@@ -4725,6 +6088,11 @@ class LocationHooker : XposedModule() {
                 fields[2] = latDir
                 fields[3] = lngStr
                 fields[4] = lngDir
+                if (fields.size > 6) fields[6] = "A"
+                modified = true
+            } else if (type.endsWith("VTG") && fields.size >= 2) {
+                fields[1] = String.format(java.util.Locale.US, "%.1f", spoofedBearing(config))
+                if (fields.size > 2) fields[2] = "T"
                 modified = true
             }
             
@@ -4745,6 +6113,112 @@ class LocationHooker : XposedModule() {
             XposedBridge.log(e)
             return sentence
         }
+    }
+
+    private fun buildSpoofedGsaSentence(): String? {
+        updateSatelliteCacheIfNeeded()
+        val sats = cachedSatellites ?: return null
+        if (!isSpoofingActiveCache || sats.isEmpty()) return null
+        val used = sats.filter { it.usedInFix }.take(12).map { nmeaPrn(it) }.toMutableList()
+        while (used.size < 12) used.add("")
+        val hdop = estimateNmeaHdop()
+        val hdopValue = hdop.toDoubleOrNull() ?: 0.9
+        val pdop = String.format(java.util.Locale.US, "%.1f", (hdopValue * 1.7).coerceIn(0.8, 3.5))
+        val vdop = String.format(java.util.Locale.US, "%.1f", (hdopValue * 1.3).coerceIn(0.7, 2.8))
+        val fields = mutableListOf("\$GNGSA", "A", "3")
+        fields.addAll(used)
+        fields.add(pdop)
+        fields.add(hdop)
+        fields.add(vdop)
+        return appendNmeaChecksum(fields.joinToString(","))
+    }
+
+    private fun buildSpoofedNmeaBurst(config: JSONObject): List<String> {
+        val targetLat = config.optDouble("wgs84_lat", 0.0)
+        val targetLng = config.optDouble("wgs84_lng", 0.0)
+        if (targetLat == 0.0 && targetLng == 0.0) return emptyList()
+        updateSatelliteCacheIfNeeded()
+        val calendar = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+        val time = String.format(
+            java.util.Locale.US,
+            "%02d%02d%02d.00",
+            calendar.get(java.util.Calendar.HOUR_OF_DAY),
+            calendar.get(java.util.Calendar.MINUTE),
+            calendar.get(java.util.Calendar.SECOND)
+        )
+        val date = String.format(
+            java.util.Locale.US,
+            "%02d%02d%02d",
+            calendar.get(java.util.Calendar.DAY_OF_MONTH),
+            calendar.get(java.util.Calendar.MONTH) + 1,
+            calendar.get(java.util.Calendar.YEAR) % 100
+        )
+        val (latStr, latDir) = convertToNmeaLatitude(targetLat)
+        val (lngStr, lngDir) = convertToNmeaLongitude(targetLng)
+        val sats = cachedSatellites
+        val satCount = (sats?.size ?: config.optInt("satellite_count", 20)).coerceIn(0, 64)
+        val hdop = estimateNmeaHdop()
+        val altitude = config.optDouble("altitude", 0.0)
+        val speedKnots = spoofedSpeed(config) * 1.943844f
+        val bearing = if (hasSpoofedMotion(config)) spoofedBearing(config) else 0f
+        val sentences = ArrayList<String>()
+        sentences.add(appendNmeaChecksum("\$GNRMC,$time,A,$latStr,$latDir,$lngStr,$lngDir,${String.format(java.util.Locale.US, "%.1f", speedKnots)},${String.format(java.util.Locale.US, "%.1f", bearing)},$date,,,A"))
+        sentences.add(appendNmeaChecksum("\$GNGGA,$time,$latStr,$latDir,$lngStr,$lngDir,1,${String.format(java.util.Locale.US, "%02d", satCount)},$hdop,${String.format(java.util.Locale.US, "%.1f", altitude)},M,0.0,M,,"))
+        sentences.add(appendNmeaChecksum("\$GNGLL,$latStr,$latDir,$lngStr,$lngDir,$time,A,A"))
+        sentences.add(appendNmeaChecksum("\$GNVTG,${String.format(java.util.Locale.US, "%.1f", bearing)},T,,M,${String.format(java.util.Locale.US, "%.1f", speedKnots)},N,${String.format(java.util.Locale.US, "%.1f", spoofedSpeed(config) * 3.6f)},K,A"))
+        buildSpoofedGsaSentence()?.let { sentences.add(it) }
+        val gsvPages = ((satCount + 3) / 4).coerceAtLeast(1)
+        repeat(gsvPages) {
+            buildSpoofedGsvSentence()?.let { sentence -> sentences.add(sentence) }
+        }
+        return sentences
+    }
+
+    private fun buildSpoofedGsvSentence(): String? {
+        updateSatelliteCacheIfNeeded()
+        val sats = cachedSatellites ?: return null
+        if (!isSpoofingActiveCache || sats.isEmpty()) return null
+        val totalMessages = ((sats.size + 3) / 4).coerceAtLeast(1)
+        val page = (nmeaGsvPageCounter % totalMessages) + 1
+        nmeaGsvPageCounter = (nmeaGsvPageCounter + 1) % totalMessages
+        val start = (page - 1) * 4
+        val end = minOf(start + 4, sats.size)
+        val fields = mutableListOf(
+            "\$GNGSV",
+            totalMessages.toString(),
+            page.toString(),
+            sats.size.toString()
+        )
+        for (i in start until end) {
+            val sat = sats[i]
+            fields.add(nmeaPrn(sat))
+            fields.add(sat.elevation.toInt().coerceIn(0, 90).toString())
+            fields.add(sat.azimuth.toInt().coerceIn(0, 359).toString())
+            fields.add(sat.cn0.toInt().coerceIn(0, 99).toString())
+        }
+        return appendNmeaChecksum(fields.joinToString(","))
+    }
+
+    private fun nmeaPrn(sat: SatelliteData): String {
+        val prn = when (sat.type) {
+            3 -> sat.svid + 64
+            5 -> sat.svid + 200
+            else -> sat.svid
+        }
+        return String.format(java.util.Locale.US, "%02d", prn)
+    }
+
+    private fun estimateNmeaHdop(): String {
+        updateSatelliteCacheIfNeeded()
+        val sats = cachedSatellites ?: return "0.9"
+        val used = sats.count { it.usedInFix }.coerceAtLeast(1)
+        val avgElevation = sats.filter { it.usedInFix }.map { it.elevation }.ifEmpty { sats.map { it.elevation } }.average()
+        val hdop = (2.4 - used * 0.11 - avgElevation / 120.0).coerceIn(0.6, 2.2)
+        return String.format(java.util.Locale.US, "%.1f", hdop)
+    }
+
+    private fun appendNmeaChecksum(mainPart: String): String {
+        return mainPart + "*" + calculateNmeaChecksum(mainPart)
     }
 
     private fun convertToNmeaLatitude(lat: Double): Pair<String, String> {

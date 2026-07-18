@@ -78,6 +78,8 @@ fun FullScreenMapPage(
     var showSaveRouteDialog by remember { mutableStateOf(false) }
     var showSavedRoutesDialog by remember { mutableStateOf(false) }
     val isDomestic = viewModel.isDomesticEnvironment()
+    val coverageLocations by viewModel.coverageLocations.collectAsState()
+    val latestCoverageLocations = rememberUpdatedState(coverageLocations)
     var searchQuery by remember { mutableStateOf("") }
     var searchResults by remember { mutableStateOf<List<AppPoiItem>>(emptyList()) }
     var showSearchResults by remember { mutableStateOf(false) }
@@ -100,12 +102,11 @@ fun FullScreenMapPage(
 
     // 同步路点标记和折线到地图
     var liveMarker by remember { mutableStateOf<AppMapMarker?>(null) }
-    LaunchedEffect(routePoints, mapRef, uiState.manageDataList) {
+    LaunchedEffect(routePoints, mapRef) {
         val map = mapRef ?: return@LaunchedEffect
         map.clear()
         liveMarker = null
-        val locations = uiState.manageDataList.map { it.location }
-        com.shiraka.locatiobprovid.utils.MapCoverageHelper.drawCoverage(map, locations)
+        com.shiraka.locatiobprovid.utils.MapCoverageHelper.drawCoverage(map, coverageLocations)
 
         if (routePoints.size >= 2) {
             map.addPolyline(
@@ -141,6 +142,13 @@ fun FullScreenMapPage(
                 )
             }
         }
+    }
+
+    // Coverage owns separate polygon overlays. New scan rows should not clear and rebuild
+    // route polylines and markers, which would otherwise flash every time Room emits.
+    LaunchedEffect(mapRef, coverageLocations) {
+        val map = mapRef ?: return@LaunchedEffect
+        com.shiraka.locatiobprovid.utils.MapCoverageHelper.drawCoverage(map, coverageLocations)
     }
 
     // 运行中时跟踪实时位置
@@ -195,6 +203,12 @@ fun FullScreenMapPage(
             val initLat = uiState.latitudeInput.toDoubleOrNull() ?: 0.0
             val initLng = uiState.longitudeInput.toDoubleOrNull() ?: 0.0
             map.moveCamera(initLat, initLng, 18f)
+            map.setOnCameraChangeListener { _, _ ->
+                com.shiraka.locatiobprovid.utils.MapCoverageHelper.drawCoverage(
+                    map,
+                    latestCoverageLocations.value
+                )
+            }
         }
 
         // 选点模式的十字准星

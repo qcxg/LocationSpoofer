@@ -292,6 +292,87 @@ object TrajectorySimulator {
     }
 
     /**
+     * Explicit route-loop policy used by the UI's "來回" mode. Unlike the
+     * legacy endpoint-distance heuristic, every route travels to the last point
+     * and then reverses along the same segments indefinitely.
+     */
+    fun calculatePingPongRoutePosition(
+        points: List<RoutePoint>,
+        startTimestamp: Long,
+        simModeName: String,
+        currentTime: Long = System.currentTimeMillis(),
+        speedOverrideMs: Double? = null
+    ): SimulatedLocation {
+        if (points.size < 2) {
+            val point = points.firstOrNull() ?: RoutePoint(0.0, 0.0)
+            return SimulatedLocation(point.lat, point.lng, 0f, 0f, 5f, 10.0)
+        }
+        val elapsedSec = ((currentTime - startTimestamp) / 1000.0).coerceAtLeast(0.0)
+        val modeSpeed = getModeParams(simModeName).speedMs
+        val speedMs = speedOverrideMs?.takeIf { it.isFinite() && it > 0.0 } ?: modeSpeed
+        if (speedMs <= 0.0 || elapsedSec <= 0.0) {
+            val point = points.first()
+            return SimulatedLocation(point.lat, point.lng, speedMs.toFloat(), 0f, 5f, 10.0)
+        }
+
+        val segmentLengths = (0 until points.lastIndex).map { index ->
+            haversineDistance(points[index], points[index + 1])
+        }
+        val oneWayDistance = segmentLengths.sum()
+        if (oneWayDistance <= 0.0) {
+            val point = points.first()
+            return SimulatedLocation(point.lat, point.lng, speedMs.toFloat(), 0f, 5f, 10.0)
+        }
+
+        val cycleDistance = oneWayDistance * 2.0
+        val cycleProgress = (speedMs * elapsedSec) % cycleDistance
+        val movingForward = cycleProgress <= oneWayDistance
+        var remaining = if (movingForward) cycleProgress else cycleDistance - cycleProgress
+        var segmentIndex = 0
+        while (segmentIndex < segmentLengths.lastIndex && remaining > segmentLengths[segmentIndex]) {
+            remaining -= segmentLengths[segmentIndex]
+            segmentIndex++
+        }
+
+        val segmentLength = segmentLengths[segmentIndex]
+        val forwardFraction = if (segmentLength > 0.0) {
+            (remaining / segmentLength).coerceIn(0.0, 1.0)
+        } else {
+            0.0
+        }
+        val from = if (movingForward) points[segmentIndex] else points[segmentIndex + 1]
+        val to = if (movingForward) points[segmentIndex + 1] else points[segmentIndex]
+        val baseFrom = points[segmentIndex]
+        val baseTo = points[segmentIndex + 1]
+
+        // Interpolate by travelled surface distance rather than raw degrees.
+        val forwardBearing = bearing(baseFrom, baseTo)
+        val interpolationBearing = if (movingForward) forwardBearing else (forwardBearing + 180.0) % 360.0
+        val startPoint = if (movingForward) baseFrom else baseTo
+        val interpolationDistance = segmentLength * if (movingForward) forwardFraction else (1.0 - forwardFraction)
+        val startLatRad = Math.toRadians(startPoint.lat)
+        val startLngRad = Math.toRadians(startPoint.lng)
+        val bearingRad = Math.toRadians(interpolationBearing)
+        val newLatRad = Math.asin(
+            sin(startLatRad) * cos(interpolationDistance / R) +
+                cos(startLatRad) * sin(interpolationDistance / R) * cos(bearingRad)
+        )
+        val newLngRad = startLngRad + Math.atan2(
+            sin(bearingRad) * sin(interpolationDistance / R) * cos(startLatRad),
+            cos(interpolationDistance / R) - sin(startLatRad) * sin(newLatRad)
+        )
+
+        return SimulatedLocation(
+            Math.toDegrees(newLatRad),
+            EnvironmentCoveragePolicy.normalizeLongitude(Math.toDegrees(newLngRad)),
+            speedMs.toFloat(),
+            bearing(from, to).toFloat(),
+            5f,
+            10.0
+        )
+    }
+
+    /**
      * 高斯随机游走核心算法
      *
      * 数学模型: X(t+dt) = X(t) + sigma * sqrt(dt) * N(0,1) - alpha * X(t) * dt

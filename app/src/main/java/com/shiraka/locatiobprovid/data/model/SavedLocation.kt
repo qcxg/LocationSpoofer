@@ -4,6 +4,6 @@ data class SavedLocation(
     val name: String, 
     val lat: Double, 
     val lng: Double,
-    val wifiJson: String = "[]",
+    val wifiJson: String = "{\"isConnected\":false,\"connectedWifi\":null,\"nearbyWifi\":[]}",
     val cellJson: String = "[]"
 )

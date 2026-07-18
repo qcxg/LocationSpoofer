@@ -1,4 +1,6 @@
-# 設備定位故障診斷與修復報告
+# 設備定位故障診斷與修復報告（歷史／已取代）
+
+> **請勿按本文修改目前程式。** 這是早期 test-provider 污染事故的現場記錄；其中加入 `clearLegacyTestProviders()`、在 `onDestroy()` 清理 test provider 等建議均已失效。目前架構禁止註冊 Android test/mock provider，唯一有效的實作說明是 `../technical_readme.md`。
 
 ## 🔍 問題根因
 

@@ -27,6 +27,18 @@ data class LocationRecord(
     val remark: String = ""
 )
 
+/**
+ * Lightweight RF-presence projection used for exact coverage hit-testing.
+ * Relations are loaded only for the small set of samples selected for replay.
+ */
+data class RfCoverageLocation(
+    @Embedded val location: LocationRecord,
+    val hasConnectedWifi: Boolean,
+    val hasWifi: Boolean,
+    val hasCell: Boolean,
+    val hasBluetooth: Boolean
+)
+
 @Serializable
 @Entity(tableName = "wifi_devices")
 data class WifiDevice(
@@ -204,6 +216,17 @@ data class CompleteLocation(
     val wifis: List<LocationWithWifi>,
     @Relation(entity = LocationBluetooth::class, parentColumn = "id", entityColumn = "locationId")
     val bluetooths: List<LocationWithBluetooth>,
+    @Relation(entity = LocationCell::class, parentColumn = "id", entityColumn = "locationId")
+    val cells: List<LocationWithCell>
+)
+
+/** Runtime-only projection: deliberately excludes Bluetooth relations. */
+data class RuntimeRfLocation(
+    @Embedded val location: LocationRecord,
+    @Relation(parentColumn = "id", entityColumn = "locationId")
+    val connectedWifi: LocationConnectedWifi?,
+    @Relation(entity = LocationWifi::class, parentColumn = "id", entityColumn = "locationId")
+    val wifis: List<LocationWithWifi>,
     @Relation(entity = LocationCell::class, parentColumn = "id", entityColumn = "locationId")
     val cells: List<LocationWithCell>
 )

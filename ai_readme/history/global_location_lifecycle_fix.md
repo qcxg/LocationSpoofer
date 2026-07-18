@@ -1,4 +1,6 @@
-# Global Location Hook Lifecycle Fix
+# Global Location Hook Lifecycle Fix (Historical)
+
+> **Superseded implementation note (2026-07-10):** this document records earlier diagnosis and design exploration. The `Location.writeToParcel()`/getter strategy described below is not the current location pipeline and must not be reintroduced. The verified path is documented in [`../technical_readme.md`](../technical_readme.md): a single system-server cadence reports through the real provider abstraction, and `LocationProviderManager.processReportedLocation()` returns one canonical fix before framework cache/filter/native delivery.
 
 ## Purpose
 

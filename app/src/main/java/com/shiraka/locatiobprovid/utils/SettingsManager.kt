@@ -44,6 +44,10 @@ class SettingsManager(context: Context) {
         get() = prefs.getString("map_engine", "AUTO") ?: "AUTO"
         set(value) = prefs.edit().putString("map_engine", value).apply()
 
+    var showHomeCoordinateAlgorithm: Boolean
+        get() = prefs.getBoolean("show_home_coordinate_algorithm", true)
+        set(value) = prefs.edit().putBoolean("show_home_coordinate_algorithm", value).apply()
+
     var ignoredVersion: String
         get() = prefs.getString("ignored_version", "") ?: ""
         set(value) = prefs.edit().putString("ignored_version", value).apply()
@@ -51,6 +55,17 @@ class SettingsManager(context: Context) {
     var isSpoofingActive: Boolean
         get() = prefs.getBoolean("is_spoofing_active", false)
         set(value) = prefs.edit().putBoolean("is_spoofing_active", value).apply()
+
+    /**
+     * An APK replacement cannot reload hook code already resident in system_server/GMS.
+     * Keep simulation disabled until the next completed device boot makes the installed
+     * module code authoritative in every scoped process.
+     */
+    var moduleRestartRequired: Boolean
+        get() = prefs.getBoolean("module_restart_required", false)
+        set(value) {
+            prefs.edit().putBoolean("module_restart_required", value).commit()
+        }
 
     var lastSpoofedLat: String
         get() = prefs.getString("last_spoofed_lat", "0") ?: "0"
@@ -69,8 +84,8 @@ class SettingsManager(context: Context) {
         set(value) = prefs.edit().putBoolean("mock_cell", value).apply()
 
     var mockBluetooth: Boolean
-        get() = prefs.getBoolean("mock_bluetooth", true)
-        set(value) = prefs.edit().putBoolean("mock_bluetooth", value).apply()
+        get() = false
+        set(@Suppress("UNUSED_PARAMETER") value) = prefs.edit().putBoolean("mock_bluetooth", false).apply()
 
     var enableJitter: Boolean
         get() = prefs.getBoolean("enable_jitter", true)
@@ -84,12 +99,24 @@ class SettingsManager(context: Context) {
         get() = prefs.getString("jitter_speed", "MEDIUM") ?: "MEDIUM"
         set(value) = prefs.edit().putString("jitter_speed", value).apply()
 
+    var signalJitterEnabled: Boolean
+        get() = prefs.getBoolean("signal_jitter_enabled", true)
+        set(value) = prefs.edit().putBoolean("signal_jitter_enabled", value).apply()
+
+    var signalJitterLevel: Int
+        get() = prefs.getInt("signal_jitter_level", 40).coerceIn(0, 100)
+        set(value) = prefs.edit().putInt("signal_jitter_level", value.coerceIn(0, 100)).apply()
+
+    var wifiConnectionMode: String
+        get() = prefs.getString("wifi_connection_mode", "FIXED") ?: "FIXED"
+        set(value) = prefs.edit().putString("wifi_connection_mode", value).apply()
+
     var altitude: String
         get() = prefs.getString("altitude", "0.0") ?: "0.0"
         set(value) = prefs.edit().putString("altitude", value).apply()
 
     var satelliteCount: String
-        get() = prefs.getString("satellite_count", "10") ?: "10"
+        get() = prefs.getString("satellite_count", "20") ?: "20"
         set(value) = prefs.edit().putString("satellite_count", value).apply()
 
     fun getSavedLocations(): List<SavedLocation> {

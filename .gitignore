@@ -35,3 +35,8 @@ google-services.json
 
 # ─── Builds / Outputs ────────────────────────────────────
 app/release/
+
+# ─── Local diagnostics ──────────────────────────────────────────────
+.codex_tmp/
+.codex_modules_config.db
+.lsposed_live.db

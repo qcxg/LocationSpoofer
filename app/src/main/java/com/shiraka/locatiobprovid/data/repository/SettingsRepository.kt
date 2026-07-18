@@ -66,6 +66,10 @@ class SettingsRepository(private val settingsManager: SettingsManager) {
         settingsManager.mapEngine = value
     }
 
+    var showHomeCoordinateAlgorithm: Boolean
+        get() = settingsManager.showHomeCoordinateAlgorithm
+        set(value) { settingsManager.showHomeCoordinateAlgorithm = value }
+
     fun getIgnoredVersion(): String = settingsManager.ignoredVersion
 
     fun setIgnoredVersion(value: String) {
@@ -111,6 +115,18 @@ class SettingsRepository(private val settingsManager: SettingsManager) {
     var jitterSpeed: String
         get() = settingsManager.jitterSpeed
         set(value) { settingsManager.jitterSpeed = value }
+
+    var signalJitterEnabled: Boolean
+        get() = settingsManager.signalJitterEnabled
+        set(value) { settingsManager.signalJitterEnabled = value }
+
+    var signalJitterLevel: Int
+        get() = settingsManager.signalJitterLevel
+        set(value) { settingsManager.signalJitterLevel = value }
+
+    var wifiConnectionMode: String
+        get() = settingsManager.wifiConnectionMode
+        set(value) { settingsManager.wifiConnectionMode = value }
 
     var altitude: String
         get() = settingsManager.altitude

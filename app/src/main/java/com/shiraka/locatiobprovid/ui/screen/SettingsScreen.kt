@@ -30,7 +30,9 @@ import com.shiraka.locatiobprovid.R
 import com.shiraka.locatiobprovid.data.model.AppState
 import com.shiraka.locatiobprovid.data.model.MapEngine
 import com.shiraka.locatiobprovid.ui.theme.AccentBlue
+import com.shiraka.locatiobprovid.utils.ExternalApiTester
 import com.shiraka.locatiobprovid.viewmodel.MainViewModel
+import kotlinx.coroutines.launch
 
 @Composable
 fun SettingsScreen(
@@ -46,6 +48,10 @@ fun SettingsScreen(
     var showCleanupDialog by remember { mutableStateOf(false) }
     var isCleaningRuntime by remember { mutableStateOf(false) }
     var expandedSection by remember { mutableStateOf<String?>(null) }
+    var googleApiTest by remember { mutableStateOf(ApiTestUiState()) }
+    var wigleApiTest by remember { mutableStateOf(ApiTestUiState()) }
+    var openCellIdApiTest by remember { mutableStateOf(ApiTestUiState()) }
+    val apiTestScope = rememberCoroutineScope()
     val savedLanguage = uiState.currentLanguage.ifBlank { viewModel.getSavedLanguage() }
     val selectedLanguageName = LANGUAGES.firstOrNull { it.code == savedLanguage }?.nativeName ?: savedLanguage.ifBlank { "System" }
 
@@ -137,6 +143,41 @@ fun SettingsScreen(
                 )
             }
 
+            ExpandableSettingsRow(
+                title = stringResource(R.string.home_display_settings),
+                summary = if (uiState.showHomeCoordinateAlgorithm) {
+                    stringResource(R.string.coordinate_algorithm_visible)
+                } else {
+                    stringResource(R.string.coordinate_algorithm_hidden)
+                },
+                expanded = expandedSection == "home_display",
+                onClick = { toggleSection("home_display") }
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            stringResource(R.string.show_home_coordinate_algorithm),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            stringResource(R.string.show_home_coordinate_algorithm_desc),
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.56f)
+                        )
+                    }
+                    Switch(
+                        checked = uiState.showHomeCoordinateAlgorithm,
+                        onCheckedChange = { viewModel.setShowHomeCoordinateAlgorithm(it) }
+                    )
+                }
+            }
+
             val configuredApiCount = listOf(localGoogleApiKey, localWigleToken, localOpencellidToken).count { it.isNotBlank() }
             ExpandableSettingsRow(
                 title = stringResource(R.string.api_config),
@@ -144,25 +185,65 @@ fun SettingsScreen(
                 expanded = expandedSection == "apis",
                 onClick = { toggleSection("apis") }
             ) {
-                SettingsTextField(
+                ApiCredentialField(
                     value = localGoogleApiKey,
-                    onValueChange = { localGoogleApiKey = it },
+                    onValueChange = {
+                        localGoogleApiKey = it
+                        googleApiTest = ApiTestUiState()
+                    },
                     label = stringResource(R.string.custom_google_key),
-                    placeholder = stringResource(R.string.custom_google_key_hint)
+                    placeholder = stringResource(R.string.custom_google_key_hint),
+                    state = googleApiTest,
+                    onTest = {
+                        val keyBeingTested = localGoogleApiKey
+                        googleApiTest = ApiTestUiState(isTesting = true)
+                        apiTestScope.launch {
+                            val result = ExternalApiTester.testGooglePlaces(
+                                apiKey = keyBeingTested
+                            )
+                            googleApiTest = ApiTestUiState(result = result)
+                        }
+                    }
                 )
                 Spacer(Modifier.height(8.dp))
-                SettingsTextField(
+                ApiCredentialField(
                     value = localWigleToken,
-                    onValueChange = { localWigleToken = it },
+                    onValueChange = {
+                        localWigleToken = it
+                        wigleApiTest = ApiTestUiState()
+                    },
                     label = stringResource(R.string.custom_wigle_token),
-                    placeholder = stringResource(R.string.custom_wigle_token_hint)
+                    placeholder = stringResource(R.string.custom_wigle_token_hint),
+                    state = wigleApiTest,
+                    onTest = {
+                        val tokenBeingTested = localWigleToken
+                        wigleApiTest = ApiTestUiState(isTesting = true)
+                        apiTestScope.launch {
+                            wigleApiTest = ApiTestUiState(
+                                result = ExternalApiTester.testWigle(tokenBeingTested)
+                            )
+                        }
+                    }
                 )
                 Spacer(Modifier.height(8.dp))
-                SettingsTextField(
+                ApiCredentialField(
                     value = localOpencellidToken,
-                    onValueChange = { localOpencellidToken = it },
+                    onValueChange = {
+                        localOpencellidToken = it
+                        openCellIdApiTest = ApiTestUiState()
+                    },
                     label = stringResource(R.string.custom_opencellid_token),
-                    placeholder = stringResource(R.string.custom_opencellid_token_hint)
+                    placeholder = stringResource(R.string.custom_opencellid_token_hint),
+                    state = openCellIdApiTest,
+                    onTest = {
+                        val tokenBeingTested = localOpencellidToken
+                        openCellIdApiTest = ApiTestUiState(isTesting = true)
+                        apiTestScope.launch {
+                            openCellIdApiTest = ApiTestUiState(
+                                result = ExternalApiTester.testOpenCellId(tokenBeingTested)
+                            )
+                        }
+                    }
                 )
                 SaveSettingsButton {
                     viewModel.setGoogleApiKey(localGoogleApiKey)
@@ -321,22 +402,102 @@ private fun CopyableReadOnlyField(
     )
 }
 
+private data class ApiTestUiState(
+    val isTesting: Boolean = false,
+    val result: ExternalApiTester.Result? = null
+)
+
 @Composable
-private fun SettingsTextField(
+private fun ApiCredentialField(
     value: String,
     onValueChange: (String) -> Unit,
     label: String,
-    placeholder: String
+    placeholder: String,
+    state: ApiTestUiState,
+    onTest: () -> Unit
 ) {
-    OutlinedTextField(
-        value = value,
-        onValueChange = onValueChange,
-        label = { Text(label) },
-        placeholder = { Text(placeholder, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)) },
-        modifier = Modifier.fillMaxWidth(),
-        singleLine = true,
-        colors = settingsTextFieldColors()
-    )
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = value,
+                onValueChange = onValueChange,
+                enabled = !state.isTesting,
+                label = { Text(label, maxLines = 1) },
+                placeholder = {
+                    Text(
+                        placeholder,
+                        maxLines = 1,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
+                    )
+                },
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                colors = settingsTextFieldColors()
+            )
+            Spacer(Modifier.width(8.dp))
+            OutlinedButton(
+                onClick = onTest,
+                enabled = !state.isTesting,
+                modifier = Modifier.widthIn(min = 68.dp),
+                shape = RoundedCornerShape(8.dp),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 12.dp)
+            ) {
+                if (state.isTesting) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Text(stringResource(R.string.api_test_button))
+                }
+            }
+        }
+
+        val message = when {
+            state.isTesting -> stringResource(R.string.api_test_testing)
+            state.result != null -> apiTestResultMessage(state.result)
+            else -> null
+        }
+        if (message != null) {
+            Spacer(Modifier.height(5.dp))
+            Text(
+                text = message,
+                modifier = Modifier.padding(horizontal = 2.dp),
+                fontSize = 12.sp,
+                lineHeight = 16.sp,
+                color = when {
+                    state.isTesting -> MaterialTheme.colorScheme.primary
+                    state.result?.isSuccess == true -> MaterialTheme.colorScheme.primary
+                    else -> MaterialTheme.colorScheme.error
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun apiTestResultMessage(result: ExternalApiTester.Result): String {
+    return when (result.code) {
+        ExternalApiTester.ResultCode.SUCCESS -> stringResource(R.string.api_test_success)
+        ExternalApiTester.ResultCode.MISSING_CREDENTIAL -> stringResource(R.string.api_test_missing_credential)
+        ExternalApiTester.ResultCode.INVALID_CREDENTIAL -> stringResource(R.string.api_test_invalid_credential)
+        ExternalApiTester.ResultCode.ACCESS_RESTRICTED -> stringResource(R.string.api_test_access_restricted)
+        ExternalApiTester.ResultCode.SERVICE_NOT_ENABLED -> stringResource(R.string.api_test_service_not_enabled)
+        ExternalApiTester.ResultCode.BILLING_REQUIRED -> stringResource(R.string.api_test_billing_required)
+        ExternalApiTester.ResultCode.QUOTA_EXCEEDED -> stringResource(R.string.api_test_quota_exceeded)
+        ExternalApiTester.ResultCode.NETWORK_UNAVAILABLE -> stringResource(R.string.api_test_network_unavailable)
+        ExternalApiTester.ResultCode.TIMEOUT -> stringResource(R.string.api_test_timeout)
+        ExternalApiTester.ResultCode.SERVER_UNAVAILABLE -> result.httpStatus?.let {
+            stringResource(R.string.api_test_server_unavailable_http, it)
+        } ?: stringResource(R.string.api_test_server_unavailable)
+        ExternalApiTester.ResultCode.INVALID_RESPONSE -> stringResource(R.string.api_test_invalid_response)
+        ExternalApiTester.ResultCode.UNKNOWN_ERROR -> result.httpStatus?.let {
+            stringResource(R.string.api_test_unknown_http, it)
+        } ?: stringResource(R.string.api_test_unknown)
+    }
 }
 
 @Composable

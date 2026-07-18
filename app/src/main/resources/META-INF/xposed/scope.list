@@ -1,6 +1,6 @@
 android
 system
-com.android.phone
 com.google.android.gms
 com.android.location.fused
-com.android.networkstack
+com.android.gpstest
+make.more.r2d2.cellular_z.play

@@ -22,8 +22,6 @@ import com.shiraka.locatiobprovid.ui.components.MapTypeDialog
 import com.shiraka.locatiobprovid.ui.theme.AccentGreen
 import com.shiraka.locatiobprovid.ui.theme.AppColors
 import com.shiraka.locatiobprovid.viewmodel.MainViewModel
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
 
 @Composable
 fun ScannerMapScreen(
@@ -34,26 +32,16 @@ fun ScannerMapScreen(
 ) {
     var mapController by remember { mutableStateOf<AppMapController?>(null) }
     var showMapTypeDialog by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
-    var redrawJob by remember { mutableStateOf<Job?>(null) }
+    val coverageLocations by viewModel.coverageLocations.collectAsState()
+    val latestCoverageLocations = rememberUpdatedState(coverageLocations)
 
     fun redrawCoverage(controller: AppMapController, moveToLatest: Boolean) {
-        redrawJob?.cancel()
-        redrawJob = scope.launch {
-            val bounds = controller.visibleBounds()
-            val locations = if (bounds != null) {
-                viewModel.getLocationsInBounds(bounds.minLat, bounds.maxLat, bounds.minLng, bounds.maxLng)
-            } else {
-                viewModel.getAllLocations()
-            }
-            controller.clear()
-            com.shiraka.locatiobprovid.utils.MapCoverageHelper.drawCoverage(controller, locations)
+        val locations = latestCoverageLocations.value
+        com.shiraka.locatiobprovid.utils.MapCoverageHelper.drawCoverage(controller, locations)
 
-            if (moveToLatest) {
-                val latest = viewModel.getLatestLocation()
-                if (latest != null) {
-                    controller.animateCamera(latest.lat, latest.lng, 17f)
-                }
+        if (moveToLatest) {
+            locations.firstOrNull()?.let { latest ->
+                controller.animateCamera(latest.lat, latest.lng, 17f)
             }
         }
     }
@@ -63,7 +51,7 @@ fun ScannerMapScreen(
         mapController?.setMapType(uiState.mapType)
     }
     
-    LaunchedEffect(mapController, uiState.environmentRecordCount) {
+    LaunchedEffect(mapController, coverageLocations) {
         val controller = mapController ?: return@LaunchedEffect
         redrawCoverage(controller, moveToLatest = true)
     }

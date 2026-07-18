@@ -72,6 +72,7 @@ import com.shiraka.locatiobprovid.data.model.JitterSpeed
 import com.shiraka.locatiobprovid.data.model.SearchMode
 import com.shiraka.locatiobprovid.data.model.SavedLocation
 import com.shiraka.locatiobprovid.data.model.StartSpoofingPhase
+import com.shiraka.locatiobprovid.data.model.WifiConnectionMode
 import com.shiraka.locatiobprovid.data.model.WifiLoadStatus
 import com.shiraka.locatiobprovid.ui.components.AppMapView
 import com.shiraka.locatiobprovid.ui.components.AppMapController
@@ -200,6 +201,8 @@ fun SpoofingScreen(
 
     // 小地图实例，用于响应坐标更新
     var smallMapRef by remember { mutableStateOf<AppMapController?>(null) }
+    val coverageLocations by viewModel.coverageLocations.collectAsState()
+    val latestCoverageLocations = rememberUpdatedState(coverageLocations)
     var mapSettleJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     val latestUiState = rememberUpdatedState(uiState)
     DisposableEffect(Unit) {
@@ -217,11 +220,9 @@ fun SpoofingScreen(
         smallMapRef?.setMapType(uiState.mapType)
     }
 
-    LaunchedEffect(smallMapRef, uiState.manageDataList) {
+    LaunchedEffect(smallMapRef, coverageLocations) {
         val map = smallMapRef ?: return@LaunchedEffect
-        map.clear()
-        val locations = uiState.manageDataList.map { it.location }
-        com.shiraka.locatiobprovid.utils.MapCoverageHelper.drawCoverage(map, locations)
+        com.shiraka.locatiobprovid.utils.MapCoverageHelper.drawCoverage(map, coverageLocations)
     }
 
     Column(
@@ -307,6 +308,10 @@ fun SpoofingScreen(
 
                 // 移动地图即选点；模拟中等待地图稳定后再刷新运行坐标。
                 map.setOnCameraChangeListener { lat, lng ->
+                    com.shiraka.locatiobprovid.utils.MapCoverageHelper.drawCoverage(
+                        map,
+                        latestCoverageLocations.value
+                    )
                     if (!latestUiState.value.isSpoofingActive) {
                         viewModel.confirmMapPoint(lat, lng)
                         return@setOnCameraChangeListener
@@ -465,35 +470,36 @@ fun SpoofingScreen(
                 Spacer(Modifier.height(16.dp))
             }
 
-
-            SectionHeader(Icons.Rounded.Extension, stringResource(R.string.custom_coordinate_algo), isDark)
-            Spacer(Modifier.height(8.dp))
-            Card(
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(containerColor = AppColors.cardBackground(isDark)),
-                elevation = CardDefaults.cardElevation(0.dp),
-                modifier = Modifier.clickable { showAppCoordinateScreen = true }
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
-                    verticalAlignment = Alignment.CenterVertically
+            if (uiState.showHomeCoordinateAlgorithm) {
+                SectionHeader(Icons.Rounded.Extension, stringResource(R.string.custom_coordinate_algo), isDark)
+                Spacer(Modifier.height(8.dp))
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = AppColors.cardBackground(isDark)),
+                    elevation = CardDefaults.cardElevation(0.dp),
+                    modifier = Modifier.clickable { showAppCoordinateScreen = true }
                 ) {
-                    Box(
-                        modifier = Modifier.size(36.dp).clip(RoundedCornerShape(8.dp))
-                            .background(AccentBlue.copy(alpha = 0.12f)),
-                        contentAlignment = Alignment.Center
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Rounded.Extension, null, tint = AccentBlue, modifier = Modifier.size(18.dp))
+                        Box(
+                            modifier = Modifier.size(36.dp).clip(RoundedCornerShape(8.dp))
+                                .background(AccentBlue.copy(alpha = 0.12f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Rounded.Extension, null, tint = AccentBlue, modifier = Modifier.size(18.dp))
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(stringResource(R.string.config_app_coordinate), color = MaterialTheme.colorScheme.onBackground, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(stringResource(R.string.config_app_coordinate_desc), color = AppColors.textSecondary(isDark), fontSize = 11.sp)
+                        }
+                        Icon(Icons.Outlined.ChevronRight, null, tint = AppColors.textSecondary(isDark), modifier = Modifier.size(16.dp))
                     }
-                    Spacer(Modifier.width(12.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(stringResource(R.string.config_app_coordinate), color = MaterialTheme.colorScheme.onBackground, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                        Text(stringResource(R.string.config_app_coordinate_desc), color = AppColors.textSecondary(isDark), fontSize = 11.sp)
-                    }
-                    Icon(Icons.Outlined.ChevronRight, null, tint = AppColors.textSecondary(isDark), modifier = Modifier.size(16.dp))
                 }
+                Spacer(Modifier.height(16.dp))
             }
-            Spacer(Modifier.height(16.dp))
 
 
             SectionHeader(Icons.Rounded.Radar, stringResource(R.string.spatial_env_collection), isDark)
@@ -734,18 +740,22 @@ fun SpoofingScreen(
                     showStartSpoofingDialog = false
                 }
             },
-            onConfirm = {
-                viewModel.startSpoofing()
+            onConfirm = { mockWifi, mockCell, enableJitter, radius, speed, signalEnabled, signalLevel, wifiMode, altitude, satelliteCount ->
+                viewModel.startSpoofingWithDialogOptions(
+                    mockWifi,
+                    mockCell,
+                    enableJitter,
+                    radius,
+                    speed,
+                    signalEnabled,
+                    signalLevel,
+                    wifiMode,
+                    altitude,
+                    satelliteCount
+                )
             },
             onRetry = { viewModel.startSpoofing() },
-            onToggleWifi = { viewModel.toggleMockWifi() },
-            onToggleCell = { viewModel.toggleMockCell() },
-            onToggleBluetooth = { viewModel.toggleMockBluetooth() },
-            onJitterOptionsConfirm = { enabled, radius, speed ->
-                viewModel.setJitterOptions(enabled, radius, speed)
-            },
-            onAltitudeChange = { viewModel.setAltitude(it) },
-            onSatelliteCountChange = { viewModel.setSatelliteCount(it) }
+            onUseCurrent = { viewModel.startSpoofing(allowPartial = true) },
         )
     }
 
@@ -1840,29 +1850,45 @@ fun StartSpoofingDialog(
     uiState: AppState,
     isDark: Boolean,
     onDismiss: () -> Unit,
-    onConfirm: () -> Unit,
+    onConfirm: (Boolean, Boolean, Boolean, Int, JitterSpeed, Boolean, Int, WifiConnectionMode, String, String) -> Unit,
     onRetry: () -> Unit,
-    onToggleWifi: () -> Unit,
-    onToggleCell: () -> Unit,
-    onToggleBluetooth: () -> Unit,
-    onJitterOptionsConfirm: (Boolean, Int, JitterSpeed) -> Unit,
-    onAltitudeChange: (String) -> Unit,
-    onSatelliteCountChange: (String) -> Unit
+    onUseCurrent: () -> Unit
 ) {
+    var pendingMockWifi by remember(uiState.mockWifi) { mutableStateOf(uiState.mockWifi) }
+    var pendingMockCell by remember(uiState.mockCell) { mutableStateOf(uiState.mockCell) }
     var pendingEnableJitter by remember(uiState.enableJitter) { mutableStateOf(uiState.enableJitter) }
     var pendingJitterRadius by remember(uiState.jitterRadiusMeters) { mutableStateOf(uiState.jitterRadiusMeters.coerceIn(1, 80).toFloat()) }
     var pendingJitterSpeed by remember(uiState.jitterSpeed) { mutableStateOf(uiState.jitterSpeed) }
+    var pendingSignalJitterEnabled by remember(uiState.signalJitterEnabled) { mutableStateOf(uiState.signalJitterEnabled) }
+    var pendingSignalJitterLevel by remember(uiState.signalJitterLevel) { mutableStateOf(uiState.signalJitterLevel.coerceIn(0, 100).toFloat()) }
+    var pendingWifiConnectionMode by remember(uiState.wifiConnectionMode) { mutableStateOf(uiState.wifiConnectionMode) }
+    var pendingAltitude by remember(uiState.altitudeInput) { mutableStateOf(uiState.altitudeInput) }
+    var pendingSatelliteCount by remember(uiState.satelliteCountInput) { mutableStateOf(uiState.satelliteCountInput) }
+    var showWifiOptions by remember { mutableStateOf(false) }
+    var showCellOptions by remember { mutableStateOf(false) }
+    var showSatelliteJitterOptions by remember { mutableStateOf(false) }
+    var showCustomOptions by remember { mutableStateOf(false) }
     val progress = uiState.startSpoofingProgress
+    // Wrap collapsed content naturally, but cap expanded content to a scrollable viewport.
+    // Section bodies switch in one layout pass below: animating their height makes the
+    // platform Dialog resize on every frame and was the source of the expansion stutter.
+    val screenHeight = androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.dp
+    val dialogMaxHeight = minOf(screenHeight * 0.86f, 720.dp)
+    val dialogScrollState = rememberScrollState()
 
     LocalizedDialog(onDismissRequest = { if (!uiState.isSavingConfig) onDismiss() }) {
         Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = dialogMaxHeight),
             shape = RoundedCornerShape(16.dp),
             color = AppColors.cardBackground(isDark)
         ) {
             Column(
                 modifier = Modifier
-                    .padding(20.dp)
                     .fillMaxWidth()
+                    .verticalScroll(dialogScrollState)
+                    .padding(20.dp)
             ) {
                 if (progress.phase != StartSpoofingPhase.IDLE) {
                     StartSpoofingProgressContent(
@@ -1871,7 +1897,8 @@ fun StartSpoofingDialog(
                         sources = progress.sources,
                         errors = progress.errors,
                         onDismiss = onDismiss,
-                        onRetry = onRetry
+                        onRetry = onRetry,
+                        onUseCurrent = onUseCurrent
                     )
                 } else {
                 Text(
@@ -1889,38 +1916,113 @@ fun StartSpoofingDialog(
                 Spacer(Modifier.height(16.dp))
 
                 if (uiState.canMockWifi || uiState.wigleToken.isNotBlank()) {
-                    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Icon(Icons.Outlined.Wifi, null, tint = AccentBlue, modifier = Modifier.size(20.dp))
                         Spacer(Modifier.width(12.dp))
                         Text(stringResource(R.string.mock_wifi_data), modifier = Modifier.weight(1f), fontSize = 15.sp, color = MaterialTheme.colorScheme.onBackground)
-                        Switch(checked = uiState.mockWifi, onCheckedChange = { onToggleWifi() })
+                        IconButton(
+                            onClick = { showWifiOptions = !showWifiOptions },
+                            enabled = pendingMockWifi,
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(
+                                if (showWifiOptions) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                                null,
+                                tint = MaterialTheme.colorScheme.onBackground.copy(alpha = if (pendingMockWifi) 0.65f else 0.25f)
+                            )
+                        }
+                        Switch(checked = pendingMockWifi, onCheckedChange = { pendingMockWifi = it })
+                    }
+                    if (pendingMockWifi && showWifiOptions) {
+                        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth().padding(start = 32.dp, top = 4.dp, bottom = 8.dp)) {
+                            SegmentedButton(
+                                selected = pendingWifiConnectionMode == WifiConnectionMode.RANDOM,
+                                onClick = { pendingWifiConnectionMode = WifiConnectionMode.RANDOM },
+                                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)
+                            ) { Text("隨機連線", fontSize = 12.sp) }
+                            SegmentedButton(
+                                selected = pendingWifiConnectionMode == WifiConnectionMode.FIXED,
+                                onClick = { pendingWifiConnectionMode = WifiConnectionMode.FIXED },
+                                shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)
+                            ) { Text("固定第一個", fontSize = 12.sp) }
+                        }
                     }
                 }
-                
+
                 if (uiState.canMockCell || uiState.opencellidToken.isNotBlank()) {
                     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Outlined.CellTower, null, tint = AccentOrange, modifier = Modifier.size(20.dp))
                         Spacer(Modifier.width(12.dp))
                         Text(stringResource(R.string.mock_cell_data), modifier = Modifier.weight(1f), fontSize = 15.sp, color = MaterialTheme.colorScheme.onBackground)
-                        Switch(checked = uiState.mockCell, onCheckedChange = { onToggleCell() })
+                        IconButton(
+                            onClick = { showCellOptions = !showCellOptions },
+                            enabled = pendingMockCell,
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(
+                                if (showCellOptions) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                                null,
+                                tint = MaterialTheme.colorScheme.onBackground.copy(alpha = if (pendingMockCell) 0.65f else 0.25f)
+                            )
+                        }
+                        Switch(checked = pendingMockCell, onCheckedChange = { pendingMockCell = it })
+                    }
+                    if (pendingMockCell && showCellOptions) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(start = 32.dp, end = 4.dp, bottom = 8.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Outlined.NetworkCell, null, tint = AccentOrange, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(10.dp))
+                                Text("信號強度抖動", modifier = Modifier.weight(1f), fontSize = 14.sp, color = MaterialTheme.colorScheme.onBackground)
+                                Switch(checked = pendingSignalJitterEnabled, onCheckedChange = { pendingSignalJitterEnabled = it })
+                            }
+                            if (pendingSignalJitterEnabled) {
+                                Column(modifier = Modifier.fillMaxWidth().padding(end = 4.dp, bottom = 4.dp)) {
+                                    Slider(
+                                        value = pendingSignalJitterLevel,
+                                        onValueChange = { pendingSignalJitterLevel = it.coerceIn(0f, 100f) },
+                                        valueRange = 0f..100f,
+                                        steps = 0,
+                                        colors = SliderDefaults.colors(
+                                            thumbColor = AccentOrange,
+                                            activeTrackColor = AccentOrange
+                                        )
+                                    )
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                        Text("穩定", fontSize = 11.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.45f))
+                                        Text("活躍", fontSize = 11.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.45f))
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                
-                if (uiState.canMockBluetooth) {
-                    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Outlined.Bluetooth, null, tint = AccentGreen, modifier = Modifier.size(20.dp))
-                        Spacer(Modifier.width(12.dp))
-                        Text(stringResource(R.string.mock_bluetooth_data), modifier = Modifier.weight(1f), fontSize = 15.sp, color = MaterialTheme.colorScheme.onBackground)
-                        Switch(checked = uiState.mockBluetooth, onCheckedChange = { onToggleBluetooth() })
-                    }
-                }
-                Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Icon(Icons.Outlined.GraphicEq, null, tint = AccentBlue, modifier = Modifier.size(20.dp))
                     Spacer(Modifier.width(12.dp))
-                    Text(stringResource(R.string.enable_slight_jitter), modifier = Modifier.weight(1f), fontSize = 15.sp, color = MaterialTheme.colorScheme.onBackground)
+                    Text("衛星定位抖動", modifier = Modifier.weight(1f), fontSize = 15.sp, color = MaterialTheme.colorScheme.onBackground)
+                    IconButton(
+                        onClick = { showSatelliteJitterOptions = !showSatelliteJitterOptions },
+                        enabled = pendingEnableJitter,
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            if (showSatelliteJitterOptions) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                            null,
+                            tint = MaterialTheme.colorScheme.onBackground.copy(alpha = if (pendingEnableJitter) 0.65f else 0.25f)
+                        )
+                    }
                     Switch(checked = pendingEnableJitter, onCheckedChange = { pendingEnableJitter = it })
                 }
-                AnimatedVisibility(visible = pendingEnableJitter) {
+                if (pendingEnableJitter && showSatelliteJitterOptions) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1978,33 +2080,57 @@ fun StartSpoofingDialog(
                         }
                     }
                 }
-                
-                Spacer(Modifier.height(8.dp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    androidx.compose.material3.OutlinedTextField(
-                        value = uiState.altitudeInput,
-                        onValueChange = onAltitudeChange,
-                        label = { Text("海拔 (米)", fontSize = 12.sp) },
-                        modifier = Modifier.weight(1f),
-                        singleLine = true,
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
-                        colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = AccentBlue,
-                            focusedLabelColor = AccentBlue
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Outlined.Tune, null, tint = AccentBlue, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Text("更多自定義參數", modifier = Modifier.weight(1f), fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onBackground)
+                    IconButton(
+                        onClick = { showCustomOptions = !showCustomOptions },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            if (showCustomOptions) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                            null,
+                            tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f)
                         )
-                    )
-                    androidx.compose.material3.OutlinedTextField(
-                        value = uiState.satelliteCountInput,
-                        onValueChange = onSatelliteCountChange,
-                        label = { Text("卫星数", fontSize = 12.sp) },
-                        modifier = Modifier.weight(1f),
-                        singleLine = true,
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
-                        colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = AccentBlue,
-                            focusedLabelColor = AccentBlue
+                    }
+                }
+                if (showCustomOptions) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(start = 32.dp, top = 4.dp, bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        androidx.compose.material3.OutlinedTextField(
+                            value = pendingAltitude,
+                            onValueChange = { pendingAltitude = it },
+                            label = { Text("海拔 (米)", fontSize = 12.sp) },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true,
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = AccentBlue,
+                                focusedLabelColor = AccentBlue
+                            )
                         )
-                    )
+                        androidx.compose.material3.OutlinedTextField(
+                            value = pendingSatelliteCount,
+                            onValueChange = { pendingSatelliteCount = it },
+                            label = { Text("衛星數", fontSize = 12.sp) },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true,
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = AccentBlue,
+                                focusedLabelColor = AccentBlue
+                            )
+                        )
+                    }
                 }
 
                 Spacer(Modifier.height(24.dp))
@@ -2018,12 +2144,18 @@ fun StartSpoofingDialog(
                     Spacer(Modifier.width(8.dp))
                     Button(
                         onClick = {
-                            onJitterOptionsConfirm(
+                            onConfirm(
+                                pendingMockWifi,
+                                pendingMockCell,
                                 pendingEnableJitter,
                                 pendingJitterRadius.roundToInt().coerceIn(1, 80),
-                                pendingJitterSpeed
+                                pendingJitterSpeed,
+                                pendingSignalJitterEnabled,
+                                pendingSignalJitterLevel.roundToInt().coerceIn(0, 100),
+                                pendingWifiConnectionMode,
+                                pendingAltitude,
+                                pendingSatelliteCount
                             )
-                            onConfirm()
                         },
                         shape = RoundedCornerShape(8.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = AccentBlue)
@@ -2044,7 +2176,8 @@ private fun StartSpoofingProgressContent(
     sources: List<String>,
     errors: List<String>,
     onDismiss: () -> Unit,
-    onRetry: () -> Unit
+    onRetry: () -> Unit,
+    onUseCurrent: () -> Unit
 ) {
     val isError = phase == StartSpoofingPhase.ERROR
     val isSuccess = phase == StartSpoofingPhase.SUCCESS
@@ -2124,22 +2257,38 @@ private fun StartSpoofingProgressContent(
         }
 
         if (isError) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End
-            ) {
-                TextButton(onClick = onDismiss) {
-                    Text(stringResource(R.string.cancel))
-                }
-                Spacer(Modifier.width(8.dp))
-                Button(
-                    onClick = onRetry,
-                    shape = RoundedCornerShape(8.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = AccentBlue)
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
                 ) {
-                    Icon(Icons.Rounded.Refresh, null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("重試獲取")
+                    TextButton(onClick = onDismiss) {
+                        Text(stringResource(R.string.cancel))
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onUseCurrent,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp)
+                    ) {
+                        Text("以目前狀態啟用", fontSize = 13.sp)
+                    }
+                    Button(
+                        onClick = onRetry,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentBlue)
+                    ) {
+                        Icon(Icons.Rounded.Refresh, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("重試獲取", fontSize = 13.sp)
+                    }
                 }
             }
         }

@@ -14,17 +14,22 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothManager
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.launch
-import kotlin.coroutines.resume
+import java.util.concurrent.atomic.AtomicLong
 
     @android.annotation.SuppressLint("MissingPermission", "NewApi")
 class EnvironmentScanner(private val context: Context) {
+
+    private val lastWifiErrorLogUptimeMs = AtomicLong(0L)
+    private val lastCellErrorLogUptimeMs = AtomicLong(0L)
+
+    private fun logScanFailure(kind: String, error: Exception) {
+        val slot = if (kind == "Wi-Fi") lastWifiErrorLogUptimeMs else lastCellErrorLogUptimeMs
+        val now = android.os.SystemClock.elapsedRealtime()
+        val previous = slot.get()
+        if ((previous == 0L || now - previous >= 60_000L) && slot.compareAndSet(previous, now)) {
+            android.util.Log.w("EnvironmentScanner", "$kind scan failed; returning an empty snapshot", error)
+        }
+    }
 
     @SuppressLint("MissingPermission")
     suspend fun scanWifi(): String = withContext(Dispatchers.IO) {
@@ -116,7 +121,7 @@ class EnvironmentScanner(private val context: Context) {
             }
             resultObj.put("nearbyWifi", nearbyArray)
         } catch (e: Exception) {
-            e.printStackTrace()
+            logScanFailure("Wi-Fi", e)
             resultObj.put("isConnected", false)
             resultObj.put("connectedWifi", JSONObject.NULL)
             resultObj.put("nearbyWifi", JSONArray())
@@ -191,80 +196,9 @@ class EnvironmentScanner(private val context: Context) {
                 jsonArray.put(obj)
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            logScanFailure("Cell", e)
         }
         jsonArray.toString()
     }
 
-    @SuppressLint("MissingPermission")
-    suspend fun scanBluetooth(): String = withContext(Dispatchers.IO) {
-        val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        val adapter = bluetoothManager?.adapter
-        val scanner = adapter?.bluetoothLeScanner
-        
-        val jsonArray = JSONArray()
-        if (scanner == null || !adapter.isEnabled) {
-            return@withContext jsonArray.toString()
-        }
-
-        try {
-            suspendCancellableCoroutine<Unit> { cont ->
-                val resultsList = mutableListOf<ScanResult>()
-                val callback = object : ScanCallback() {
-                    override fun onScanResult(callbackType: Int, result: ScanResult?) {
-                        if (result != null) {
-                            resultsList.add(result)
-                        }
-                    }
-                    override fun onBatchScanResults(results: MutableList<ScanResult>?) {
-                        if (results != null) {
-                            resultsList.addAll(results)
-                        }
-                    }
-                    override fun onScanFailed(errorCode: Int) {
-                        // ignore
-                    }
-                }
-
-                // Start scan
-                scanner.startScan(callback)
-
-                // Stop scan after 2 seconds
-                kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                    delay(2000)
-                    try {
-                        scanner.stopScan(callback)
-                    } catch (e: Exception) {}
-                    
-                    // Deduplicate and convert to JSON
-                    val deduped = resultsList.distinctBy { it.device.address }
-                    deduped.forEach { res ->
-                        val obj = JSONObject()
-                        obj.put("address", res.device.address)
-                        obj.put("name", res.device.name ?: "")
-                        obj.put("rssi", res.rssi)
-                        
-                        // Parse scan record bytes if available
-                        val recordBytes = res.scanRecord?.bytes
-                        if (recordBytes != null) {
-                            val hexString = recordBytes.joinToString("") { "%02X".format(it) }
-                            obj.put("scanRecordHex", hexString)
-                        }
-                        jsonArray.put(obj)
-                    }
-                    if (cont.isActive) {
-                        cont.resume(Unit)
-                    }
-                }
-                
-                cont.invokeOnCancellation {
-                    try { scanner.stopScan(callback) } catch (e: Exception) {}
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        
-        jsonArray.toString()
-    }
 }

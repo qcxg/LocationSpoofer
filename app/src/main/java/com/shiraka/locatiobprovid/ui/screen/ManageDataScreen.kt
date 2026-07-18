@@ -64,6 +64,8 @@ fun ManageDataScreen(
     var editingItem by remember { mutableStateOf<CompleteLocation?>(null) }
 
     val dataList = uiState.manageDataList
+    val coverageLocations by viewModel.coverageLocations.collectAsState()
+    val latestCoverageLocations = rememberUpdatedState(coverageLocations)
     val groupedData = remember(dataList, uiState.nearbyPlaceNames) {
         groupManagedLocations(dataList, uiState.nearbyPlaceNames)
     }
@@ -75,15 +77,13 @@ fun ManageDataScreen(
         mapController?.setMapType(uiState.mapType)
     }
 
-    LaunchedEffect(mapController, dataList) {
+    LaunchedEffect(mapController, coverageLocations) {
         val controller = mapController ?: return@LaunchedEffect
-        controller.clear()
-        val locations = dataList.map { it.location }
-        MapCoverageHelper.drawCoverage(controller, locations)
-        if (locations.isNotEmpty()) {
-            val last = locations.last()
-            controller.moveCamera(last.lat, last.lng, 15f)
+        if (coverageLocations.isNotEmpty()) {
+            val latest = coverageLocations.first()
+            controller.moveCamera(latest.lat, latest.lng, 15f)
         }
+        MapCoverageHelper.drawCoverage(controller, coverageLocations)
     }
 
     Scaffold(
@@ -172,6 +172,12 @@ fun ManageDataScreen(
                         onMapReady = { controller ->
                             mapController = controller
                             controller.disableUiControls()
+                            controller.setOnCameraChangeListener { _, _ ->
+                                MapCoverageHelper.drawCoverage(
+                                    controller,
+                                    latestCoverageLocations.value
+                                )
+                            }
                         }
                     )
                 }

@@ -1,4 +1,6 @@
-# LocationSpoofer Phase Summary (2026-07-02)
+# LocationSpoofer Phase Summary (2026-07-02, Superseded)
+
+> **Historical snapshot:** active client `LocationManager` dispatch, hook-edge getter jitter, and per-object timestamp/sample caches in this file were removed after Android 16 device logs proved that they broke or bypassed the framework chain. Use [`../technical_readme.md`](../technical_readme.md) as the only current implementation guide.
 
 This document records the current phase state of the project based on the recent conversation and the code changes already made in the workspace. It is meant to let the next coding session continue quickly without reconstructing intent from chat history.
 

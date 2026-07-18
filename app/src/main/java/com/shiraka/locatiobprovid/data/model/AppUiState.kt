@@ -25,6 +25,11 @@ enum class JitterSpeed(@StringRes val labelResId: Int) {
     FAST(R.string.jitter_speed_fast)
 }
 
+enum class WifiConnectionMode {
+    FIXED,
+    RANDOM
+}
+
 enum class StartSpoofingPhase {
     IDLE,
     PREPARING,
@@ -106,6 +111,7 @@ data class AppState(
     val isFetchingRoute: Boolean = false,
     /** 首页地图已确认的选点（点击地图后出现确认按钮，确认后填充坐标） */
     val mapConfirmedPoint: Pair<Double, Double>? = null,
+    val showHomeCoordinateAlgorithm: Boolean = true,
     val googleApiKey: String = "",
     val wigleToken: String = "",
     val opencellidToken: String = "",
@@ -115,16 +121,19 @@ data class AppState(
     val environmentRecordCount: Int = 0,
     val hookedApps: List<AppInfoItem> = emptyList(),
     // 采集到的本地环境数据
-    val collectedWifiJson: String = "[]",
+    val collectedWifiJson: String = "{\"isConnected\":false,\"connectedWifi\":null,\"nearbyWifi\":[]}",
     val collectedCellJson: String = "[]",
     val collectedBluetoothJson: String = "[]",
     // 模拟开关
     val mockWifi: Boolean = true,
     val mockCell: Boolean = true,
-    val mockBluetooth: Boolean = true,
+    val mockBluetooth: Boolean = false,
     val enableJitter: Boolean = true,
     val jitterRadiusMeters: Int = 30,
     val jitterSpeed: JitterSpeed = JitterSpeed.MEDIUM,
+    val signalJitterEnabled: Boolean = true,
+    val signalJitterLevel: Int = 40,
+    val wifiConnectionMode: WifiConnectionMode = WifiConnectionMode.FIXED,
     val altitudeInput: String = "0.0",
     val satelliteCountInput: String = "20",
     val canMockWifi: Boolean = false,

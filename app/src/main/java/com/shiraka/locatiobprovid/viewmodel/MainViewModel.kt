@@ -5,6 +5,7 @@ import android.location.Geocoder
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.android.gms.location.LocationServices
+import com.shiraka.locatiobprovid.data.db.RfCoverageLocation
 import com.shiraka.locatiobprovid.data.model.AppState
 import com.shiraka.locatiobprovid.data.model.RoutePoint
 import com.shiraka.locatiobprovid.data.model.RoutePlanStage
@@ -19,6 +20,9 @@ import com.shiraka.locatiobprovid.data.repository.LocationRepository
 import com.shiraka.locatiobprovid.data.repository.SettingsRepository
 import com.shiraka.locatiobprovid.provider.SpooferProvider
 import com.shiraka.locatiobprovid.service.SpoofingService
+import com.shiraka.locatiobprovid.utils.EnvironmentCoveragePolicy
+import com.shiraka.locatiobprovid.utils.EnvironmentRfResolver
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -38,6 +42,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -70,12 +75,18 @@ class MainViewModel(
             currentLanguage = normalizeLanguageTag(settingsRepository.getLanguage()),
             isLanguageSet = settingsRepository.isLanguageSet(),
             appCoordinateSystems = settingsRepository.getAppCoordinateSystems(),
+            showHomeCoordinateAlgorithm = settingsRepository.showHomeCoordinateAlgorithm,
             mockWifi = settingsRepository.mockWifi,
             mockCell = settingsRepository.mockCell,
-            mockBluetooth = settingsRepository.mockBluetooth,
+            mockBluetooth = false,
             enableJitter = settingsRepository.enableJitter,
             jitterRadiusMeters = settingsRepository.jitterRadiusMeters,
             jitterSpeed = parseJitterSpeed(settingsRepository.jitterSpeed),
+            signalJitterEnabled = settingsRepository.signalJitterEnabled,
+            signalJitterLevel = settingsRepository.signalJitterLevel,
+            wifiConnectionMode = runCatching {
+                com.shiraka.locatiobprovid.data.model.WifiConnectionMode.valueOf(settingsRepository.wifiConnectionMode)
+            }.getOrDefault(com.shiraka.locatiobprovid.data.model.WifiConnectionMode.FIXED),
             altitudeInput = settingsRepository.altitude,
             satelliteCountInput = settingsRepository.satelliteCount,
             wigleToken = settingsRepository.getWigleApiToken(),
@@ -84,11 +95,41 @@ class MainViewModel(
     )
     val uiState: StateFlow<AppState> = _uiState.asStateFlow()
 
+    private val _coverageLocations = MutableStateFlow<List<com.shiraka.locatiobprovid.data.db.LocationRecord>>(emptyList())
+    val coverageLocations: StateFlow<List<com.shiraka.locatiobprovid.data.db.LocationRecord>> =
+        _coverageLocations.asStateFlow()
+
     private var locationSyncJob: Job? = null
-    private var autoRouteJob: Job? = null
     private var continuousScanJob: Job? = null
     private val geocodeClient = OkHttpClient()
     private val nearbyNameMemory = mutableMapOf<String, String>()
+    private val environmentRfResolver = EnvironmentRfResolver(environmentDao)
+    private val capabilityEvaluationGeneration = AtomicLong(0L)
+    private var capabilityEvaluationJob: Job? = null
+    private var lastCapabilityCell: EnvironmentCoveragePolicy.Cell? = null
+    private val runtimeOperationGeneration = AtomicLong(0L)
+    private val lastEnvironmentPersistenceErrorUptimeMs = AtomicLong(0L)
+    private var runtimeStartJob: Job? = null
+
+    private fun logEnvironmentPersistenceFailure(error: Exception) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val previous = lastEnvironmentPersistenceErrorUptimeMs.get()
+        if ((previous == 0L || now - previous >= 60_000L) &&
+            lastEnvironmentPersistenceErrorUptimeMs.compareAndSet(previous, now)
+        ) {
+            android.util.Log.w(
+                "MainViewModel",
+                "Continuous environment snapshot persistence failed",
+                error
+            )
+        }
+    }
+
+    private fun invalidateRuntimeStart() {
+        runtimeOperationGeneration.incrementAndGet()
+        runtimeStartJob?.cancel()
+        runtimeStartJob = null
+    }
 
     init {
         initialize()
@@ -99,6 +140,7 @@ class MainViewModel(
     private fun initialize() {
         viewModelScope.launch(Dispatchers.IO) {
             val root = locationRepository.checkRootAccess()
+            val runtimeActive = SpoofingService.isRunning || SpooferProvider.isActive
 
             if (settingsRepository.isSpoofingActive) {
                 val lastLat = settingsRepository.lastSpoofedLat.toDoubleOrNull() ?: 0.0
@@ -111,15 +153,15 @@ class MainViewModel(
                             mapConfirmedPoint = Pair(lastLat, lastLng)
                         )
                     }
-                    if (SpoofingService.isRunning) {
+                    if (runtimeActive) {
                         evaluateMockCapabilitiesSuspend(lastLat, lastLng)
                     }
                 }
-                if (!SpoofingService.isRunning) {
+                if (!runtimeActive) {
                     settingsRepository.isSpoofingActive = false
                     locationRepository.stopSpoofing(context)
                 }
-            } else if (SpoofingService.isRunning) {
+            } else if (runtimeActive) {
                 locationRepository.stopSpoofing(context)
             }
 
@@ -179,6 +221,22 @@ class MainViewModel(
                     }
                 }
                 _uiState.update { it.copy(savedRoutes = routes) }
+            }
+        }
+
+        // Room invalidates this Flow as soon as a location row is inserted,
+        // deleted, imported, or cleared. Maps can therefore repaint while they
+        // remain open instead of waiting for loadManageData() on the next visit.
+        viewModelScope.launch(Dispatchers.IO) {
+            environmentDao.observeAllLocations().collect { locations ->
+                _uiState.update { it.copy(environmentRecordCount = locations.size) }
+            }
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            environmentDao.observeRfCoverageLocations().collect { locations ->
+                _coverageLocations.value = locations
+                SpooferProvider.requestRfRefresh()
+                evaluateMockCapabilities()
             }
         }
     }
@@ -356,7 +414,7 @@ class MainViewModel(
                 android.widget.Toast.makeText(ctx, ctx.getString(com.shiraka.locatiobprovid.R.string.location_permission_denied), android.widget.Toast.LENGTH_SHORT).show()
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            android.util.Log.w("MainViewModel", "Native location request failed", e)
         }
     }
 
@@ -473,6 +531,8 @@ class MainViewModel(
     }
     
     private fun evaluateMockCapabilities() {
+        val generation = capabilityEvaluationGeneration.incrementAndGet()
+        capabilityEvaluationJob?.cancel()
         val state = _uiState.value
         val lat = state.latitudeInput.toDoubleOrNull()
         val lng = state.longitudeInput.toDoubleOrNull()
@@ -480,147 +540,74 @@ class MainViewModel(
         if (lat == null || lng == null) {
             _uiState.update { 
                 it.copy(canMockWifi = false, canMockCell = false, canMockBluetooth = false, 
-                        collectedWifiJson = "[]", collectedCellJson = "[]", collectedBluetoothJson = "[]",
+                        collectedWifiJson = EnvironmentRfResolver.EMPTY_WIFI_JSON,
+                        collectedCellJson = "[]",
+                        collectedBluetoothJson = "[]",
                         wifiApCount = 0, wifiLoadStatus = com.shiraka.locatiobprovid.data.model.WifiLoadStatus.IDLE) 
             }
             return
         }
         
-        viewModelScope.launch {
-            evaluateMockCapabilitiesSuspend(lat, lng)
+        capabilityEvaluationJob = viewModelScope.launch {
+            evaluateMockCapabilitiesSuspend(lat, lng, generation)
         }
     }
 
-    private suspend fun evaluateMockCapabilitiesSuspend(lat: Double, lng: Double) {
-        val allRecords = withContext(Dispatchers.IO) { environmentDao.getAllCompleteLocations() }
-        val validRecords = mutableListOf<com.shiraka.locatiobprovid.data.db.CompleteLocation>()
-
-        for (record in allRecords) {
-            val loc = record.location
-            val dLat = Math.toRadians(lat - loc.lat)
-            val dLng = Math.toRadians(lng - loc.lng)
-            val a = kotlin.math.sin(dLat / 2).let { it * it } +
-                    kotlin.math.cos(Math.toRadians(loc.lat)) *
-                    kotlin.math.cos(Math.toRadians(lat)) *
-                    kotlin.math.sin(dLng / 2).let { it * it }
-            val distance = 2 * 6378137.0 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
-
-            if (distance <= 50.0) { // Increased radius to 50m to match visually forgiving areas
-                validRecords.add(record)
-            }
-        }
-
+    private suspend fun evaluateMockCapabilitiesSuspend(
+        lat: Double,
+        lng: Double,
+        generation: Long = capabilityEvaluationGeneration.incrementAndGet()
+    ) {
+        val resolved = resolveRfCoverageForTargetCell(lat, lng)
         withContext(Dispatchers.Main) {
-            if (validRecords.isEmpty()) {
-                _uiState.update {
-                    it.copy(
-                        canMockWifi = false, canMockCell = false, canMockBluetooth = false,
-                        collectedWifiJson = "[]", collectedCellJson = "[]", collectedBluetoothJson = "[]",
-                        wifiApCount = 0,
-                        wifiLoadStatus = com.shiraka.locatiobprovid.data.model.WifiLoadStatus.IDLE
-                    )
-                }
-            } else {
-                val (wifiJson, cellJson, btJson) = locationToJson(validRecords, lat, lng)
-                val hasW = try {
-                    val obj = org.json.JSONObject(wifiJson)
-                    val nearby = obj.optJSONArray("nearbyWifi")
-                    val connected = obj.opt("connectedWifi")
-                    (nearby != null && nearby.length() > 0) || (connected != null && !obj.isNull("connectedWifi"))
-                } catch (e: Exception) {
-                    false
-                }
-                val hasC = try {
-                    val arr = org.json.JSONArray(cellJson)
-                    arr.length() > 0
-                } catch (e: Exception) {
-                    false
-                }
-                val hasB = try {
-                    val arr = org.json.JSONArray(btJson)
-                    arr.length() > 0
-                } catch (e: Exception) {
-                    false
-                }
-
-                val wifiCount = try {
-                    val obj = org.json.JSONObject(wifiJson)
-                    val nearby = obj.optJSONArray("nearbyWifi")
-                    nearby?.length() ?: 0
-                } catch (e: Exception) { 0 }
-
-                _uiState.update {
-                    it.copy(
-                        canMockWifi = hasW, canMockCell = hasC, canMockBluetooth = hasB,
-                        collectedWifiJson = wifiJson, collectedCellJson = cellJson, collectedBluetoothJson = btJson,
-                        wifiApCount = wifiCount,
-                        wifiLoadStatus = if (hasW) com.shiraka.locatiobprovid.data.model.WifiLoadStatus.DONE else com.shiraka.locatiobprovid.data.model.WifiLoadStatus.IDLE
-                    )
-                }
-            }
+            if (generation != capabilityEvaluationGeneration.get()) return@withContext
+            val current = _uiState.value
+            if (current.latitudeInput.toDoubleOrNull() != lat ||
+                current.longitudeInput.toDoubleOrNull() != lng
+            ) return@withContext
+            publishResolvedRfCoverage(resolved)
         }
     }
 
-    private suspend fun hasLocalWifiWithin50m(lat: Double, lng: Double): Boolean {
-        val bounds = nearbyBounds(lat, lng, 50.0)
-        val nearbyRecords = withContext(Dispatchers.IO) {
-            environmentDao.getCompleteLocationsInBounds(bounds.minLat, bounds.maxLat, bounds.minLng, bounds.maxLng)
+    private fun publishResolvedRfCoverage(resolved: EnvironmentRfResolver.ResolvedRfCoverage) {
+        _uiState.update {
+            it.copy(
+                canMockWifi = resolved.hasWifi,
+                canMockCell = resolved.hasCell,
+                canMockBluetooth = false,
+                collectedWifiJson = resolved.wifiJson,
+                collectedCellJson = resolved.cellJson,
+                collectedBluetoothJson = "[]",
+                wifiApCount = resolved.wifiApCount,
+                wifiLoadStatus = if (resolved.hasWifi) {
+                    com.shiraka.locatiobprovid.data.model.WifiLoadStatus.DONE
+                } else {
+                    com.shiraka.locatiobprovid.data.model.WifiLoadStatus.IDLE
+                }
+            )
         }
-        for (record in nearbyRecords) {
-            if (record.wifis.isEmpty()) continue
-            val loc = record.location
-            val dLat = Math.toRadians(lat - loc.lat)
-            val dLng = Math.toRadians(lng - loc.lng)
-            val a = kotlin.math.sin(dLat / 2).let { it * it } +
-                    kotlin.math.cos(Math.toRadians(loc.lat)) *
-                    kotlin.math.cos(Math.toRadians(lat)) *
-                    kotlin.math.sin(dLng / 2).let { it * it }
-            val distance = 2 * 6378137.0 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
-            if (distance <= 50.0) {
-                return true
-            }
-        }
-        return false
     }
 
-    private suspend fun hasLocalCellsWithin50m(lat: Double, lng: Double): Boolean {
-        val bounds = nearbyBounds(lat, lng, 50.0)
-        val nearbyRecords = withContext(Dispatchers.IO) {
-            environmentDao.getCompleteLocationsInBounds(bounds.minLat, bounds.maxLat, bounds.minLng, bounds.maxLng)
-        }
-        for (record in nearbyRecords) {
-            if (record.cells.isEmpty()) continue
-            val loc = record.location
-            val dLat = Math.toRadians(lat - loc.lat)
-            val dLng = Math.toRadians(lng - loc.lng)
-            val a = kotlin.math.sin(dLat / 2).let { it * it } + 
-                    kotlin.math.cos(Math.toRadians(loc.lat)) * 
-                    kotlin.math.cos(Math.toRadians(lat)) * 
-                    kotlin.math.sin(dLng / 2).let { it * it }
-            val distance = 2 * 6378137.0 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
-            if (distance <= 50.0) {
-                return true
-            }
-        }
-        return false
-    }
+    private fun hasLocalWifiInTargetCell(locations: List<RfCoverageLocation>): Boolean =
+        locations.any { it.hasWifi }
 
-    private data class GeoBounds(
-        val minLat: Double,
-        val maxLat: Double,
-        val minLng: Double,
-        val maxLng: Double
-    )
+    private fun hasLocalCellsInTargetCell(locations: List<RfCoverageLocation>): Boolean =
+        locations.any { it.hasCell }
 
-    private fun nearbyBounds(lat: Double, lng: Double, radiusMeters: Double): GeoBounds {
-        val latDelta = radiusMeters / 111_320.0
-        val lngDelta = radiusMeters / (111_320.0 * kotlin.math.cos(Math.toRadians(lat)).coerceAtLeast(0.01))
-        return GeoBounds(
-            minLat = (lat - latDelta).coerceAtLeast(-90.0),
-            maxLat = (lat + latDelta).coerceAtMost(90.0),
-            minLng = (lng - lngDelta).coerceAtLeast(-180.0),
-            maxLng = (lng + lngDelta).coerceAtMost(180.0)
-        )
+    private suspend fun findRfCoverageInTargetCell(lat: Double, lng: Double): List<RfCoverageLocation> =
+        environmentRfResolver.findCoverageInTargetCell(lat, lng)
+
+    private suspend fun resolveRfCoverageForTargetCell(
+        lat: Double,
+        lng: Double
+    ): EnvironmentRfResolver.ResolvedRfCoverage {
+        val resolved = environmentRfResolver.resolve(lat, lng)
+        val selectedBssid = SpooferProvider.connectedWifiOverrideFor(lat, lng) ?: return resolved
+        val selectedWifiJson = EnvironmentRfResolver.selectConnectedWifi(
+            resolved.wifiJson,
+            selectedBssid
+        ) ?: return resolved
+        return resolved.copy(wifiJson = selectedWifiJson)
     }
 
     private suspend fun fetchWifiFromWigleSync(lat: Double, lng: Double): Boolean {
@@ -696,7 +683,7 @@ class MainViewModel(
                 val formattedWifiJson = wifiObj.toString()
                 
                 withContext(Dispatchers.IO) {
-                    saveEnvironmentData(lat, lng, formattedWifiJson, "[]", "[]")
+                    saveEnvironmentData(lat, lng, formattedWifiJson, "[]")
                     val newestLocation = environmentDao.getAllLocations().firstOrNull { it.lat == lat && it.lng == lng }
                     if (newestLocation != null) {
                         environmentDao.updateMetadata(
@@ -767,7 +754,7 @@ class MainViewModel(
                 }
 
                 withContext(Dispatchers.IO) {
-                    saveEnvironmentData(lat, lng, "{}", formattedCells.toString(), "[]")
+                    saveEnvironmentData(lat, lng, "{}", formattedCells.toString())
                     val newestLocation = environmentDao.getAllLocations().firstOrNull { it.lat == lat && it.lng == lng }
                     if (newestLocation != null) {
                         environmentDao.updateMetadata(
@@ -866,7 +853,7 @@ class MainViewModel(
     // 定点模拟
 
     @android.annotation.SuppressLint("MissingPermission")
-    fun startSpoofing() {
+    fun startSpoofing(allowPartial: Boolean = false) {
         val state = _uiState.value
         
         if (state.isContinuousScanning) {
@@ -881,11 +868,9 @@ class MainViewModel(
             return
         }
         
-        settingsRepository.isSpoofingActive = true
-        settingsRepository.lastSpoofedLat = lat.toString()
-        settingsRepository.lastSpoofedLng = lng.toString()
-        
-        viewModelScope.launch {
+        val operationGeneration = runtimeOperationGeneration.incrementAndGet()
+        runtimeStartJob?.cancel()
+        runtimeStartJob = viewModelScope.launch {
             _uiState.update {
                 it.copy(
                     isSavingConfig = true,
@@ -895,15 +880,16 @@ class MainViewModel(
                     )
                 )
             }
-            
-            val needsWifiFetch = state.mockWifi && !hasLocalWifiWithin50m(lat, lng)
-            val needsCellFetch = state.mockCell && !hasLocalCellsWithin50m(lat, lng)
+
+            val localCoverage = findRfCoverageInTargetCell(lat, lng)
+            val needsWifiFetch = state.mockWifi && !hasLocalWifiInTargetCell(localCoverage)
+            val needsCellFetch = state.mockCell && !hasLocalCellsInTargetCell(localCoverage)
             val fetchSources = buildList {
                 if (needsWifiFetch) add("WiGLE")
                 if (needsCellFetch) add("OpenCellID")
             }
 
-            if (fetchSources.isNotEmpty()) {
+            if (fetchSources.isNotEmpty() && !allowPartial) {
                 _uiState.update {
                     it.copy(
                         startSpoofingProgress = StartSpoofingProgress(
@@ -921,7 +907,9 @@ class MainViewModel(
                 if (needsCellFetch && !fetchCellFromOpenCellIdSync(lat, lng)) {
                     failedSources += "OpenCellID"
                 }
+                if (operationGeneration != runtimeOperationGeneration.get()) return@launch
                 if (failedSources.isNotEmpty()) {
+                    settingsRepository.isSpoofingActive = false
                     _uiState.update {
                         it.copy(
                             isSavingConfig = false,
@@ -937,46 +925,82 @@ class MainViewModel(
                 }
             }
 
+            if (operationGeneration != runtimeOperationGeneration.get()) return@launch
             _uiState.update {
                 it.copy(
                     startSpoofingProgress = StartSpoofingProgress(
                         phase = StartSpoofingPhase.ENABLING,
-                        message = "正在寫入模擬配置",
+                        message = if (allowPartial && fetchSources.isNotEmpty()) {
+                            "正在以目前可用資料啟用"
+                        } else {
+                            "正在寫入模擬配置"
+                        },
                         sources = fetchSources
                     )
                 )
             }
-            evaluateMockCapabilitiesSuspend(lat, lng)
-            
+            val resolved = resolveRfCoverageForTargetCell(lat, lng)
+            val currentTarget = _uiState.value
+            if (operationGeneration != runtimeOperationGeneration.get() ||
+                currentTarget.latitudeInput.toDoubleOrNull() != lat ||
+                currentTarget.longitudeInput.toDoubleOrNull() != lng
+            ) {
+                _uiState.update { it.copy(isSavingConfig = false) }
+                return@launch
+            }
+            publishResolvedRfCoverage(resolved)
+
             val updatedState = _uiState.value
             recordRecentLocation(
                 SavedLocation(
                     String.format(java.util.Locale.US, "%.5f, %.5f", lat, lng),
                     lat,
                     lng,
-                    updatedState.collectedWifiJson,
-                    updatedState.collectedCellJson
+                    resolved.wifiJson,
+                    resolved.cellJson
                 )
             )
             val now = System.currentTimeMillis()
-            locationRepository.startSpoofing(
-                context, lat, lng,
-                "STILL", 0f, now,
-                emptyList(), false,
-                updatedState.appCoordinateSystems,
-                updatedState.collectedWifiJson,
-                updatedState.collectedCellJson,
-                updatedState.collectedBluetoothJson,
-                updatedState.mockWifi && updatedState.canMockWifi,
-                updatedState.mockCell,
-                updatedState.mockBluetooth && updatedState.canMockBluetooth,
-                updatedState.enableJitter,
-                updatedState.jitterRadiusMeters,
-                updatedState.jitterSpeed.name
-            )
-            
-            // Wait briefly to ensure root shell syncs to disk fully
-            kotlinx.coroutines.delay(200)
+            try {
+                locationRepository.startSpoofing(
+                    context, lat, lng,
+                    "STILL", 0f, now,
+                    emptyList(), false,
+                    updatedState.appCoordinateSystems,
+                    resolved.wifiJson,
+                    resolved.cellJson,
+                    updatedState.mockWifi,
+                    updatedState.mockCell,
+                    updatedState.enableJitter,
+                    updatedState.jitterRadiusMeters,
+                    updatedState.jitterSpeed.name,
+                    updatedState.signalJitterEnabled,
+                    updatedState.signalJitterLevel,
+                    updatedState.wifiConnectionMode.name
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                settingsRepository.isSpoofingActive = false
+                if (operationGeneration == runtimeOperationGeneration.get()) {
+                    _uiState.update {
+                        it.copy(
+                            isSpoofingActive = false,
+                            isSavingConfig = false,
+                            startSpoofingProgress = StartSpoofingProgress(
+                                phase = StartSpoofingPhase.ERROR,
+                                message = "啟用失敗",
+                                errors = listOf(error.message ?: error.javaClass.simpleName)
+                            )
+                        )
+                    }
+                }
+                return@launch
+            }
+            if (operationGeneration != runtimeOperationGeneration.get()) return@launch
+            settingsRepository.isSpoofingActive = true
+            settingsRepository.lastSpoofedLat = lat.toString()
+            settingsRepository.lastSpoofedLng = lng.toString()
 
             _uiState.update {
                 it.copy(
@@ -986,7 +1010,7 @@ class MainViewModel(
                         phase = StartSpoofingPhase.SUCCESS,
                         message = "虛擬位置已啟用",
                         sources = fetchSources,
-                        usedLocalCache = fetchSources.isEmpty()
+                        usedLocalCache = fetchSources.isEmpty() || allowPartial
                     )
                 )
             }
@@ -998,29 +1022,30 @@ class MainViewModel(
     }
 
     fun stopSpoofing() {
+        invalidateRuntimeStart()
         settingsRepository.isSpoofingActive = false
         locationSyncJob?.cancel()
         locationSyncJob = null
-        autoRouteJob?.cancel()
-        autoRouteJob = null
+        capabilityEvaluationJob?.cancel()
         viewModelScope.launch {
             locationRepository.stopSpoofing(context)
             _uiState.update {
-                it.copy(isSpoofingActive = false)
+                it.copy(isSpoofingActive = false, isSavingConfig = false)
             }
         }
     }
 
     fun cleanupRuntimeEnvironment(onComplete: (Boolean) -> Unit) {
+        invalidateRuntimeStart()
         settingsRepository.isSpoofingActive = false
         locationSyncJob?.cancel()
         locationSyncJob = null
-        autoRouteJob?.cancel()
-        autoRouteJob = null
+        capabilityEvaluationJob?.cancel()
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
                     isSpoofingActive = false,
+                    isSavingConfig = false,
                     routePlanStage = RoutePlanStage.IDLE,
                     routePoints = emptyList(),
                     routeRunMode = RouteRunMode.MANUAL
@@ -1053,22 +1078,8 @@ class MainViewModel(
             kotlin.math.cos(distance / R) - kotlin.math.sin(latRad) * kotlin.math.sin(newLatRad)
         )
         val newLat = Math.toDegrees(newLatRad)
-        val newLng = Math.toDegrees(newLngRad)
-        _uiState.update {
-            it.copy(
-                latitudeInput = String.format("%.6f", newLat),
-                longitudeInput = String.format("%.6f", newLng),
-                simBearing = bearing.toFloat(),
-                showCoordinateError = false
-            )
-        }
-        // 实时同步给 SpooferProvider
-        SpooferProvider.latitude = newLat
-        SpooferProvider.longitude = newLng
-        SpooferProvider.currentLatitude = newLat
-        SpooferProvider.currentLongitude = newLng
-        SpooferProvider.simBearing = bearing.toFloat()
-        SpooferProvider.startTimestamp = System.currentTimeMillis()
+        val newLng = EnvironmentCoveragePolicy.normalizeLongitude(Math.toDegrees(newLngRad))
+        updatePosition(newLat, newLng, bearing.toFloat())
     }
 
     // 路线规划状态机
@@ -1180,18 +1191,21 @@ class MainViewModel(
             return false
         }
 
-        autoRouteJob?.cancel()
-        autoRouteJob = null
         settingsRepository.lastSpoofedLat = lat.toString()
         settingsRepository.lastSpoofedLng = lng.toString()
-        updatePosition(lat, lng, state.simBearing, forceConfigUpdate = true)
+        updatePosition(lat, lng, state.simBearing)
         return true
     }
 
     fun selectConnectedWifi(bssid: String) {
         val state = _uiState.value
-        val updatedJson = switchConnectedWifi(state.collectedWifiJson, bssid) ?: return
+        val updatedJson = EnvironmentRfResolver.selectConnectedWifi(state.collectedWifiJson, bssid) ?: return
         _uiState.update { it.copy(collectedWifiJson = updatedJson) }
+        val lat = state.latitudeInput.toDoubleOrNull()
+        val lng = state.longitudeInput.toDoubleOrNull()
+        if (lat != null && lng != null) {
+            SpooferProvider.setConnectedWifiOverride(lat, lng, bssid)
+        }
         if (state.isSpoofingActive) {
             syncMockSettings()
         }
@@ -1233,32 +1247,70 @@ class MainViewModel(
 
         val isLoop = state.routeRunMode == RouteRunMode.LOOP
 
-        viewModelScope.launch {
+        val operationGeneration = runtimeOperationGeneration.incrementAndGet()
+        runtimeStartJob?.cancel()
+        runtimeStartJob = viewModelScope.launch {
+            val resolved = resolveRfCoverageForTargetCell(startPoint.lat, startPoint.lng)
+            if (operationGeneration != runtimeOperationGeneration.get() ||
+                _uiState.value.routePlanStage != RoutePlanStage.RUNNING ||
+                _uiState.value.routePoints != pointsToRun
+            ) return@launch
+            publishResolvedRfCoverage(resolved)
+            val runtimeState = _uiState.value
+            val now = System.currentTimeMillis()
+            SpooferProvider.simSpeed = getEffectiveSpeedMs().toFloat()
+
+            try {
+                locationRepository.startSpoofing(
+                    context, startPoint.lat, startPoint.lng,
+                    if (isLoop) state.routeSimMode.name else "STILL",
+                    0f, now, pointsToRun, isLoop, runtimeState.appCoordinateSystems,
+                    resolved.wifiJson, resolved.cellJson,
+                    runtimeState.mockWifi,
+                    runtimeState.mockCell,
+                    runtimeState.enableJitter,
+                    runtimeState.jitterRadiusMeters, runtimeState.jitterSpeed.name,
+                    runtimeState.signalJitterEnabled, runtimeState.signalJitterLevel,
+                    runtimeState.wifiConnectionMode.name
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                settingsRepository.isSpoofingActive = false
+                if (operationGeneration == runtimeOperationGeneration.get()) {
+                    _uiState.update {
+                        it.copy(
+                            isSpoofingActive = false,
+                            routePlanStage = RoutePlanStage.IDLE
+                        )
+                    }
+                }
+                return@launch
+            }
+            if (operationGeneration != runtimeOperationGeneration.get() ||
+                _uiState.value.routePlanStage != RoutePlanStage.RUNNING
+            ) return@launch
             settingsRepository.isSpoofingActive = true
             settingsRepository.lastSpoofedLat = startPoint.lat.toString()
             settingsRepository.lastSpoofedLng = startPoint.lng.toString()
-            val now = System.currentTimeMillis()
-            
-            locationRepository.startSpoofing(
-                context, startPoint.lat, startPoint.lng,
-                if (isLoop) state.routeSimMode.name else "STILL",
-                0f, now, pointsToRun, isLoop, state.appCoordinateSystems,
-                state.collectedWifiJson, state.collectedCellJson, state.collectedBluetoothJson,
-                state.mockWifi, state.mockCell, state.mockBluetooth, state.enableJitter,
-                state.jitterRadiusMeters, state.jitterSpeed.name
-            )
             _uiState.update {
                 it.copy(isSpoofingActive = true)
             }
-        }
-
-        if (isLoop) {
-            startAutoRouteLoop()
+            if (isLoop) {
+                startRouteUiSync()
+            }
         }
     }
 
     /** 停止路线模拟，重置所有状态 */
     fun cancelRoutePlanning() {
+        if (_uiState.value.routePlanStage == RoutePlanStage.RUNNING ||
+            _uiState.value.isSpoofingActive
+        ) {
+            stopRoutePlanning()
+            return
+        }
+        invalidateRuntimeStart()
         _uiState.update {
             it.copy(
                 routePlanStage = RoutePlanStage.IDLE,
@@ -1269,11 +1321,11 @@ class MainViewModel(
     }
 
     fun stopRoutePlanning() {
+        invalidateRuntimeStart()
         settingsRepository.isSpoofingActive = false
         locationSyncJob?.cancel()
         locationSyncJob = null
-        autoRouteJob?.cancel()
-        autoRouteJob = null
+        capabilityEvaluationJob?.cancel()
         viewModelScope.launch {
             locationRepository.stopSpoofing(context)
             _uiState.update {
@@ -1356,123 +1408,32 @@ class MainViewModel(
 
     // 内部工具
 
-    /**
-     * 循环模式自动移动。
-     * 按路点顺序移动，到终点后反向，不断循环。
-     * 同时实时同步坐标到 SpooferProvider。
-     */
-    private fun startAutoRouteLoop() {
-        autoRouteJob?.cancel()
-        autoRouteJob = viewModelScope.launch(Dispatchers.Default) {
-            val points = _uiState.value.routePoints
-            if (points.size < 2) return@launch
-
-            val speedMs = getEffectiveSpeedMs()
-            if (speedMs <= 0.0) return@launch
-
-            val tickMs = 100L
-            val tickSec = tickMs / 1000.0
-            var forward = true
-            var segmentIndex = 0
-            var progress = 0.0 // 当前段上已走过的距离（米）
-
-            while (isActive) {
-                val fromIdx = if (forward) segmentIndex else segmentIndex + 1
-                val toIdx = if (forward) segmentIndex + 1 else segmentIndex
-                val from = points[fromIdx]
-                val to = points[toIdx]
-                val segLen = haversineMeters(from, to)
-
-                val stepDist = speedMs * tickSec
-                progress += stepDist
-
-                if (progress >= segLen) {
-                    // 到达当前段终点
-                    progress -= segLen
-                    if (forward) {
-                        segmentIndex++
-                        if (segmentIndex >= points.lastIndex) {
-                            // 到达终点，反向
-                            forward = false
-                            segmentIndex = points.lastIndex - 1
-                            progress = 0.0
-                        }
-                    } else {
-                        segmentIndex--
-                        if (segmentIndex < 0) {
-                            // 回到起点，正向
-                            forward = true
-                            segmentIndex = 0
-                            progress = 0.0
-                        }
-                    }
-                    // 重新获取段信息并继续
-                    val newFrom = if (forward) points[segmentIndex] else points[segmentIndex + 1]
-                    updatePosition(newFrom.lat, newFrom.lng, 0f)
-                } else {
-                    // 在段中间插值
-                    val ratio = if (segLen > 0) progress / segLen else 0.0
-                    val lat = from.lat + (to.lat - from.lat) * ratio
-                    val lng = from.lng + (to.lng - from.lng) * ratio
-                    val bearing = bearingBetween(from, to).toFloat()
-                    updatePosition(lat, lng, bearing)
+    /** The service owns route motion; this job mirrors its atomic output to UI only. */
+    private fun startRouteUiSync() {
+        locationSyncJob?.cancel()
+        locationSyncJob = viewModelScope.launch {
+            while (isActive && _uiState.value.isSpoofingActive && SpooferProvider.isRouteMode) {
+                val position = SpooferProvider.currentPosition()
+                val cell = EnvironmentCoveragePolicy.cellFor(position.latitude, position.longitude)
+                _uiState.update {
+                    it.copy(
+                        latitudeInput = String.format(Locale.US, "%.6f", position.latitude),
+                        longitudeInput = String.format(Locale.US, "%.6f", position.longitude),
+                        simBearing = position.bearing,
+                        showCoordinateError = false
+                    )
                 }
-
-                delay(tickMs)
+                if (cell != lastCapabilityCell) {
+                    lastCapabilityCell = cell
+                    evaluateMockCapabilities()
+                }
+                delay(250L)
             }
         }
     }
 
-    private var lastDbQueryLat: Double = 0.0
-    private var lastDbQueryLng: Double = 0.0
-
-    private fun switchConnectedWifi(wifiJson: String, selectedBssid: String): String? {
-        return try {
-            val source = org.json.JSONObject(wifiJson)
-            val selectedKey = selectedBssid.trim()
-            if (selectedKey.isBlank()) return null
-
-            val currentConnected = source.optJSONObject("connectedWifi")
-            val nearby = source.optJSONArray("nearbyWifi") ?: org.json.JSONArray()
-            var selected: org.json.JSONObject? = currentConnected
-                ?.takeIf { it.optString("bssid", "").equals(selectedKey, ignoreCase = true) }
-
-            if (selected == null) {
-                for (i in 0 until nearby.length()) {
-                    val candidate = nearby.optJSONObject(i) ?: continue
-                    if (candidate.optString("bssid", "").equals(selectedKey, ignoreCase = true)) {
-                        selected = candidate
-                        break
-                    }
-                }
-            }
-            val selectedWifi = selected ?: return null
-
-            val newNearby = org.json.JSONArray()
-            fun addIfDifferent(wifi: org.json.JSONObject?) {
-                if (wifi == null) return
-                val bssid = wifi.optString("bssid", "")
-                if (bssid.isBlank() || bssid.equals(selectedKey, ignoreCase = true)) return
-                newNearby.put(org.json.JSONObject(wifi.toString()))
-            }
-
-            addIfDifferent(currentConnected)
-            for (i in 0 until nearby.length()) {
-                addIfDifferent(nearby.optJSONObject(i))
-            }
-
-            org.json.JSONObject(source.toString()).apply {
-                put("isConnected", true)
-                put("connectedWifi", org.json.JSONObject(selectedWifi.toString()))
-                put("nearbyWifi", newNearby)
-            }.toString()
-        } catch (_: Throwable) {
-            null
-        }
-    }
-
-    /** 更新当前模拟位置到 UI 和 SpooferProvider */
-    private fun updatePosition(lat: Double, lng: Double, bearing: Float, forceConfigUpdate: Boolean = false) {
+    /** Manual movement updates the anchor; SpoofingService publishes the next heartbeat. */
+    private fun updatePosition(lat: Double, lng: Double, bearing: Float) {
         _uiState.update {
             it.copy(
                 latitudeInput = String.format("%.6f", lat),
@@ -1481,93 +1442,39 @@ class MainViewModel(
                 showCoordinateError = false
             )
         }
-        SpooferProvider.latitude = lat
-        SpooferProvider.longitude = lng
-        SpooferProvider.currentLatitude = lat
-        SpooferProvider.currentLongitude = lng
+        val wasAutomaticRoute = SpooferProvider.isRouteMode || SpooferProvider.simMode != "STILL"
+        SpooferProvider.publishAnchorPosition(lat, lng)
+        SpooferProvider.simMode = "STILL"
+        SpooferProvider.isRouteMode = false
+        SpooferProvider.routeJson = "[]"
         SpooferProvider.simBearing = bearing
-        SpooferProvider.startTimestamp = System.currentTimeMillis()
-        
-        // Check if we need to query the database (e.g. moved more than 20 meters since last query)
-        val dLat = Math.toRadians(lat - lastDbQueryLat)
-        val dLng = Math.toRadians(lng - lastDbQueryLng)
-        val a = kotlin.math.sin(dLat / 2).let { it * it } + kotlin.math.cos(Math.toRadians(lastDbQueryLat)) * kotlin.math.cos(Math.toRadians(lat)) * kotlin.math.sin(dLng / 2).let { it * it }
-        val distance = 2 * 6378137.0 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
-        
-        if (forceConfigUpdate || distance > 20.0) {
-            lastDbQueryLat = lat
-            lastDbQueryLng = lng
-            viewModelScope.launch(Dispatchers.IO) {
-                val records = environmentDao.getNearestLocations(lat, lng, 3)
-                if (records.isNotEmpty()) {
-                    val record = records[0]
-                    // Check if the closest record is actually within ~50 meters
-                    val rLat = Math.toRadians(record.location.lat - lat)
-                    val rLng = Math.toRadians(record.location.lng - lng)
-                    val rA = kotlin.math.sin(rLat / 2).let { it * it } + kotlin.math.cos(Math.toRadians(lat)) * kotlin.math.cos(Math.toRadians(record.location.lat)) * kotlin.math.sin(rLng / 2).let { it * it }
-                    val rDist = 2 * 6378137.0 * kotlin.math.atan2(kotlin.math.sqrt(rA), kotlin.math.sqrt(1 - rA))
-                    
-                    if (rDist <= 50.0) {
-                        val jsons = locationToJson(records, lat, lng)
-                        SpooferProvider.cellJson = jsons.second
-                        // Save config file with new cell_json and wifi_json and bluetoothJson
-                        locationRepository.updateConfig(
-                            lat = lat,
-                            lng = lng,
-                            simMode = "STILL",
-                            simBearing = bearing,
-                            startTime = SpooferProvider.startTimestamp,
-                            routePoints = _uiState.value.routePoints,
-                            isRouteMode = _uiState.value.routePlanStage == com.shiraka.locatiobprovid.data.model.RoutePlanStage.RUNNING,
-                            appCoordinateSystems = settingsRepository.getAppCoordinateSystems(),
-                            wifiJson = jsons.first,
-                            cellJson = jsons.second,
-                            bluetoothJson = jsons.third
-                        )
-                    } else {
-                        // No trusted local environment data around this point; keep RF data empty.
-                        SpooferProvider.cellJson = "[]"
-                        locationRepository.updateConfig(
-                            lat = lat,
-                            lng = lng,
-                            simMode = "STILL",
-                            simBearing = bearing,
-                            startTime = SpooferProvider.startTimestamp,
-                            routePoints = _uiState.value.routePoints,
-                            isRouteMode = _uiState.value.routePlanStage == com.shiraka.locatiobprovid.data.model.RoutePlanStage.RUNNING,
-                            appCoordinateSystems = settingsRepository.getAppCoordinateSystems(),
-                            wifiJson = "[]",
-                            cellJson = "[]",
-                            bluetoothJson = "[]"
-                        )
-                    }
-                } else {
-                    SpooferProvider.cellJson = "[]"
-                    locationRepository.updateConfig(
-                        lat = lat,
-                        lng = lng,
-                        simMode = "STILL",
-                        simBearing = bearing,
-                        startTime = SpooferProvider.startTimestamp,
-                        routePoints = _uiState.value.routePoints,
-                        isRouteMode = _uiState.value.routePlanStage == com.shiraka.locatiobprovid.data.model.RoutePlanStage.RUNNING,
-                        appCoordinateSystems = settingsRepository.getAppCoordinateSystems(),
-                        wifiJson = "[]",
-                        cellJson = "[]",
-                        bluetoothJson = "[]"
-                    )
-                }
-            }
+        SpooferProvider.simSpeed = 0f
+        SpooferProvider.publishCurrentPosition(lat, lng, bearing, 0f)
+        if (wasAutomaticRoute || SpooferProvider.startTimestamp <= 0L) {
+            SpooferProvider.startTimestamp = System.currentTimeMillis()
+        }
+
+        val targetCell = EnvironmentCoveragePolicy.cellFor(lat, lng)
+        if (targetCell != lastCapabilityCell) {
+            lastCapabilityCell = targetCell
+            SpooferProvider.requestRfRefresh()
+            evaluateMockCapabilities()
         }
     }
 
     private fun haversineMeters(a: RoutePoint, b: RoutePoint): Double {
-        val R = 6378137.0
-        val lat1 = Math.toRadians(a.lat); val lat2 = Math.toRadians(b.lat)
-        val dLat = Math.toRadians(b.lat - a.lat); val dLng = Math.toRadians(b.lng - a.lng)
+        return distanceMeters(a.lat, a.lng, b.lat, b.lng)
+    }
+
+    private fun distanceMeters(fromLat: Double, fromLng: Double, toLat: Double, toLng: Double): Double {
+        val radius = 6_378_137.0
+        val lat1 = Math.toRadians(fromLat)
+        val lat2 = Math.toRadians(toLat)
+        val dLat = Math.toRadians(toLat - fromLat)
+        val dLng = Math.toRadians(toLng - fromLng)
         val h = kotlin.math.sin(dLat / 2).let { it * it } +
             kotlin.math.cos(lat1) * kotlin.math.cos(lat2) * kotlin.math.sin(dLng / 2).let { it * it }
-        return 2 * R * kotlin.math.atan2(kotlin.math.sqrt(h), kotlin.math.sqrt(1 - h))
+        return 2 * radius * kotlin.math.atan2(kotlin.math.sqrt(h), kotlin.math.sqrt(1 - h))
     }
 
     private fun bearingBetween(from: RoutePoint, to: RoutePoint): Double {
@@ -1590,13 +1497,6 @@ class MainViewModel(
         val newVal = !_uiState.value.mockCell
         settingsRepository.mockCell = newVal
         _uiState.update { it.copy(mockCell = newVal) }
-        syncMockSettings()
-    }
-
-    fun toggleMockBluetooth() {
-        val newVal = !_uiState.value.mockBluetooth
-        settingsRepository.mockBluetooth = newVal
-        _uiState.update { it.copy(mockBluetooth = newVal) }
         syncMockSettings()
     }
 
@@ -1633,44 +1533,83 @@ class MainViewModel(
         }
         syncMockSettings()
     }
+
+    fun startSpoofingWithDialogOptions(
+        mockWifi: Boolean,
+        mockCell: Boolean,
+        enableJitter: Boolean,
+        jitterRadiusMeters: Int,
+        jitterSpeed: JitterSpeed,
+        signalJitterEnabled: Boolean,
+        signalJitterLevel: Int,
+        wifiConnectionMode: com.shiraka.locatiobprovid.data.model.WifiConnectionMode,
+        altitude: String,
+        satelliteCount: String
+    ) {
+        val radius = jitterRadiusMeters.coerceIn(1, 80)
+        val signalLevel = signalJitterLevel.coerceIn(0, 100)
+        settingsRepository.mockWifi = mockWifi
+        settingsRepository.mockCell = mockCell
+        settingsRepository.mockBluetooth = false
+        settingsRepository.enableJitter = enableJitter
+        settingsRepository.jitterRadiusMeters = radius
+        settingsRepository.jitterSpeed = jitterSpeed.name
+        settingsRepository.signalJitterEnabled = signalJitterEnabled
+        settingsRepository.signalJitterLevel = signalLevel
+        settingsRepository.wifiConnectionMode = wifiConnectionMode.name
+        settingsRepository.altitude = altitude
+        settingsRepository.satelliteCount = satelliteCount
+        SpooferProvider.enableJitter = enableJitter
+        SpooferProvider.jitterRadiusMeters = radius
+        SpooferProvider.jitterSpeed = jitterSpeed.name
+        SpooferProvider.signalJitterEnabled = signalJitterEnabled
+        SpooferProvider.signalJitterLevel = signalLevel
+        SpooferProvider.wifiConnectionMode = wifiConnectionMode.name
+        _uiState.update {
+            it.copy(
+                mockWifi = mockWifi,
+                mockCell = mockCell,
+                mockBluetooth = false,
+                enableJitter = enableJitter,
+                jitterRadiusMeters = radius,
+                jitterSpeed = jitterSpeed,
+                signalJitterEnabled = signalJitterEnabled,
+                signalJitterLevel = signalLevel,
+                wifiConnectionMode = wifiConnectionMode,
+                altitudeInput = altitude,
+                satelliteCountInput = satelliteCount
+            )
+        }
+        startSpoofing()
+    }
+
+    fun setShowHomeCoordinateAlgorithm(show: Boolean) {
+        settingsRepository.showHomeCoordinateAlgorithm = show
+        _uiState.update { it.copy(showHomeCoordinateAlgorithm = show) }
+    }
     
     private fun syncMockSettings() {
         if (_uiState.value.isSpoofingActive) {
             val state = _uiState.value
-            val lat = state.latitudeInput.toDoubleOrNull() ?: return
-            val lng = state.longitudeInput.toDoubleOrNull() ?: return
-            viewModelScope.launch {
-                locationRepository.updateConfig(
-                    lat = lat,
-                    lng = lng,
-                    simMode = if (state.routePlanStage == com.shiraka.locatiobprovid.data.model.RoutePlanStage.RUNNING) state.routeSimMode.name else "STILL",
-                    simBearing = state.simBearing,
-                    startTime = SpooferProvider.startTimestamp,
-                    routePoints = state.routePoints,
-                    isRouteMode = state.routePlanStage == com.shiraka.locatiobprovid.data.model.RoutePlanStage.RUNNING,
-                    appCoordinateSystems = state.appCoordinateSystems,
-                    wifiJson = state.collectedWifiJson,
-                    cellJson = state.collectedCellJson,
-                    bluetoothJson = state.collectedBluetoothJson,
-                    mockWifi = state.mockWifi,
-                    mockCell = state.mockCell,
-                    mockBluetooth = state.mockBluetooth,
-                    enableJitter = state.enableJitter,
-                    jitterRadiusMeters = state.jitterRadiusMeters,
-                    jitterSpeed = state.jitterSpeed.name
-                )
-            }
+            SpooferProvider.enableJitter = state.enableJitter
+            SpooferProvider.jitterRadiusMeters = state.jitterRadiusMeters
+            SpooferProvider.jitterSpeed = state.jitterSpeed.name
+            SpooferProvider.signalJitterEnabled = state.signalJitterEnabled
+            SpooferProvider.signalJitterLevel = state.signalJitterLevel
+            SpooferProvider.wifiConnectionMode = state.wifiConnectionMode.name
+            SpooferProvider.appCoordinateSystemsJson = org.json.JSONObject().apply {
+                state.appCoordinateSystems.forEach { (pkg, system) -> put(pkg, system) }
+            }.toString()
+            SpooferProvider.altitude = state.altitudeInput.toDoubleOrNull() ?: 0.0
+            SpooferProvider.satelliteCount = state.satelliteCountInput.toIntOrNull()?.coerceIn(0, 64) ?: 20
+            SpooferProvider.requestRfRefresh()
+            evaluateMockCapabilities()
         }
     }
 
 
 
     fun toggleContinuousScanning() {
-        if (_uiState.value.isSpoofingActive) {
-            android.widget.Toast.makeText(context, context.getString(com.shiraka.locatiobprovid.R.string.disable_continuous_scan_route_first), android.widget.Toast.LENGTH_SHORT).show()
-            return
-        }
-        
         if (_uiState.value.isSpoofingActive) {
             android.widget.Toast.makeText(context, context.getString(com.shiraka.locatiobprovid.R.string.stop_spoofing_before_scan), android.widget.Toast.LENGTH_SHORT).show()
             return
@@ -1690,9 +1629,8 @@ class MainViewModel(
                         
                         val wifiJson = environmentScanner.scanWifi()
                         val cellJson = environmentScanner.scanCell()
-                        val bluetoothJson = environmentScanner.scanBluetooth()
                         
-                        saveEnvironmentData(lat, lng, wifiJson, cellJson, bluetoothJson)
+                        saveEnvironmentData(lat, lng, wifiJson, cellJson)
                         
                         val count = environmentDao.getRecordCount()
                         _uiState.update { it.copy(environmentRecordCount = count) }
@@ -2052,18 +1990,7 @@ class MainViewModel(
         
         // If spoofing is active, update config
         if (_uiState.value.isSpoofingActive) {
-            viewModelScope.launch {
-                locationRepository.updateConfig(
-                    SpooferProvider.latitude,
-                    SpooferProvider.longitude,
-                    SpooferProvider.simMode,
-                    SpooferProvider.simBearing,
-                    SpooferProvider.startTimestamp,
-                    if (SpooferProvider.isRouteMode) parseRoutePoints(SpooferProvider.routeJson) else emptyList(),
-                    SpooferProvider.isRouteMode,
-                    currentMap
-                )
-            }
+            syncMockSettings()
         }
     }
 
@@ -2074,34 +2001,11 @@ class MainViewModel(
         _uiState.update { it.copy(appCoordinateSystems = currentMap) }
 
         if (_uiState.value.isSpoofingActive) {
-            viewModelScope.launch {
-                locationRepository.updateConfig(
-                    SpooferProvider.latitude,
-                    SpooferProvider.longitude,
-                    SpooferProvider.simMode,
-                    SpooferProvider.simBearing,
-                    SpooferProvider.startTimestamp,
-                    if (SpooferProvider.isRouteMode) parseRoutePoints(SpooferProvider.routeJson) else emptyList(),
-                    SpooferProvider.isRouteMode,
-                    currentMap
-                )
-            }
+            syncMockSettings()
         }
     }
     
-    private fun parseRoutePoints(json: String): List<RoutePoint> {
-        return try {
-            val arr = org.json.JSONArray(json)
-            (0 until arr.length()).map { i ->
-                val obj = arr.getJSONObject(i)
-                RoutePoint(obj.getDouble("lat"), obj.getDouble("lng"))
-            }
-        } catch (e: Exception) {
-            emptyList()
-        }
-    }
-
-    private suspend fun saveEnvironmentData(lat: Double, lng: Double, wifiJson: String, cellJson: String, bluetoothJson: String) {
+    private suspend fun saveEnvironmentData(lat: Double, lng: Double, wifiJson: String, cellJson: String) {
         val locId = environmentDao.insertLocation(com.shiraka.locatiobprovid.data.db.LocationRecord(lat = lat, lng = lng))
         
         try {
@@ -2150,7 +2054,7 @@ class MainViewModel(
                 }
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            logEnvironmentPersistenceFailure(e)
         }
 
         try {
@@ -2213,155 +2117,9 @@ class MainViewModel(
             }
         } catch (e: Exception) {}
 
-        try {
-            val btArr = org.json.JSONArray(bluetoothJson)
-            for (i in 0 until btArr.length()) {
-                val obj = btArr.getJSONObject(i)
-                val address = obj.optString("address")
-                if (address.isEmpty()) continue
-                environmentDao.insertBluetoothDevice(com.shiraka.locatiobprovid.data.db.BluetoothDevice(address, obj.optString("name", ""), obj.optString("scanRecordHex", "")))
-                environmentDao.insertLocationBluetooth(com.shiraka.locatiobprovid.data.db.LocationBluetooth(locId, address, obj.optInt("rssi", -60)))
-            }
-        } catch (e: Exception) {}
     }
 
-    private fun locationToJson(records: List<com.shiraka.locatiobprovid.data.db.CompleteLocation>, targetLat: Double, targetLng: Double): Triple<String, String, String> {
-        if (records.isEmpty()) return Triple("{}", "[]", "[]")
-
-        val weights = records.map {
-            val rLat = Math.toRadians(it.location.lat - targetLat)
-            val rLng = Math.toRadians(it.location.lng - targetLng)
-            val rA = kotlin.math.sin(rLat / 2).let { v -> v * v } + kotlin.math.cos(Math.toRadians(targetLat)) * kotlin.math.cos(Math.toRadians(it.location.lat)) * kotlin.math.sin(rLng / 2).let { v -> v * v }
-            val dist = 2 * 6378137.0 * kotlin.math.atan2(kotlin.math.sqrt(rA), kotlin.math.sqrt(1 - rA))
-            val safeDist = kotlin.math.max(dist, 1.0)
-            1.0 / (safeDist * safeDist)
-        }
-
-        // 1. Reconstruct connected Wi-Fi using the closest record's connectedWi-Fi
-        val closestRecord = records.firstOrNull()
-        val hasConnected = closestRecord?.connectedWifi != null
-        val connectedObj = if (hasConnected) {
-            val cw = closestRecord!!.connectedWifi!!
-            org.json.JSONObject().apply {
-                put("ssid", cw.ssid)
-                put("bssid", cw.bssid)
-                put("vendor", cw.vendor)
-                put("macAddress", cw.macAddress)
-                put("frequency", cw.frequency)
-                put("channel", com.shiraka.locatiobprovid.utils.MacVendorHelper.frequencyToChannel(cw.frequency))
-                put("linkSpeed", cw.linkSpeed)
-                put("level", cw.level)
-                put("capabilities", cw.capabilities)
-                put("networkId", cw.networkId)
-                put("wifiStandard", cw.wifiStandard)
-            }
-        } else {
-            null
-        }
-
-        // 2. Interpolate nearby Wi-Fis
-        val wifiMap = mutableMapOf<String, com.shiraka.locatiobprovid.data.db.LocationWithWifi>()
-        val wifiLevels = mutableMapOf<String, Double>()
-        val wifiWeights = mutableMapOf<String, Double>()
-        
-        records.forEachIndexed { i, rec ->
-            rec.wifis.forEach { rw ->
-                val bssid = rw.device.bssid
-                if (!wifiMap.containsKey(bssid)) wifiMap[bssid] = rw
-                wifiLevels[bssid] = (wifiLevels[bssid] ?: 0.0) + rw.locationWifi.level * weights[i]
-                wifiWeights[bssid] = (wifiWeights[bssid] ?: 0.0) + weights[i]
-            }
-        }
-        
-        val nearbyArr = org.json.JSONArray()
-        wifiMap.forEach { (bssid, rw) ->
-            val w = wifiWeights[bssid]!!
-            val interpolatedLevel = (wifiLevels[bssid]!! / w).toInt()
-            val obj = org.json.JSONObject().apply {
-                put("bssid", bssid)
-                put("ssid", rw.device.ssid)
-                put("vendor", rw.device.vendor)
-                put("frequency", rw.device.frequency)
-                put("channel", com.shiraka.locatiobprovid.utils.MacVendorHelper.frequencyToChannel(rw.device.frequency))
-                put("capabilities", rw.device.capabilities)
-                put("level", interpolatedLevel)
-            }
-            nearbyArr.put(obj)
-        }
-
-        val wifiResultObj = org.json.JSONObject().apply {
-            put("isConnected", hasConnected)
-            put("connectedWifi", connectedObj ?: org.json.JSONObject.NULL)
-            put("nearbyWifi", nearbyArr)
-        }
-        val wifiArr = wifiResultObj // Just assign it to match the rest of the method variables if needed, or we return wifiResultObj.toString()
-
-        
-        val cellMap = mutableMapOf<String, com.shiraka.locatiobprovid.data.db.LocationWithCell>()
-        val cellDbms = mutableMapOf<String, Double>()
-        val cellWeights = mutableMapOf<String, Double>()
-        
-        records.forEachIndexed { i, rec ->
-            rec.cells.forEach { rc ->
-                val cellKey = rc.device.cellKey
-                if (!cellMap.containsKey(cellKey)) cellMap[cellKey] = rc
-                cellDbms[cellKey] = (cellDbms[cellKey] ?: 0.0) + rc.locationCell.dbm * weights[i]
-                cellWeights[cellKey] = (cellWeights[cellKey] ?: 0.0) + weights[i]
-            }
-        }
-        
-        val cellArr = org.json.JSONArray()
-        cellMap.forEach { (cellKey, rc) ->
-            val w = cellWeights[cellKey]!!
-            val interpolatedDbm = (cellDbms[cellKey]!! / w).toInt()
-            val obj = org.json.JSONObject()
-            obj.put("type", rc.device.type)
-            obj.put("mcc", rc.device.mcc)
-            obj.put("mnc", rc.device.mnc)
-            obj.put("tac", rc.device.tac)
-            obj.put("ci", rc.device.ci)
-            obj.put("pci", rc.device.pci)
-            obj.put("lac", rc.device.lac)
-            obj.put("cid", rc.device.cid)
-            obj.put("psc", rc.device.psc)
-            obj.put("nci", rc.device.nci)
-            obj.put("networkId", rc.device.networkId)
-            obj.put("systemId", rc.device.systemId)
-            obj.put("basestationId", rc.device.basestationId)
-            obj.put("dbm", interpolatedDbm)
-            obj.put("isRegistered", rc.locationCell.isRegistered)
-            cellArr.put(obj)
-        }
-        
-        val btMap = mutableMapOf<String, com.shiraka.locatiobprovid.data.db.LocationWithBluetooth>()
-        val btRssis = mutableMapOf<String, Double>()
-        val btWeights = mutableMapOf<String, Double>()
-        
-        records.forEachIndexed { i, rec ->
-            rec.bluetooths.forEach { rb ->
-                val address = rb.device.address
-                if (!btMap.containsKey(address)) btMap[address] = rb
-                btRssis[address] = (btRssis[address] ?: 0.0) + rb.locationBluetooth.rssi * weights[i]
-                btWeights[address] = (btWeights[address] ?: 0.0) + weights[i]
-            }
-        }
-        
-        val btArr = org.json.JSONArray()
-        btMap.forEach { (address, rb) ->
-            val w = btWeights[address]!!
-            val interpolatedRssi = (btRssis[address]!! / w).toInt()
-            val obj = org.json.JSONObject()
-            obj.put("address", address)
-            obj.put("name", rb.device.name)
-            obj.put("scanRecordHex", rb.device.scanRecordHex)
-            obj.put("rssi", interpolatedRssi)
-            btArr.put(obj)
-        }
-        
-        return Triple(wifiArr.toString(), cellArr.toString(), btArr.toString())
-    }
-
-    fun exportEnvironmentData(uri: android.net.Uri) {
+   fun exportEnvironmentData(uri: android.net.Uri) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val locations = environmentDao.getAllCompleteLocations()
