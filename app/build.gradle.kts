@@ -5,6 +5,16 @@ plugins {
     kotlin("plugin.serialization") version "1.9.22"
 }
 
+val releaseKeystorePath = System.getenv("KEYSTORE_FILE_PATH")?.takeIf { it.isNotBlank() }
+val releaseKeystorePassword = System.getenv("KEYSTORE_PASSWORD")?.takeIf { it.isNotBlank() }
+val releaseKeyAlias = System.getenv("KEY_ALIAS")?.takeIf { it.isNotBlank() }
+val releaseKeyPassword = System.getenv("KEY_PASSWORD")?.takeIf { it.isNotBlank() }
+val hasReleaseSigning = releaseKeystorePath != null &&
+    releaseKeystorePassword != null &&
+    releaseKeyAlias != null &&
+    releaseKeyPassword != null &&
+    file(releaseKeystorePath).isFile
+
 android {
     namespace = "com.shiraka.locatiobprovid"
     compileSdk = 36
@@ -29,8 +39,8 @@ android {
         minSdk = 26
         //noinspection OldTargetApi
         targetSdk = 36
-        versionCode = 13926
-        versionName = "1.39.26"
+        versionCode = 14300
+        versionName = "1.4.3"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -44,13 +54,11 @@ android {
     }
     signingConfigs {
         create("release") {
-            val keystorePath = System.getenv("KEYSTORE_FILE_PATH")
-                ?: "/Users/vincent/Desktop/SUSE-APP-Key/APP-Key.jks"
-            if (file(keystorePath).exists()) {
-                storeFile = file(keystorePath)
-                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "LinuxisUbuntu18"
-                keyAlias = System.getenv("KEY_ALIAS") ?: "suse-app-key"
-                keyPassword = System.getenv("KEY_PASSWORD") ?: "LinuxisUbuntu18"
+            if (hasReleaseSigning) {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
             }
         }
     }
@@ -66,7 +74,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("release")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             buildConfigField("String", "GOOGLE_MAPS_API_KEY", "\"$googleMapsApiKey\"")
         }
     }
