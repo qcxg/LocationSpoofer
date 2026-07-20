@@ -77,7 +77,6 @@ fun FullScreenMapPage(
     var showConfigDialog by remember { mutableStateOf(false) }
     var showSaveRouteDialog by remember { mutableStateOf(false) }
     var showSavedRoutesDialog by remember { mutableStateOf(false) }
-    val isDomestic = viewModel.isDomesticEnvironment()
     val coverageLocations by viewModel.coverageLocations.collectAsState()
     val latestCoverageLocations = rememberUpdatedState(coverageLocations)
     var searchQuery by remember { mutableStateOf("") }
@@ -197,7 +196,7 @@ fun FullScreenMapPage(
     Box(modifier = Modifier.fillMaxSize()) {
 
         // 地图
-        AppMapView(mapEngine = uiState.mapEngine, isDomestic = isDomestic, modifier = Modifier.fillMaxSize()) { map ->
+        AppMapView(modifier = Modifier.fillMaxSize()) { map ->
             mapRef = map
             map.disableUiControls()
             val initLat = uiState.latitudeInput.toDoubleOrNull() ?: 0.0
@@ -260,7 +259,7 @@ fun FullScreenMapPage(
                         keyboardActions = KeyboardActions(onSearch = {
                             focusManager.clearFocus()
                             if (searchQuery.isNotBlank()) {
-                                performPoiSearch(context, uiState.mapEngine, searchQuery, isDomestic) { r ->
+                                performPoiSearch(context, searchQuery) { r ->
                                     searchResults = r
                                     showSearchResults = r.isNotEmpty()
                                 }

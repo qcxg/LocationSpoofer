@@ -49,7 +49,7 @@
 - 不增加 `Location` getter、Parcel、client callback timer 或每 App 定位重採樣 hook。
 - system framework 的定位發布節奏維持約 1 Hz；搖桿 UI 可以更流暢，但不得因此建立第二條系統定位鏈。
 - 地圖、DAO、runtime RF 仍共用 `EnvironmentCoveragePolicy` exact-cell；禁止鄰格借資料或恢復距離圓覆蓋。
-- Wi-Fi／Cell／BLE 開關表示使用者意圖；開啟但無 payload 必須是 `block only`，不可洩漏真實 RF。
+- Wi-Fi／Cell 開關表示使用者意圖；開啟但無 payload 必須是 `block only`，不可洩漏真實 RF。
 - 最終漂移仍在 hook 的完整 location sample 內生成；RF 開啟時不得把最終位置漂到已解析六角格外。
 - 正常 stop 必須明確發布 `active=false`；舊 command、start job 或 heartbeat 不得在 stop 後重新啟動。
 - 不使用 Android test/mock provider，也不重新加入已刪除的 overlay `FloatingJoystickService`。
@@ -191,7 +191,7 @@ data class JoystickCommand(
 - 放開搖桿後最遲下一個 framework sample 速度為 0，且位置不再持續前進。
 - 旋轉、返回、鎖屏、切背景、App 被殺後不會 runaway。
 - 退出搖桿後仍保持定點 spoofing；按「停止模擬」才恢復真實位置。
-- Wi-Fi／Cell／BLE 開關與 `ready`／`block only`／`off` 語義不變。
+- Wi-Fi／Cell 開關與 `ready`／`block only`／`off` 語義不變。
 - 跨 exact-cell 後 map hex、後端 resolver 與 RF payload 同步切換，沒有鄰格借用。
 - system_server 仍只有一條 canonical standard-location hook，約 1 Hz，沒有重複 hook／callback timer。
 - stop、重新開始、安裝替換與 reboot 後無 stale command／active resurrection。
@@ -209,4 +209,4 @@ data class JoystickCommand(
 
 ## 下一個任務的範圍界線
 
-下一個開發任務應先做搖桿，不要順手重寫 `LocationHooker`、coverage geometry、Wi-Fi/Cell/BLE hook 或 API 採集。若搖桿測試暴露核心鏈問題，先提供可重現日誌，再決定是否擴大範圍。
+下一個開發任務應先做搖桿，不要順手重寫 `LocationHooker`、coverage geometry、Wi-Fi／Cell hook 或 API 採集。若搖桿測試暴露核心鏈問題，先提供可重現日誌，再決定是否擴大範圍。

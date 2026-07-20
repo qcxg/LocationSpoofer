@@ -208,8 +208,7 @@ class GMapControllerImpl(private val map: GoogleMap) : AppMapController {
 }
 
 @Composable
-@Suppress("UNUSED_PARAMETER")
-fun AppMapView(mapEngine: com.shiraka.locatiobprovid.data.model.MapEngine, isDomestic: Boolean, modifier: Modifier = Modifier, onMapReady: (AppMapController) -> Unit) {
+fun AppMapView(modifier: Modifier = Modifier, onMapReady: (AppMapController) -> Unit) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val isDark = androidx.compose.foundation.isSystemInDarkTheme()

@@ -7,13 +7,13 @@ System-level Android location and radio-environment simulation for testing apps 
 [![Root](https://img.shields.io/badge/Root-KernelSU%20%7C%20Magisk%20%7C%20APatch-orange.svg)](https://kernelsu.org)
 [![Xposed](https://img.shields.io/badge/Framework-LSPosed-purple.svg)](https://github.com/LSPosed/LSPosed)
 
-[繁體中文](README.md) | [English](README_EN.md)
+[繁體中文](README.md) | [Changelog](CHANGELOG.md)
 
 > This project originated from [HuangZhuoRui/LocationSpoofer](https://github.com/HuangZhuoRui/LocationSpoofer) and is now maintained as an independent branch. The current package name is `com.shiraka.locatiobprovid`.
 
 ## Design
 
-Android developer-options mock locations can be identified through mock flags, AppOps, test providers, or inconsistent Wi-Fi/cell/BLE fingerprints. LocationSpoofer establishes an ordinary global location source inside the Android framework. Target-app hooks are optional supplements only when an app directly reads Wi-Fi, cellular, BLE, GNSS status, or NMEA APIs.
+Android developer-options mock locations can be identified through mock flags, AppOps, test providers, or inconsistent Wi-Fi/cell fingerprints. LocationSpoofer establishes an ordinary global location source inside the Android framework. Target-app hooks are optional supplements only when an app directly reads Wi-Fi, cellular, GNSS status, or NMEA APIs.
 
 The project follows two rules:
 
@@ -45,12 +45,12 @@ The project follows two rules:
 
 Trusted sources are limited to:
 
-- local Wi-Fi/cell/BLE collection;
+- local Wi-Fi/cell collection;
 - saved Room database records;
 - live WiGLE Wi-Fi results;
 - live OpenCellID cellular results.
 
-When enabled, the module can replace Wi-Fi connection/scan callbacks, cellular info/location/callbacks, and BLE scans. An enabled channel with no valid payload returns an empty or null simulated result instead of leaking real nearby data.
+When enabled, the module can replace Wi-Fi connection/scan callbacks and cellular info/location/callbacks. An enabled channel with no valid payload returns an empty or null simulated result instead of leaking real nearby data.
 
 ### GNSS and NMEA supplements
 
@@ -62,7 +62,7 @@ When enabled, the module can replace Wi-Fi connection/scan callbacks, cellular i
 ### Local data tools
 
 - Collect, inspect, edit, import, and export local environment records.
-- Only records with replayable Wi-Fi, cellular, or BLE relations appear live in world-fixed Web Mercator hexagons with a 30 m circumradius.
+- Only records with replayable Wi-Fi or cellular relations appear live in world-fixed Web Mercator hexagons with a 30 m circumradius. Historical Bluetooth relations remain only for database and import/export compatibility.
 - Map rendering, pre-start capability checks, and runtime RF resolution use the exact same `EnvironmentCoveragePolicy` cell ID. `EnvironmentRfResolver` and the DAO read only the target cell, so dense samples do not inflate coverage and neighbouring cells are never borrowed.
 - Exact-cell RF hexagons are defined only within Web Mercator latitude `±85.05112878°`. Polar coordinates outside that range do not currently guarantee RF isolation or same-cell drift constraints and should not be used with RF simulation.
 - Reuse exact-cell local RF data first, then optionally supplement it through WiGLE/OpenCellID. If an enabled channel still has no trusted payload in that cell, it remains enabled in `block only` mode instead of falling back to real RF.
@@ -86,7 +86,7 @@ LocationSpoofer app
   -> GMS and ordinary scoped or unscoped apps
 
 Optional scoped app hooks
-  -> Wi-Fi / Cell / BLE / GNSS status / NMEA supplements
+  -> Wi-Fi / Cell / GNSS status / NMEA supplements
 ```
 
 Fixed-point, route, and manual-joystick movement all update the same `SpooferProvider` anchor. `MainViewModel` does not write runtime files; the next `SpoofingService` heartbeat publishes the position and RF payload through one pipeline. Lifecycle-transition and heartbeat writes are serialized by `RuntimeConfigWriteCoordinator`, so an older generation cannot overwrite newer state.
@@ -134,7 +134,7 @@ After changing module code or its scope, reboot so `system_server` and target pr
 2. Enable the module for the Android framework and GMS in LSPosed.
 3. Add only apps that need direct RF/GNSS/NMEA supplements, then reboot.
 4. Select a target point in LocationSpoofer; the legacy route mode is not the recommended primary flow.
-5. Enable only the Wi-Fi, cellular, BLE, and drift options needed for the test.
+5. Enable only the Wi-Fi, cellular, and drift options needed for the test.
 6. Start simulation and verify the location/environment in the tested app.
 
 ## Safety boundary

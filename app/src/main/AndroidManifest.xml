@@ -29,16 +29,8 @@
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         
         <meta-data
-            android:name="com.amap.api.v2.apikey"
-            android:value="5b24b0b05cec9290b712ddc749d86661" />
-        
-        <meta-data
             android:name="com.google.android.geo.API_KEY"
             android:value="${googleMapsApiKey}" />
-
-        <meta-data
-            android:name="com.baidu.lbsapi.API_KEY"
-            android:value="EdHJttwnB21sc9FWEUxGmvEHOhlFJyyt" />
         
         <activity
             android:name=".MainActivity"

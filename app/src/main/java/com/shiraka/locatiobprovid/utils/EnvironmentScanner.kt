@@ -2,6 +2,8 @@ package com.shiraka.locatiobprovid.utils
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.telephony.CellInfo
 import android.telephony.CellInfoCdma
@@ -16,7 +18,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicLong
 
-    @android.annotation.SuppressLint("MissingPermission", "NewApi")
+@SuppressLint("MissingPermission", "NewApi")
 class EnvironmentScanner(private val context: Context) {
 
     private val lastWifiErrorLogUptimeMs = AtomicLong(0L)
@@ -34,26 +36,14 @@ class EnvironmentScanner(private val context: Context) {
     @SuppressLint("MissingPermission")
     suspend fun scanWifi(): String = withContext(Dispatchers.IO) {
         val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        val connectivityManager = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val connectivityManager = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val resultObj = JSONObject()
         try {
-            var isWifiConnected = false
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                val networks = connectivityManager.allNetworks
-                for (network in networks) {
-                    val caps = connectivityManager.getNetworkCapabilities(network)
-                    if (caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) {
-                        // 确保这个 Wi-Fi 网络具备基础的连接能力
-                        if (caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) || 
-                            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
-                            isWifiConnected = true
-                            break
-                        }
-                    }
-                }
-            } else {
-                val activeNetwork = connectivityManager.activeNetworkInfo
-                isWifiConnected = activeNetwork != null && activeNetwork.type == android.net.ConnectivityManager.TYPE_WIFI && activeNetwork.isConnected
+            val isWifiConnected = connectivityManager.allNetworks.any { network ->
+                val capabilities = connectivityManager.getNetworkCapabilities(network)
+                capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                    (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ||
+                        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED))
             }
 
             resultObj.put("isConnected", isWifiConnected)
@@ -62,7 +52,7 @@ class EnvironmentScanner(private val context: Context) {
             val connectedBssid = if (isWifiConnected) connectionInfo?.bssid else null
             val results = wifiManager.scanResults ?: emptyList()
 
-            // 1. 优先提取当前正在连接的 Wi-Fi 信息
+            // Prefer the currently connected Wi-Fi entry when Android exposes one.
             if (isWifiConnected && connectedBssid != null && connectedBssid != "02:00:00:00:00:00") {
                 val connObj = JSONObject()
                 connObj.put("bssid", connectedBssid)
@@ -74,7 +64,7 @@ class EnvironmentScanner(private val context: Context) {
                 }
                 
                 val match = results.find { it.BSSID == connectedBssid }
-                // 如果是 unknown ssid 或为空，尝试从扫描结果中恢复真实 SSID
+                // Recover an unavailable SSID from the matching scan result when possible.
                 if (cleanSsid == "<unknown ssid>" || cleanSsid.isEmpty()) {
                     if (match != null && !match.SSID.isNullOrEmpty()) {
                         cleanSsid = match.SSID
@@ -98,7 +88,7 @@ class EnvironmentScanner(private val context: Context) {
                 resultObj.put("connectedWifi", JSONObject.NULL)
             }
 
-            // 2. 提取周围扫描到的其他 Wi-Fi（去重，不包含当前已连接的）
+            // Add nearby access points once each, excluding the connected entry.
             val nearbyArray = JSONArray()
             val seenBssids = mutableSetOf<String>()
             if (isWifiConnected && connectedBssid != null) {

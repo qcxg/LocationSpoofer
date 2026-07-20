@@ -1,5 +1,6 @@
 package com.shiraka.locatiobprovid.utils
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.SharedPreferences
 import com.shiraka.locatiobprovid.data.model.RoutePoint
@@ -40,10 +41,6 @@ class SettingsManager(context: Context) {
         get() = prefs.getString("map_type", "NORMAL") ?: "NORMAL"
         set(value) = prefs.edit().putString("map_type", value).apply()
 
-    var mapEngine: String
-        get() = prefs.getString("map_engine", "AUTO") ?: "AUTO"
-        set(value) = prefs.edit().putString("map_engine", value).apply()
-
     var showHomeCoordinateAlgorithm: Boolean
         get() = prefs.getBoolean("show_home_coordinate_algorithm", true)
         set(value) = prefs.edit().putBoolean("show_home_coordinate_algorithm", value).apply()
@@ -58,11 +55,12 @@ class SettingsManager(context: Context) {
 
     /**
      * An APK replacement cannot reload hook code already resident in system_server/GMS.
-     * Keep simulation disabled until the next completed device boot makes the installed
-     * module code authoritative in every scoped process.
+     * The package-replaced receiver may be killed immediately after returning, so this
+     * safety marker must be persisted synchronously before the process can disappear.
      */
     var moduleRestartRequired: Boolean
         get() = prefs.getBoolean("module_restart_required", false)
+        @SuppressLint("ApplySharedPref")
         set(value) {
             prefs.edit().putBoolean("module_restart_required", value).commit()
         }

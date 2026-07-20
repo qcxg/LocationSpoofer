@@ -7,11 +7,13 @@
 [![Root](https://img.shields.io/badge/Root-KernelSU%20%7C%20Magisk%20%7C%20APatch-orange.svg)](https://kernelsu.org)
 [![Xposed](https://img.shields.io/badge/Framework-LSPosed-purple.svg)](https://github.com/LSPosed/LSPosed)
 
+[更新記錄](CHANGELOG.md) | [English](README_EN.md)
+
 > 本專案最初源自 [HuangZhuoRui/LocationSpoofer](https://github.com/HuangZhuoRui/LocationSpoofer)，目前已重構為獨立維護分支。當前包名為 `com.shiraka.locatiobprovid`。
 
 ## 核心定位
 
-傳統 Android 開發者選項中的 Mock Location 容易被目標 App 或 SDK 通過 `isFromMockProvider`、AppOps、測試 provider、周邊 Wi-Fi/基站/BLE 指紋等方式識別。LocationSpoofer 用 Root + LSPosed 在 Android 系統框架建立全域定位來源；只有 App 直接讀取 Wi-Fi、基站、GNSS status 或 NMEA 時，才在該 App 進程補充對應環境資料。
+傳統 Android 開發者選項中的 Mock Location 容易被目標 App 或 SDK 通過 `isFromMockProvider`、AppOps、測試 provider、周邊 Wi-Fi／基站指紋等方式識別。LocationSpoofer 用 Root + LSPosed 在 Android 系統框架建立全域定位來源；只有 App 直接讀取 Wi-Fi、基站、GNSS status 或 NMEA 時，才在該 App 進程補充對應環境資料。
 
 本專案遵守兩個重要原則：
 
@@ -39,7 +41,7 @@
 - Android framework 的標準 `Location` 固定輸出 `WGS-84`。
 - `GCJ-02`、`BD-09` 只用於明確啟用的地圖 SDK 邊界，不得回寫到全域 framework fix。
 
-### Wi-Fi / 基站 / BLE 環境模擬
+### Wi-Fi / 基站環境模擬
 
 可信資料來源只包括：
 
@@ -52,16 +54,15 @@
 
 - Wi-Fi hook 可替換 `WifiInfo`、scan results 與 scan callback。
 - 基站 hook 可替換 `getAllCellInfo()`、`getCellLocation()`、callback、service state 與 signal strength 等路徑。
-- BLE 掃描資料可按配置替換或阻斷。
 - 若沒有可信 payload，hook 返回空或 null 的模擬資料，而不是暴露真實周邊訊號。
 
 ### 本地環境資料管理
 
-- 支援實地掃描 Wi-Fi、基站與 BLE。
+- 支援實地掃描 Wi-Fi 與基站。
 - 支援本地資料查看、編輯、匯入與匯出。
 - 首頁顯示最近使用的 7 個位置；收藏列表保留為頂部書籤入口。
 - 管理頁會把相同經緯度的環境記錄合併成一條，並在 Wi-Fi / 基站數量後標出「由 WiGLE / OpenCellID 導入」或本地采集來源。
-- 采集資料使用 Room/SQLite 保存；只有含可重放 Wi-Fi、基站或 BLE 關聯的記錄會即時映射到世界固定的 Web Mercator 六角格，六角格外接半徑為 30m。
+- 採集資料使用 Room/SQLite 保存；只有含可重放 Wi-Fi 或基站關聯的記錄會即時映射到世界固定的 Web Mercator 六角格，六角格外接半徑為 30m。舊 Bluetooth 關聯只為資料庫升級與歷史資料管理保留，不參與掃描或運行期模擬。
 - 地圖、開始前能力檢查與運行期 RF 解析共用 `EnvironmentCoveragePolicy` 的完全相同格 ID；`EnvironmentRfResolver`／DAO 只讀取目標所在格，密集采樣不會擴大範圍，跨格也不會借用資料。
 - Exact-cell RF 六角格的有效緯度為 `±85.05112878°`；更高緯度目前不保證 RF 隔離或漂移限格，請勿在極區座標啟用 RF 模擬。
 - 開始模擬時會先檢查目標六角格的本地 RF 快取；API 補採失敗時可重試，或直接以目前資料啟用。使用者已開啟但該格沒有可信 payload 的 RF 通道會保持啟用並進入 `block only`，不會退回真實 RF。
@@ -70,12 +71,10 @@
 - Wi-Fi payload 對話框提供去重列表：短按展開詳情，長按切換要暴露為 `connectedWifi` 的 AP。
 - RF 診斷面板顯示 `ready`、`block only`、`off`、`loading` 等狀態，便於確認目前是模擬、阻斷還是關閉。
 
-### 反檢測處理
+### Mock 標記與系統相容
 
 - 清理 `Location.isFromMockProvider()` / `Location.isMock()` 與相關 mock 欄位。
 - 隱藏 mock location AppOps 與 Settings 讀取痕跡。
-- 隔離常見 Xposed / LSPosed 類名查詢。
-- 清理呼叫棧中可疑框架影格。
 - 不保留 Android test provider 作為運行機制。
 
 ## 運行架構
@@ -104,7 +103,7 @@ Config channels
 LSPosed injected processes
   |-- system_server: authoritative 1 Hz location source
   |-- GMS: ordinary framework consumer
-  |-- optional target apps: GNSS / Wi-Fi / Cell / BLE supplements
+  |-- optional target apps: GNSS / Wi-Fi / Cell supplements
   |-- fail-closed when active config is stale
 ```
 
@@ -118,7 +117,7 @@ LSPosed injected processes
 
 - Android 8.0+。
 - KernelSU、Magisk 或 APatch Root。
-- LSPosed / libxposed 可用；全域普通定位需要系統框架與 GMS 作用域。只有要模擬 App 內直接讀取的 Wi-Fi、基站、BLE、GNSS status 或 NMEA 時，才把該 App 加入作用域。
+- LSPosed / libxposed 可用；全域普通定位需要系統框架與 GMS 作用域。只有要模擬 App 內直接讀取的 Wi-Fi、基站、GNSS status 或 NMEA 時，才把該 App 加入作用域。
 - Google Maps API key 用於地圖與搜尋。
 - WiGLE / OpenCellID token 可選，用於補充真實 RF payload。
 
@@ -151,7 +150,7 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 2. 在 LSPosed 中啟用模組並啟用系統框架／GMS 作用域；需要 RF 或 GNSS/NMEA 補充時再加入相應 App。
 3. 修改 module 或 scope 後重啟手機，確保 `system_server` 載入同一版本的唯一定位鏈。
 4. 在 LocationSpoofer 中選擇目標點；舊路線模式目前不作為推薦主流程。
-5. 根據需要啟用 Wi-Fi、基站、BLE 與抖動配置。
+5. 根據需要啟用 Wi-Fi、基站與抖動配置。
 6. 開始模擬後，在目標 App 中驗證定位與環境資料。
 
 ## 資料與安全邊界

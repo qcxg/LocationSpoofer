@@ -131,13 +131,26 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION_HEADER="## [${{ steps.version.outputs.name }}]"
+          awk -v header="$VERSION_HEADER" '
+            index($0, header) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: LocationSpoofer ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
+          body_path: release-notes.md
           files: |
             dist/LocationSpoofer-${{ steps.version.outputs.tag }}.apk
             dist/LocationSpoofer-${{ steps.version.outputs.tag }}.aab

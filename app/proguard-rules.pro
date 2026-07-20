@@ -1,25 +1,9 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-
-# Xposed Framework (Legacy & LibXposed)
+# Xposed / libxposed entry points are loaded outside normal Android component discovery.
 -keep class de.robv.android.xposed.** { *; }
 -keep interface de.robv.android.xposed.** { *; }
 -keep class io.github.libxposed.** { *; }
 -keep interface io.github.libxposed.** { *; }
--keep class com.suseoaa.locationspoofer.xposed.** { *; }
-
-# AMap 3DMap & Location SDK
--keep class com.amap.api.** { *; }
--keep class com.autonavi.** { *; }
--dontwarn com.amap.api.**
--dontwarn com.autonavi.**
-
-# Baidu Map SDK
--keep class com.baidu.** { *; }
--keep class mapsdkvi.com.** { *; }
--keep class vi.com.gdi.bgl.android.** { *; }
--dontwarn com.baidu.**
+-keep class com.shiraka.locatiobprovid.xposed.** { *; }
 
 # Coroutines
 -keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
@@ -35,12 +19,12 @@
     *;
 }
 
-# Models / Utils
--keep class com.suseoaa.locationspoofer.utils.ConfigManager { *; }
--keep class com.suseoaa.locationspoofer.utils.LSPosedManager { *; }
--keep class com.suseoaa.locationspoofer.provider.** { *; }
--keep class com.suseoaa.locationspoofer.data.** { *; }
--keepclassmembers class com.suseoaa.locationspoofer.data.** { *; }
+# Runtime config and provider models are read through reflection or cross-process contracts.
+-keep class com.shiraka.locatiobprovid.utils.ConfigManager { *; }
+-keep class com.shiraka.locatiobprovid.utils.LSPosedManager { *; }
+-keep class com.shiraka.locatiobprovid.provider.** { *; }
+-keep class com.shiraka.locatiobprovid.data.** { *; }
+-keepclassmembers class com.shiraka.locatiobprovid.data.** { *; }
 
 # General safety for Android lifecycle
 -keep class * extends android.app.Application { *; }

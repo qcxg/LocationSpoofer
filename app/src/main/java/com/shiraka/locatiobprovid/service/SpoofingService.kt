@@ -873,10 +873,12 @@ class SpoofingService : Service() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(CHANNEL_ID, getString(com.shiraka.locatiobprovid.R.string.spoofing_service_channel_name), NotificationManager.IMPORTANCE_LOW)
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            getString(com.shiraka.locatiobprovid.R.string.spoofing_service_channel_name),
+            NotificationManager.IMPORTANCE_LOW
+        )
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

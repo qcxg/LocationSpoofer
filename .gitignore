@@ -10,7 +10,6 @@ local.yml
 build/
 app/build/
 **/build/
-gradle-wrapper.jar
 
 # ─── NDK ─────────────────────────────────────────────────
 .cxx/
@@ -27,7 +26,7 @@ captures/
 *.hprof
 
 # ─── Secrets / Keys ──────────────────────────────────────
-# 不要把 API Key、Keystore 提交进仓库
+# API keys and release signing material must stay outside the repository.
 *.jks
 *.keystore
 keystore.properties

@@ -1,6 +1,6 @@
 # LocationSpoofer Current Simulation Pipeline
 
-Last maintained: 2026-07-18 (idle/active power, RF pass-through gates, compact runtime frames, Bluetooth removal, and lifecycle ordering)
+Last maintained: 2026-07-20 (repository cleanup, removal of unreachable compatibility hooks, and release documentation)
 
 This document is the current source of truth for how LocationSpoofer simulates GNSS, Wi-Fi, cellular, and related environment signals. It is written for future coding agents and developers so the implementation stays understandable and does not drift into hidden generated telemetry.
 
@@ -321,14 +321,7 @@ As with Wi-Fi, this is a local readiness check; hook delivery is verified throug
 
 ## Connectivity Layer
 
-Legacy connectivity-hook helper code may still exist for parts of:
-
-- `ConnectivityManager`
-- `NetworkCapabilities`
-- `NetworkInfo`
-- network interface metadata
-
-These hooks are used to keep the visible network state consistent with Wi-Fi/cellular spoofing. They do not create trusted Wi-Fi or cell records by themselves.
+The unused generic `ConnectivityManager`, `NetworkCapabilities`, `NetworkInfo`, and `NetworkInterface` hook helper has been removed. Wi-Fi and cellular simulation own only their explicit API surfaces; inactive mode and disabled RF channels do not rewrite generic connectivity state.
 
 ## Compass And Magnetic Field
 
@@ -346,7 +339,7 @@ The previous experimental magnetic-field hook is removed from the stable hook ch
 - Nearby place names resolve through Google Places Nearby Search first, then Google Geocoding and Android `Geocoder`, with `LocationSpoofer_Debug` logs for success and failure.
 - Recent locations are separate from saved favorites: the home screen shows the latest seven used locations, while the top bookmark button opens the saved favorites list.
 - Recent locations must be written only after the current coordinate's Wi-Fi/cell payload has been resolved; loading a saved/recent point re-evaluates local RF data for that coordinate.
-It is not installed by the current package matrix. Wi-Fi and Cell simulation own their explicit APIs; inactive mode must not rewrite generic connectivity state. If Android object construction needs missing optional fields, use harmless structural defaults and keep identity fields from trusted data.
+- If Android object construction needs missing optional fields, use harmless structural defaults and keep identity fields from trusted data.
 
 ## Known Gaps
 

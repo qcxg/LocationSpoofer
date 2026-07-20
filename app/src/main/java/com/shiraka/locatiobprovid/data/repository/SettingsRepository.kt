@@ -60,12 +60,6 @@ class SettingsRepository(private val settingsManager: SettingsManager) {
         settingsManager.mapType = value
     }
 
-    fun getMapEngine(): String = settingsManager.mapEngine
-
-    fun setMapEngine(value: String) {
-        settingsManager.mapEngine = value
-    }
-
     var showHomeCoordinateAlgorithm: Boolean
         get() = settingsManager.showHomeCoordinateAlgorithm
         set(value) { settingsManager.showHomeCoordinateAlgorithm = value }

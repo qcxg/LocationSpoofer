@@ -6,18 +6,8 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * 国家测绘局标准坐标偏移算法（GCJ-02 ↔ WGS-84）
- *
- * 坐标系约定：
- * - AMap SDK（高德）返回 GCJ-02
- * - Android LocationManager / GPS 硬件 / Google Play Services 使用 WGS-84
- * - android.location.Location.getLatitude() 标准返回 WGS-84
- * - AMapLocation.getLatitude() 返回 GCJ-02
- *
- * 注入规则：
- * - TestProvider (setTestProviderLocation) → 注入 WGS-84
- * - Xposed Hook (Location.getLatitude) → 注入 WGS-84
- * - Xposed Hook (AMapLocation.getLatitude) → 注入 GCJ-02
+ * Converts user-facing GCJ-02 coordinates into the WGS-84 coordinates required by
+ * Android framework locations and external RF data providers.
  */
 object CoordinateUtils {
 
@@ -27,31 +17,11 @@ object CoordinateUtils {
 
     data class LatLng(val lat: Double, val lng: Double)
 
-    /**
-     * GCJ-02 → WGS-84（逆向偏移）
-     * 用于将高德坐标转为 GPS 坐标，注入 TestProvider 和标准 Location API
-     */
+    /** Converts a GCJ-02 map coordinate to the canonical WGS-84 runtime coordinate. */
     fun gcj02ToWgs84(gcjLat: Double, gcjLng: Double): LatLng {
         if (outOfChina(gcjLat, gcjLng)) return LatLng(gcjLat, gcjLng)
         val d = delta(gcjLat, gcjLng)
         return LatLng(gcjLat - d.lat, gcjLng - d.lng)
-    }
-
-    /**
-     * WGS-84 → GCJ-02（正向偏移）
-     * 用于将 GPS 坐标转为高德坐标
-     */
-    fun wgs84ToGcj02(wgsLat: Double, wgsLng: Double): LatLng {
-        if (outOfChina(wgsLat, wgsLng)) return LatLng(wgsLat, wgsLng)
-        val dLat = transformLat(wgsLng - 105.0, wgsLat - 35.0)
-        val dLng = transformLng(wgsLng - 105.0, wgsLat - 35.0)
-        val radLat = wgsLat / 180.0 * PI
-        var magic = sin(radLat)
-        magic = 1 - EE * magic * magic
-        val sqrtMagic = sqrt(magic)
-        val newLat = wgsLat + (dLat * 180.0) / ((A * (1 - EE)) / (magic * sqrtMagic) * PI)
-        val newLng = wgsLng + (dLng * 180.0) / (A / sqrtMagic * cos(radLat) * PI)
-        return LatLng(newLat, newLng)
     }
 
     private fun delta(lat: Double, lng: Double): LatLng {
@@ -87,19 +57,4 @@ object CoordinateUtils {
         return lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271
     }
 
-    // ── GCJ-02 → BD-09 转换常量 ──
-    private const val BD_PI = PI * 3000.0 / 180.0
-
-    /**
-     * GCJ-02 → BD-09(百度坐标系)
-     * 百度地图/百度定位SDK使用BD-09坐标系,在GCJ-02基础上施加极坐标旋转偏移。
-     * 若直接将GCJ-02坐标传入百度SDK,会产生约100-500米的固定偏移。
-     */
-    fun gcj02ToBd09(gcjLat: Double, gcjLng: Double): LatLng {
-        val x = gcjLng + 0.0065
-        val y = gcjLat + 0.006
-        val z = sqrt(x * x + y * y) + 0.00002 * sin(y * BD_PI)
-        val theta = Math.atan2(y, x) + 0.000003 * cos(x * BD_PI)
-        return LatLng(z * sin(theta) + 0.006, z * cos(theta) + 0.0065)
-    }
 }

@@ -1,5 +1,6 @@
 package com.shiraka.locatiobprovid.viewmodel
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.location.Geocoder
 import androidx.lifecycle.ViewModel
@@ -46,6 +47,8 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
+// Koin's androidContext() binding is the Application context, never an Activity.
+@SuppressLint("StaticFieldLeak")
 class MainViewModel(
     private val locationRepository: LocationRepository,
     private val settingsRepository: SettingsRepository,
@@ -63,11 +66,6 @@ class MainViewModel(
                 AppMapType.valueOf(settingsRepository.getMapType())
             } catch (e: Exception) {
                 AppMapType.NORMAL
-            },
-            mapEngine = try {
-                com.shiraka.locatiobprovid.data.model.MapEngine.valueOf(settingsRepository.getMapEngine())
-            } catch (e: Exception) {
-                com.shiraka.locatiobprovid.data.model.MapEngine.AUTO
             },
             savedLocations = settingsRepository.getSavedLocations(),
             recentLocations = settingsRepository.getRecentLocations(),
@@ -252,11 +250,6 @@ class MainViewModel(
         _uiState.update { it.copy(mapType = type) }
     }
 
-    fun setMapEngine(engine: com.shiraka.locatiobprovid.data.model.MapEngine) {
-        settingsRepository.setMapEngine(engine.name)
-        _uiState.update { it.copy(mapEngine = engine) }
-    }
-
     fun setSearchMode(mode: com.shiraka.locatiobprovid.data.model.SearchMode) {
         _uiState.update { it.copy(searchMode = mode) }
     }
@@ -370,17 +363,14 @@ class MainViewModel(
 
     fun fetchCurrentLocation(ctx: Context, forceCallback: ((Double, Double) -> Unit)? = null) {
         viewModelScope.launch(Dispatchers.Main) {
-            fallbackToNativeLocation(ctx, forceCallback, false)
+            requestNativeLocation(ctx, forceCallback)
         }
     }
 
     @android.annotation.SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
-    private fun fallbackToNativeLocation(ctx: Context, forceCallback: ((Double, Double) -> Unit)?, convertToGcj: Boolean) {
+    private fun requestNativeLocation(ctx: Context, forceCallback: ((Double, Double) -> Unit)?) {
         try {
-            if (forceCallback != null && convertToGcj) {
-                android.widget.Toast.makeText(ctx, ctx.getString(com.shiraka.locatiobprovid.R.string.amap_restricted_fallback), android.widget.Toast.LENGTH_SHORT).show()
-            }
             val locationManager = ctx.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
             val provider = if (locationManager.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)) {
                 android.location.LocationManager.NETWORK_PROVIDER
@@ -1477,15 +1467,6 @@ class MainViewModel(
         return 2 * radius * kotlin.math.atan2(kotlin.math.sqrt(h), kotlin.math.sqrt(1 - h))
     }
 
-    private fun bearingBetween(from: RoutePoint, to: RoutePoint): Double {
-        val lat1 = Math.toRadians(from.lat)
-        val lat2 = Math.toRadians(to.lat)
-        val dLng = Math.toRadians(to.lng - from.lng)
-        val x = kotlin.math.sin(dLng) * kotlin.math.cos(lat2)
-        val y = kotlin.math.cos(lat1) * kotlin.math.sin(lat2) -
-            kotlin.math.sin(lat1) * kotlin.math.cos(lat2) * kotlin.math.cos(dLng)
-        return (Math.toDegrees(kotlin.math.atan2(x, y)) + 360) % 360
-    }
     fun toggleMockWifi() {
         val newVal = !_uiState.value.mockWifi
         settingsRepository.mockWifi = newVal

@@ -142,7 +142,6 @@ fun SpoofingScreen(
     
     var showCustomCoordDialog by remember { mutableStateOf(false) }
     val topBarBg = MaterialTheme.colorScheme.background
-    val isDomestic = viewModel.isDomesticEnvironment()
     var searchQuery by remember { mutableStateOf("") }
     var searchResults by remember { mutableStateOf<List<AppPoiItem>>(emptyList()) }
     var showSearchPanel by remember { mutableStateOf(false) }
@@ -299,7 +298,7 @@ fun SpoofingScreen(
 
         // 地图缩略图
         Box(modifier = Modifier.fillMaxWidth().height(mapHeight)) {
-            AppMapView(mapEngine = uiState.mapEngine, isDomestic = isDomestic, modifier = Modifier.fillMaxSize()) { map ->
+            AppMapView(modifier = Modifier.fillMaxSize()) { map ->
                 smallMapRef = map
                 map.disableUiControls()
                 val initLat = uiState.latitudeInput.toDoubleOrNull() ?: 0.0
@@ -632,7 +631,7 @@ fun SpoofingScreen(
                             onSearch = {
                                 focusManager.clearFocus()
                                 if (searchQuery.isNotBlank()) {
-                                    performPoiSearch(context, uiState.mapEngine, searchQuery, isDomestic) { results ->
+                                    performPoiSearch(context, searchQuery) { results ->
                                         searchResults = results
                                         showSearchResults = results.isNotEmpty()
                                     }
@@ -1668,16 +1667,13 @@ fun SavedLocationsCard(
     }
 }
 
-// 高德 POI 搜索
+// Google Places POI search.
 
 private var cachedPlacesClient: com.google.android.libraries.places.api.net.PlacesClient? = null
 
-@Suppress("UNUSED_PARAMETER")
 fun performPoiSearch(
     context: android.content.Context,
-    mapEngine: com.shiraka.locatiobprovid.data.model.MapEngine,
     keyword: String,
-    isDomestic: Boolean,
     onResult: (List<AppPoiItem>) -> Unit
 ) {
     if (!com.google.android.libraries.places.api.Places.isInitialized()) {

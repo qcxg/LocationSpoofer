@@ -75,7 +75,6 @@ enum class AppMapType {
 
 data class AppState(
     val mapType: AppMapType = AppMapType.NORMAL,
-    val mapEngine: MapEngine = MapEngine.AUTO,
     val isInitializing: Boolean = true,
     val isLanguageSet: Boolean = true, // Default to true to avoid flicker if not needed
     val currentLanguage: String = "",
